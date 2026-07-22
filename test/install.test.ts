@@ -196,6 +196,65 @@ describe("installer", () => {
     expect(result.stderr).toContain("insecure repository URL is not allowed")
   })
 
+  test("bootstraps a pinned temporary Bun when no standalone executable is installed", async () => {
+    const root = await directory()
+    const origin = await installerOrigin(root)
+    const install = path.join(root, "installed")
+    const config = path.join(root, "config")
+    const temporaryDirectory = path.join(root, "temporary")
+    await mkdir(temporaryDirectory)
+    const bootstrap = await bootstrapFixtures(root)
+    const environment = {
+      ...process.env,
+      HOME: root,
+      PATH: `${bootstrap.bin}:/usr/bin:/bin`,
+      TMPDIR: temporaryDirectory,
+      FIXTURE_BUN: process.execPath,
+      BOOTSTRAP_LOG: bootstrap.log,
+      OPENCODE_SAFE_COMPACTION_REPO: origin,
+      OPENCODE_SAFE_COMPACTION_DIR: install,
+      OPENCODE_SAFE_COMPACTION_CONFIG_DIR: config,
+      OPENCODE_SAFE_COMPACTION_OPENCODE: await openCodeFixture(root, "opencode-bootstrap"),
+    }
+    delete environment.OPENCODE_SAFE_COMPACTION_BUN
+
+    const result = await command(["sh", "install.sh"], environment)
+
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout).toContain("Bun not found; downloading temporary Bun 1.3.14 for Linux/x86_64")
+    expect(await Bun.file(bootstrap.log).text()).toBe(
+      "https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-linux-x64-baseline.zip\n",
+    )
+    expect(await Bun.file(path.join(install, "src/index.ts")).exists()).toBe(true)
+    expect(await Array.fromAsync(new Bun.Glob("opencode-safe-compaction.*").scan(temporaryDirectory))).toEqual([])
+  })
+
+  test("refuses an unverified temporary Bun archive before cloning or editing configuration", async () => {
+    const root = await directory()
+    const install = path.join(root, "installed")
+    const config = path.join(root, "config")
+    const bootstrap = await bootstrapFixtures(root, "0".repeat(64))
+    const environment = {
+      ...process.env,
+      HOME: root,
+      PATH: `${bootstrap.bin}:/usr/bin:/bin`,
+      FIXTURE_BUN: process.execPath,
+      BOOTSTRAP_LOG: bootstrap.log,
+      OPENCODE_SAFE_COMPACTION_REPO: path.join(root, "unused-origin"),
+      OPENCODE_SAFE_COMPACTION_DIR: install,
+      OPENCODE_SAFE_COMPACTION_CONFIG_DIR: config,
+      OPENCODE_SAFE_COMPACTION_OPENCODE: await openCodeFixture(root, "opencode-bootstrap-checksum"),
+    }
+    delete environment.OPENCODE_SAFE_COMPACTION_BUN
+
+    const result = await command(["sh", "install.sh"], environment)
+
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr).toContain("temporary Bun download failed SHA-256 verification")
+    expect(await Bun.file(install).exists()).toBe(false)
+    expect(await Bun.file(config).exists()).toBe(false)
+  })
+
   test("rolls back configuration and a new checkout when OpenCode debug fails", async () => {
     const root = await directory()
     const origin = await installerOrigin(root)
@@ -758,6 +817,75 @@ exit 1
   )
   await chmod(file, 0o755)
   return file
+}
+
+async function bootstrapFixtures(
+  root: string,
+  digest = "a063908ae08b7852ca10939bbdc6ceed3ddabce8fb9402dce83d65d73b36e6c7",
+) {
+  const bin = path.join(root, `bootstrap-bin-${crypto.randomUUID()}`)
+  const log = path.join(root, `bootstrap-${crypto.randomUUID()}.log`)
+  await mkdir(bin)
+  await executable(
+    path.join(bin, "uname"),
+    `#!/bin/sh
+case "$1" in
+  -s) printf 'Linux\\n' ;;
+  -m) printf 'x86_64\\n' ;;
+  *) exit 1 ;;
+esac
+`,
+  )
+  await executable(
+    path.join(bin, "ldd"),
+    `#!/bin/sh
+printf 'ldd (GNU libc) 2.39\\n'
+`,
+  )
+  await executable(
+    path.join(bin, "curl"),
+    `#!/bin/sh
+output=
+url=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output) output=$2; shift 2 ;;
+    https://*) url=$1; shift ;;
+    *) shift ;;
+  esac
+done
+[ -n "$output" ] && [ -n "$url" ] || exit 2
+printf 'fixture archive' > "$output"
+printf '%s\\n' "$url" > "$BOOTSTRAP_LOG"
+`,
+  )
+  await executable(
+    path.join(bin, "sha256sum"),
+    `#!/bin/sh
+printf '${digest}  %s\\n' "$1"
+`,
+  )
+  await executable(
+    path.join(bin, "unzip"),
+    `#!/bin/sh
+destination=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -d) destination=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$destination" ] || exit 2
+mkdir -p "$destination/bun-linux-x64-baseline"
+cp "$FIXTURE_BUN" "$destination/bun-linux-x64-baseline/bun"
+`,
+  )
+  return { bin, log }
+}
+
+async function executable(file: string, text: string) {
+  await Bun.write(file, text)
+  await chmod(file, 0o755)
 }
 
 async function command(argv: string[], env = process.env, cwd = process.cwd(), input?: string) {

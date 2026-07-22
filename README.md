@@ -6,7 +6,7 @@ The package is private at version `0.1.0`. Git/source-path installation is the s
 
 ## Compatibility and prerequisites
 
-- Bun 1.3.14 or newer (verified with 1.3.14).
+- OpenCode supplies the Bun runtime used by the plugin. A separate Bun installation is optional for the one-command installer and required only for development or packaging.
 - OpenCode `>=1.18.4 <1.19.0`. The plugin uses experimental V1 hooks, so the upper bound is intentional.
 - A configured compaction model. The initial configuration below uses `opencode-go/glm-5.2`, but the package itself is provider-neutral.
 - The selected model must have a positive output limit and leave positive usable input under OpenCode's V1 overflow calculation.
@@ -35,7 +35,7 @@ Before writing configuration, the installer imports the exact absolute source mo
 
 Checkout update, configuration activation, and `opencode debug config` verification form one installer transaction. A checkout-parent lock serializes transactions sharing an install path even when their configuration directories differ; a second lock serializes transactions sharing a configuration directory. Both are held from before clone/update through verification and commit. A later failure restores the prior configuration, permissions, and Git commit, or removes a newly created clone. Successfully written configuration and installer-created backups use mode `0600` because OpenCode configuration may contain credentials. Rollback compares the activated configuration digest before restoring it, so it refuses to overwrite a file changed independently during activation; in that case it also preserves the checkout so the independently edited tuple cannot be left pointing at removed or rolled-back source. An uncatchable termination such as `SIGKILL` or a host power loss cannot run the shell rollback trap; the next installer removes a lock whose recorded process no longer exists, but inspect the timestamped backup and checkout before rerunning.
 
-The command requires `git`, Bun 1.3.14 or newer, and OpenCode `>=1.18.4 <1.19.0` on `PATH`. If OpenCode or Bun is installed at a nonstandard path, or a different compaction model is required, pass overrides to `sh`:
+The command requires `git` and OpenCode `>=1.18.4 <1.19.0` on `PATH`. It uses Bun 1.3.14 or newer when one is already available. Otherwise it downloads the pinned Bun 1.3.14 archive from the official `oven-sh/bun` GitHub release into the installer transaction directory, verifies the archive against a platform-specific SHA-256 digest, and deletes it when the installer exits. The automatic bootstrap supports Linux, macOS, and FreeBSD on x86-64 or ARM64; it needs `curl`, a SHA-256 implementation (`sha256sum`, `shasum`, or `openssl`), and `unzip` or `busybox`. If OpenCode or Bun is installed at a nonstandard path, automatic download is undesirable, or a different compaction model is required, pass overrides to `sh`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/shyba/opencode-better-compact-plugin/default/install.sh |
@@ -47,7 +47,7 @@ curl -fsSL https://raw.githubusercontent.com/shyba/opencode-better-compact-plugi
 
 Other supported overrides are `OPENCODE_SAFE_COMPACTION_DIR`, `OPENCODE_SAFE_COMPACTION_CONFIG_DIR`, `OPENCODE_SAFE_COMPACTION_REPO`, and `OPENCODE_SAFE_COMPACTION_REF` (an alternate branch or exact lowercase 40-character commit). Exact commits are fetched and checked out detached. All directory overrides must be absolute. The installer respects an existing `OPENCODE_CONFIG_DIR`. It refuses insecure `http://` and `git://` repository URLs, including an insecure existing origin that would otherwise normalize to the requested HTTPS GitHub repository. It also refuses a dirty checkout, a mismatched remote or branch, duplicate/conflicting plugin entries, and configurations containing the stale `deepseek-v4-flash-free` limit override. It never rewrites provider catalogs.
 
-The source plugin has no runtime package dependencies, so the installer does not populate `node_modules`. Restart a running OpenCode server after installation.
+The source plugin has no runtime package dependencies, so the installer does not populate `node_modules`. A bootstrapped Bun is temporary and is not installed into the user account or retained by the plugin. Restart a running OpenCode server after installation.
 
 ## Manual Git installation
 

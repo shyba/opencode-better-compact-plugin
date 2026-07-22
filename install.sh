@@ -9,6 +9,7 @@ config_dir=${OPENCODE_SAFE_COMPACTION_CONFIG_DIR:-${OPENCODE_CONFIG_DIR:-${XDG_C
 model=${OPENCODE_SAFE_COMPACTION_MODEL:-opencode-go/glm-5.2}
 bun_command=${OPENCODE_SAFE_COMPACTION_BUN:-bun}
 opencode_command=${OPENCODE_SAFE_COMPACTION_OPENCODE:-opencode}
+bun_bootstrap_version=1.3.14
 
 fail() {
   printf 'opencode-safe-compaction: %s\n' "$1" >&2
@@ -63,6 +64,116 @@ check_bun_version() {
   fi
 }
 
+file_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    output=$(sha256sum "$1") || return 1
+    printf '%s\n' "${output%% *}"
+    return
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    output=$(shasum -a 256 "$1") || return 1
+    printf '%s\n' "${output%% *}"
+    return
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    output=$(openssl dgst -sha256 "$1") || return 1
+    printf '%s\n' "${output##* }"
+    return
+  fi
+  fail "a SHA-256 tool is required to verify the temporary Bun download (sha256sum, shasum, or openssl)"
+}
+
+bootstrap_bun() {
+  system=$(uname -s 2>/dev/null) || fail "could not determine the operating system for the temporary Bun download"
+  machine=$(uname -m 2>/dev/null) || fail "could not determine the architecture for the temporary Bun download"
+  case "$machine" in
+    x86_64|amd64) architecture=x64 ;;
+    aarch64|arm64) architecture=aarch64 ;;
+    *) fail "automatic Bun bootstrap does not support architecture: $machine; set OPENCODE_SAFE_COMPACTION_BUN" ;;
+  esac
+
+  case "$system:$architecture" in
+    Linux:x64)
+      libc=glibc
+      if command -v ldd >/dev/null 2>&1; then
+        ldd_version=$(ldd --version 2>&1 || true)
+        case "$ldd_version" in *musl*) libc=musl ;; esac
+      fi
+      if [ "$libc" = "musl" ]; then
+        asset=bun-linux-x64-musl-baseline
+        expected_sha256=56a7d6806cf155536c0178f0ea5fbd098e684fa509ebdb4fc0a7e19fb65382dc
+      else
+        asset=bun-linux-x64-baseline
+        expected_sha256=a063908ae08b7852ca10939bbdc6ceed3ddabce8fb9402dce83d65d73b36e6c7
+      fi
+      ;;
+    Linux:aarch64)
+      libc=glibc
+      if command -v ldd >/dev/null 2>&1; then
+        ldd_version=$(ldd --version 2>&1 || true)
+        case "$ldd_version" in *musl*) libc=musl ;; esac
+      fi
+      if [ "$libc" = "musl" ]; then
+        asset=bun-linux-aarch64-musl
+        expected_sha256=b98e0ad3625c5c00d1d5b5ff55605c7adddbfae151861e68ade57b2d3b8703bb
+      else
+        asset=bun-linux-aarch64
+        expected_sha256=a27ffb63a8310375836e0d6f668ae17fa8d8d18b88c37c821c65331973a19a3b
+      fi
+      ;;
+    Darwin:x64)
+      asset=bun-darwin-x64-baseline
+      expected_sha256=3e35ad6f53971a9834bf9e6786e2adf72b5f1921cc9a9c5fde073d2972944076
+      ;;
+    Darwin:aarch64)
+      asset=bun-darwin-aarch64
+      expected_sha256=d8b96221828ad6f97ac7ac0ab7e95872341af763001e8803e8267652c2652620
+      ;;
+    FreeBSD:x64)
+      asset=bun-freebsd-x64-baseline
+      expected_sha256=cf24aff5d2b7d7c1d9838f58ae6162a5565e87584495fb8bcd2cfbae4f645d92
+      ;;
+    FreeBSD:aarch64)
+      asset=bun-freebsd-aarch64
+      expected_sha256=73c5c19059fde409137fc6cbab5905fc7c5afa58ce60e41a41a521c23fff66bb
+      ;;
+    *) fail "automatic Bun bootstrap does not support platform: $system/$machine; set OPENCODE_SAFE_COMPACTION_BUN" ;;
+  esac
+
+  curl_bin=$(resolve_command curl)
+  archive=$transaction_dir/$asset.zip
+  url=https://github.com/oven-sh/bun/releases/download/bun-v$bun_bootstrap_version/$asset.zip
+  say "Bun not found; downloading temporary Bun $bun_bootstrap_version for $system/$machine"
+  "$curl_bin" --proto '=https' --tlsv1.2 --location --fail --silent --show-error --retry 3 --output "$archive" "$url" ||
+    fail "could not download temporary Bun $bun_bootstrap_version"
+  actual_sha256=$(file_sha256 "$archive") || fail "could not hash the temporary Bun download"
+  [ "$actual_sha256" = "$expected_sha256" ] || fail "temporary Bun download failed SHA-256 verification"
+
+  bootstrap_dir=$transaction_dir/bun-bootstrap
+  mkdir -m 700 "$bootstrap_dir"
+  if unzip_bin=$(command -v unzip 2>/dev/null); then
+    "$unzip_bin" -q "$archive" -d "$bootstrap_dir" || fail "could not extract the temporary Bun download"
+  elif busybox_bin=$(command -v busybox 2>/dev/null); then
+    "$busybox_bin" unzip -q "$archive" -d "$bootstrap_dir" || fail "could not extract the temporary Bun download"
+  else
+    fail "unzip or busybox is required to extract the temporary Bun download"
+  fi
+  bun_bin=$bootstrap_dir/$asset/bun
+  [ -f "$bun_bin" ] || fail "temporary Bun archive did not contain the expected executable"
+  chmod 700 "$bun_bin"
+}
+
+select_bun() {
+  if [ "${OPENCODE_SAFE_COMPACTION_BUN+x}" = x ]; then
+    bun_bin=$(resolve_command "$bun_command")
+  elif command -v bun >/dev/null 2>&1; then
+    bun_bin=$(command -v bun)
+  else
+    bootstrap_bun
+  fi
+  check_bun_version
+}
+
 check_opencode_version() {
   version=$("$opencode_bin" --version)
   stable=${version%%-*}
@@ -90,9 +201,7 @@ case "$config_dir" in ""|/) fail "config directory is unsafe: $config_dir" ;; es
 reject_insecure_repository "$repository"
 
 git_bin=$(resolve_command git)
-bun_bin=$(resolve_command "$bun_command")
 opencode_bin=$(resolve_command "$opencode_command")
-check_bun_version
 check_opencode_version
 
 temporary_root=${TMPDIR:-/tmp}
@@ -156,6 +265,8 @@ trap finish 0
 trap 'exit 129' 1
 trap 'exit 130' 2
 trap 'exit 143' 15
+
+select_bun
 
 acquire_lock() {
   lock_target=$1
