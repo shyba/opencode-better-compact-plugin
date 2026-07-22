@@ -39,10 +39,10 @@ export type MessageRecord = {
 }
 
 export type TodoRecord = {
-  id: string
-  content: string
-  status: string
-  priority: string
+  id?: string
+  content?: string
+  status?: string
+  priority?: string
 }
 
 export type RecoveryLedgerData = {
@@ -277,12 +277,17 @@ export function buildRecoveryLedger(input: {
   legacyContext.reverse()
 
   const todos: RecoveryLedgerData["todos"] = []
-  for (const todo of input.todos.slice(0, LEDGER_LIMITS.todos_scanned)) {
+  for (const inputTodo of input.todos.slice(0, LEDGER_LIMITS.todos_scanned)) {
+    const todo = record(inputTodo)
+    if (!todo || typeof todo.content !== "string") continue
+    const content = compact(boundedSource(todo.content, 2_048), 360)
+    if (!content) continue
+    const id = typeof todo.id === "string" ? compact(boundedSource(todo.id, 512), 96) : ""
     insertSortedBounded(todos, {
-      id: compact(todo.id, 96),
-      status: compact(todo.status, 48),
-      priority: compact(todo.priority, 48),
-      content: compact(todo.content, 360),
+      id: id || `todo-${sha256(content).slice(0, 16)}`,
+      status: typeof todo.status === "string" ? compact(boundedSource(todo.status, 256), 48) : "unknown",
+      priority: typeof todo.priority === "string" ? compact(boundedSource(todo.priority, 256), 48) : "unknown",
+      content,
     }, LEDGER_LIMITS.todos, (left, right) => compareText(left.id, right.id) || compareText(left.content, right.content))
   }
 

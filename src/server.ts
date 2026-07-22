@@ -113,80 +113,90 @@ export async function server(input: PluginInput, rawOptions?: OpenCodePluginOpti
     },
 
     async "experimental.session.compacting"({ sessionID }, output) {
-      const options = requireSettings(settings, parsed)
-      const data = await loadSession(input, sessionID)
-      const priorSummary = await newestPriorPluginSummaryFromSession(
-        input,
-        sessionID,
-        data.messages,
-        data.nextCursor,
-        undefined,
-        options.max_summary_bytes,
-      )
-      const ledger = buildRecoveryLedger({
-        messages: data.messages,
-        todos: data.todos,
-        tailTurns: options.tail_turns,
-        maxBytes: options.max_ledger_bytes,
-        ...(priorSummary ? { priorSummary } : {}),
+      await guardInternalHook("experimental.session.compacting", sessionID, async () => {
+        const options = requireSettings(settings, parsed)
+        const data = await loadSession(input, sessionID)
+        const priorSummary = await newestPriorPluginSummaryFromSession(
+          input,
+          sessionID,
+          data.messages,
+          data.nextCursor,
+          undefined,
+          options.max_summary_bytes,
+        )
+        const ledger = buildRecoveryLedger({
+          messages: data.messages,
+          todos: data.todos,
+          tailTurns: options.tail_turns,
+          maxBytes: options.max_ledger_bytes,
+          ...(priorSummary ? { priorSummary } : {}),
+        })
+        attempts.set({
+          sessionID,
+          createdAt: Date.now(),
+          ledger,
+          validation: "pending",
+        })
+        output.prompt = buildCompactionPrompt(ledger, options.max_summary_bytes)
+      }, () => {
+        attempts.delete(sessionID)
       })
-      attempts.set({
-        sessionID,
-        createdAt: Date.now(),
-        ledger,
-        validation: "pending",
-      })
-      output.prompt = buildCompactionPrompt(ledger, options.max_summary_bytes)
     },
 
     async "experimental.chat.messages.transform"(_, output) {
-      const options = requireSettings(settings, parsed)
       const sessionID = output.messages[0]?.info.sessionID
-      if (!sessionID || output.messages.some((message) => message.info.sessionID !== sessionID)) return
-      const messageIDs = new Set<string>()
-      if (output.messages.some((message) => {
-        if (!message.info.id || messageIDs.has(message.info.id)) return true
-        messageIDs.add(message.info.id)
-        return false
-      })) {
-        throw new Error(`opencode-safe-compaction received duplicate model-visible message identity for ${sessionID}`)
-      }
-      let attempt = attempts.get(sessionID)
-      const invalid = invalidCompactionBeforeNewestUser(output.messages as MessageRecord[], options.max_summary_bytes)
-      if (!attempt && invalid) {
-        attempt = await rebuildAttempt(input, options, sessionID, invalid.info.id)
-        attempts.set(attempt)
-      }
-      if (attempt?.summaryMessageID && !invalid) {
-        attempts.delete(sessionID)
-        attempt = undefined
-      }
-      if (!attempt) {
-        await sanitizeOverflowReplay(input, sessionID, output.messages, options)
-        return
-      }
+      await guardInternalHook("experimental.chat.messages.transform", sessionID, async () => {
+        const options = requireSettings(settings, parsed)
+        if (!sessionID || output.messages.some((message) => message.info.sessionID !== sessionID)) return
+        const messageIDs = new Set<string>()
+        if (output.messages.some((message) => {
+          if (!message.info.id || messageIDs.has(message.info.id)) return true
+          messageIDs.add(message.info.id)
+          return false
+        })) {
+          throw new Error("duplicate model-visible message identity")
+        }
+        let attempt = attempts.get(sessionID)
+        const invalid = invalidCompactionBeforeNewestUser(output.messages as MessageRecord[], options.max_summary_bytes)
+        if (!attempt && invalid) {
+          attempt = await rebuildAttempt(input, options, sessionID, invalid.info.id)
+          attempts.set(attempt)
+        }
+        if (attempt?.summaryMessageID && !invalid) {
+          attempts.delete(sessionID)
+          attempt = undefined
+        }
+        if (!attempt) {
+          await sanitizeOverflowReplay(input, sessionID, output.messages, options)
+          return
+        }
 
-      const recoveryUser = invalid ? newestOrdinaryUser(output.messages) : undefined
-      if (attempt.recoveryComplete) return
-      const overflowRecovery = invalid && recoveryUser
-        ? await isOverflowReplay(input, sessionID, output.messages, invalid, recoveryUser)
-        : false
-      sanitizeHistory(
-        recoveryUser && !overflowRecovery ? output.messages.filter((message) => message !== recoveryUser) : output.messages,
-        options,
-      )
-      if (!invalid || !recoveryUser) return
-      const recoveryPartID = `safe-compaction-recovery-${attempt.ledger.digest.slice(0, 16)}`
-      if (recoveryUser.parts.some((part) => record(part)?.id === recoveryPartID)) return
-      recoveryUser.parts.push({
-        id: recoveryPartID,
-        sessionID,
-        messageID: recoveryUser.info.id,
-        type: "text",
-        synthetic: true,
-        text: recoveryContext(attempt.ledger),
+        const recoveryUser = invalid ? newestOrdinaryUser(output.messages) : undefined
+        if (attempt.recoveryComplete) return
+        const overflowRecovery = invalid && recoveryUser
+          ? await isOverflowReplay(input, sessionID, output.messages, invalid, recoveryUser)
+          : false
+        const recoveryPartID = `safe-compaction-recovery-${attempt.ledger.digest.slice(0, 16)}`
+        const recoveryPart = invalid && recoveryUser && !recoveryUser.parts.some((part) => record(part)?.id === recoveryPartID)
+          ? {
+            id: recoveryPartID,
+            sessionID,
+            messageID: recoveryUser.info.id,
+            type: "text" as const,
+            synthetic: true,
+            text: recoveryContext(attempt.ledger),
+          }
+          : undefined
+        sanitizeHistory(
+          recoveryUser && !overflowRecovery ? output.messages.filter((message) => message !== recoveryUser) : output.messages,
+          options,
+        )
+        if (!recoveryUser || !recoveryPart) return
+        recoveryUser.parts = [...recoveryUser.parts, recoveryPart]
+        attempt.recoveryUserID = recoveryUser.info.id
+      }, () => {
+        attempts.delete(sessionID)
       })
-      attempt.recoveryUserID = recoveryUser.info.id
     },
 
     async "chat.params"(hookInput, output) {
@@ -229,97 +239,110 @@ export async function server(input: PluginInput, rawOptions?: OpenCodePluginOpti
     },
 
     async "experimental.text.complete"(hookInput, output) {
-      const options = requireSettings(settings, parsed)
-      const target = await input.client.session.message({
-        path: { id: hookInput.sessionID, messageID: hookInput.messageID },
-        throwOnError: true,
-      })
-      const targetTextParts = compactionTargetTextParts(target.data, hookInput)
-      if (!targetTextParts) return
-      const data = await loadSession(input, hookInput.sessionID)
-      if (!hasCompactionParent(data.messages, hookInput)) return
+      await guardInternalHook("experimental.text.complete", hookInput.sessionID, async () => {
+        const options = requireSettings(settings, parsed)
+        const target = await input.client.session.message({
+          path: { id: hookInput.sessionID, messageID: hookInput.messageID },
+          throwOnError: true,
+        })
+        const targetTextParts = compactionTargetTextParts(target.data, hookInput)
+        if (!targetTextParts) return
+        const data = await loadSession(input, hookInput.sessionID)
+        if (!hasCompactionParent(data.messages, hookInput)) return
 
-      let attempt = attempts.get(hookInput.sessionID)
-      if (!attempt || (attempt.summaryMessageID && attempt.summaryMessageID !== hookInput.messageID)) {
-        attempt = await rebuildAttempt(input, options, hookInput.sessionID, hookInput.messageID, data)
-        attempts.set(attempt)
-      }
-      if (attempt.textPartID && attempt.textPartID !== hookInput.partID) {
-        output.text = ""
-        return
-      }
-      attempt.textPartID = hookInput.partID
-      attempt.summaryMessageID = hookInput.messageID
-      output.text = buildAuthoritativeSummary({
-        ledger: attempt.ledger,
-        maxBytes: options.max_summary_bytes,
+        let attempt = attempts.get(hookInput.sessionID)
+        if (!attempt || (attempt.summaryMessageID && attempt.summaryMessageID !== hookInput.messageID)) {
+          attempt = await rebuildAttempt(input, options, hookInput.sessionID, hookInput.messageID, data)
+          attempts.set(attempt)
+        }
+        if (attempt.textPartID && attempt.textPartID !== hookInput.partID) {
+          output.text = ""
+          return
+        }
+        attempt.textPartID = hookInput.partID
+        attempt.summaryMessageID = hookInput.messageID
+        const text = buildAuthoritativeSummary({
+          ledger: attempt.ledger,
+          maxBytes: options.max_summary_bytes,
+        })
+        const validation = targetTextParts >= 1 && isAuthoritativeSummary(text, options.max_summary_bytes)
+          ? "fallback"
+          : "invalid"
+        output.text = text
+        attempt.validation = validation
+      }, () => {
+        const attempt = attempts.get(hookInput.sessionID)
+        if (!attempt) return
+        attempt.summaryMessageID = hookInput.messageID
+        attempt.validation = "invalid"
       })
-      attempt.validation = targetTextParts >= 1 && isAuthoritativeSummary(output.text, options.max_summary_bytes)
-        ? "fallback"
-        : "invalid"
     },
 
     async "experimental.compaction.autocontinue"(hookInput, output) {
       if (!output.enabled) return
-      const options = requireSettings(settings, parsed)
-      const active = attempts.get(hookInput.sessionID)
-      const data = await loadSession(input, hookInput.sessionID)
-      const current = compactionSummaryForParent(data.messages, hookInput.message.id)
-      const text = current ? summaryText(current, options.max_summary_bytes) : ""
-      const parsedLedger = text ? parsePluginLedger(text) : undefined
-      let valid = false
-      if (
-        current &&
-        !(active?.summaryMessageID === current.info.id && active.validation === "invalid") &&
-        parsedLedger &&
-        isAuthoritativeSummary(text, options.max_summary_bytes)
-      ) {
-        const rebuilt = await rebuildAttempt(input, options, hookInput.sessionID, current.info.id, data)
-        if (rebuilt.ledger.block === parsedLedger.block) {
-          valid = true
+      await guardInternalHook("experimental.compaction.autocontinue", hookInput.sessionID, async () => {
+        const options = requireSettings(settings, parsed)
+        const active = attempts.get(hookInput.sessionID)
+        const data = await loadSession(input, hookInput.sessionID)
+        const current = compactionSummaryForParent(data.messages, hookInput.message.id)
+        const text = current ? summaryText(current, options.max_summary_bytes) : ""
+        const parsedLedger = text ? parsePluginLedger(text) : undefined
+        let valid = false
+        if (
+          current &&
+          !(active?.summaryMessageID === current.info.id && active.validation === "invalid") &&
+          parsedLedger &&
+          isAuthoritativeSummary(text, options.max_summary_bytes)
+        ) {
+          const rebuilt = await rebuildAttempt(input, options, hookInput.sessionID, current.info.id, data)
+          if (rebuilt.ledger.block === parsedLedger.block) {
+            valid = true
+          }
         }
-      }
-      output.enabled = valid
-      attempts.delete(hookInput.sessionID)
+        output.enabled = valid
+        attempts.delete(hookInput.sessionID)
+      }, () => {
+        output.enabled = false
+        attempts.delete(hookInput.sessionID)
+      })
     },
 
     async event({ event }) {
       const properties = record(event.properties)
-      if (event.type === "session.compacted") {
-        attempts.delete(typeof properties?.sessionID === "string" ? properties.sessionID : undefined)
-        return
-      }
-      if (event.type === "session.idle") {
-        const sessionID = typeof properties?.sessionID === "string" ? properties.sessionID : undefined
-        const attempt = sessionID ? attempts.get(sessionID) : undefined
-        if (attempt?.recoveryUserID) attempt.recoveryComplete = true
-        else attempts.delete(sessionID)
-        return
-      }
-      if (event.type === "session.status" && record(properties?.status)?.type === "idle") {
-        const sessionID = typeof properties?.sessionID === "string" ? properties.sessionID : undefined
-        const attempt = sessionID ? attempts.get(sessionID) : undefined
-        if (attempt?.recoveryUserID) attempt.recoveryComplete = true
-        else attempts.delete(sessionID)
-        return
-      }
-      if (event.type === "session.deleted") {
-        const info = record(properties?.info)
-        attempts.delete(
-          typeof properties?.sessionID === "string"
-            ? properties.sessionID
-            : typeof info?.id === "string"
-              ? info.id
-              : undefined,
-        )
-        return
-      }
-      if (event.type === "session.error") {
-        if (typeof properties?.sessionID === "string") attempts.delete(properties.sessionID)
-        else attempts.cleanupExpired()
-        return
-      }
-      attempts.cleanupExpired()
+      const info = record(properties?.info)
+      const sessionID = typeof properties?.sessionID === "string"
+        ? properties.sessionID
+        : typeof info?.id === "string"
+          ? info.id
+          : undefined
+      await guardInternalHook("event", sessionID, async () => {
+        if (event.type === "session.compacted") {
+          attempts.delete(sessionID)
+          return
+        }
+        if (event.type === "session.idle") {
+          const attempt = sessionID ? attempts.get(sessionID) : undefined
+          if (attempt?.recoveryUserID) attempt.recoveryComplete = true
+          else attempts.delete(sessionID)
+          return
+        }
+        if (event.type === "session.status" && record(properties?.status)?.type === "idle") {
+          const attempt = sessionID ? attempts.get(sessionID) : undefined
+          if (attempt?.recoveryUserID) attempt.recoveryComplete = true
+          else attempts.delete(sessionID)
+          return
+        }
+        if (event.type === "session.deleted") {
+          attempts.delete(sessionID)
+          return
+        }
+        if (event.type === "session.error") {
+          if (sessionID) attempts.delete(sessionID)
+          else attempts.cleanupExpired()
+          return
+        }
+        attempts.cleanupExpired()
+      })
     },
 
     async dispose() {
@@ -328,6 +351,39 @@ export async function server(input: PluginInput, rawOptions?: OpenCodePluginOpti
   } satisfies Hooks
 
   return hooks
+}
+
+async function guardInternalHook(
+  hook: string,
+  sessionID: string | undefined,
+  operation: () => Promise<void>,
+  recover: () => void = () => {},
+) {
+  try {
+    await operation()
+  } catch (error) {
+    try {
+      recover()
+    } catch {
+      // Cleanup is best-effort and must not turn an internal plugin fault into a host failure.
+    }
+    try {
+      console.warn("opencode-safe-compaction degraded safely after an internal hook failure", {
+        hook,
+        ...(sessionID ? { sessionID } : {}),
+        error: safeErrorClass(error),
+      })
+    } catch {
+      // Logging is best-effort and must never affect the host.
+    }
+  }
+}
+
+function safeErrorClass(error: unknown) {
+  if (error instanceof TypeError) return "TypeError"
+  if (error instanceof RangeError) return "RangeError"
+  if (error instanceof Error) return "Error"
+  return "NonError"
 }
 
 async function rebuildAttempt(

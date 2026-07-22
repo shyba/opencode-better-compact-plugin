@@ -229,6 +229,45 @@ describe("recovery ledger", () => {
     expect(ledger.data.next_actions[0]).toBe("Continue the newest request: Fix the recovery race")
   })
 
+  test("normalizes V1 todos that omit IDs and optional metadata", () => {
+    const oversizedWhitespaceID = " ".repeat(1_024 * 1_024) + "must-not-be-reached"
+    const input = {
+      messages: [message("request", sessionID, "user", [{ type: "text", text: "Resume safely" }])],
+      todos: [
+        { content: "Run the regression", status: "in_progress", priority: "high" },
+        { content: "Inspect the deployment" },
+        { id: oversizedWhitespaceID, content: "Bound oversized todo identifiers", status: "pending", priority: "low" },
+        { id: "", content: "" },
+      ],
+      tailTurns: 1,
+      maxBytes: 8_192,
+    }
+    const first = buildRecoveryLedger(input)
+    const second = buildRecoveryLedger(input)
+
+    expect(first.block).toBe(second.block)
+    expect(first.data.todos).toEqual([
+      {
+        id: `todo-${sha256("Bound oversized todo identifiers").slice(0, 16)}`,
+        status: "pending",
+        priority: "low",
+        content: "Bound oversized todo identifiers",
+      },
+      {
+        id: `todo-${sha256("Inspect the deployment").slice(0, 16)}`,
+        status: "unknown",
+        priority: "unknown",
+        content: "Inspect the deployment",
+      },
+      {
+        id: `todo-${sha256("Run the regression").slice(0, 16)}`,
+        status: "in_progress",
+        priority: "high",
+        content: "Run the regression",
+      },
+    ].sort((left, right) => left.id.localeCompare(right.id)))
+  })
+
   test("enforces collection bounds without inspecting omitted history, parts, or tool input", () => {
     const omitted = {
       get info(): MessageRecord["info"] {

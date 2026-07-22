@@ -3,6 +3,7 @@ import type { Config, Hooks, PluginInput } from "@opencode-ai/plugin"
 import {
   buildRecoveryLedger,
   canonicalLedger,
+  sha256,
   type MessageRecord,
   type RecoveryLedger,
   type TodoRecord,
@@ -39,6 +40,9 @@ type MockState = {
   messageCursors: Array<string | undefined>
   targetRequests: string[]
   targetStatuses: Map<string, number>
+  messagesError?: Error
+  todoError?: Error
+  targetError?: Error
 }
 
 const TEST_OPTIONS = {
@@ -76,6 +80,7 @@ function pluginInput(mock: MockState) {
         mock.metadataRequests.push(`messages:${input.path.id}`)
         mock.messageLimits.push(input.query?.limit)
         mock.messageCursors.push(input.query?.before)
+        if (mock.messagesError) throw mock.messagesError
         const fixture = mock.sessions.get(input.path.id)
         if (!fixture?.pages) return { data: fixture?.messages }
         const pageIndex = input.query?.before
@@ -88,11 +93,13 @@ function pluginInput(mock: MockState) {
       },
       todo: async (input: { path: { id: string }; throwOnError: boolean }) => {
         mock.metadataRequests.push(`todos:${input.path.id}`)
+        if (mock.todoError) throw mock.todoError
         return { data: mock.sessions.get(input.path.id)?.todos }
       },
       message: async (input: { path: { id: string; messageID: string }; throwOnError: boolean }) => {
         const key = `${input.path.id}:${input.path.messageID}`
         mock.targetRequests.push(key)
+        if (mock.targetError) throw mock.targetError
         const fixture = mock.sessions.get(input.path.id)
         const message = [...(fixture?.messages ?? []), ...(fixture?.pages ?? []).flatMap((page) => page.messages)].find(
           (item) => item.info.id === input.path.messageID,
@@ -729,14 +736,22 @@ describe("model-visible history sanitization", () => {
     expect(providerHistory).toEqual(before)
   })
 
-  test("rejects duplicate model-visible Message identities", async () => {
+  test("warns and leaves history unchanged for duplicate model-visible Message identities", async () => {
     const sessionID = "duplicate-provider"
     const hooks = await server(pluginInput(state()), TEST_OPTIONS)
     const providerHistory = [user("same", sessionID, "first"), user("same", sessionID, "second")]
+    const before = structuredClone(providerHistory)
+    const warn = spyOn(console, "warn").mockImplementation(() => {})
 
-    await expect(
-      hooks["experimental.chat.messages.transform"]?.({}, transformOutput(providerHistory)),
-    ).rejects.toThrow("duplicate model-visible message identity")
+    await hooks["experimental.chat.messages.transform"]?.({}, transformOutput(providerHistory))
+
+    expect(providerHistory).toEqual(before)
+    expect(warn.mock.calls[0]?.[1]).toEqual({
+      hook: "experimental.chat.messages.transform",
+      sessionID,
+      error: "Error",
+    })
+    warn.mockRestore()
   })
 })
 
@@ -754,6 +769,29 @@ describe("real hook compaction flows", () => {
     for (const section of REQUIRED_SECTIONS) expect(output.prompt).toContain(`## ${section}`)
     expect(output.prompt).toEndWith(ledger.block)
     expect(mock.messageLimits).toEqual([10_000])
+  })
+
+  test("compacts with the no-ID todo shape returned by the V1 session API", async () => {
+    const sessionID = "v1-todo-without-id"
+    const fixture: SessionFixture = {
+      messages: [user("request", sessionID, "Continue from the runtime todo list")],
+      todos: [{ content: "Preserve this pending action", status: "pending", priority: "high" }],
+    }
+    const mock = state([sessionID, fixture])
+    const hooks = await server(pluginInput(mock), TEST_OPTIONS)
+    const output = await compact(hooks, sessionID)
+    const ledger = expectedLedger(fixture)
+
+    expect(output.prompt).toEndWith(ledger.block)
+    expect(ledger.data.todos).toEqual([
+      {
+        id: `todo-${sha256("Preserve this pending action").slice(0, 16)}`,
+        content: "Preserve this pending action",
+        status: "pending",
+        priority: "high",
+      },
+    ])
+    expect(mock.metadataRequests).toEqual([`messages:${sessionID}`, `todos:${sessionID}`])
   })
 
   test("chains the newest plugin-valid ledger beyond the bounded recent-history page", async () => {
@@ -814,7 +852,7 @@ describe("real hook compaction flows", () => {
     expect(mock.targetRequests).toContain(`${sessionID}:${prior.request.info.id}`)
   })
 
-  test("skips missing prior parents but propagates parent lookup server failures", async () => {
+  test("skips missing prior parents and degrades to native compaction on parent lookup failures", async () => {
     const sessionID = "parent-status"
     const priorLedger = buildRecoveryLedger({
       messages: [user("001", sessionID, "unreachable old fact")],
@@ -831,12 +869,18 @@ describe("real hook compaction flows", () => {
 
     const failed = state([sessionID, fixture])
     failed.targetStatuses.set(`${sessionID}:${prior.request.info.id}`, 500)
-    await expect(compact(await server(pluginInput(failed), TEST_OPTIONS), sessionID)).rejects.toThrow(
-      "could not validate compaction parent",
-    )
+    const warn = spyOn(console, "warn").mockImplementation(() => {})
+    const failedOutput = await compact(await server(pluginInput(failed), TEST_OPTIONS), sessionID)
+    expect(failedOutput.prompt).toBeUndefined()
+    expect(warn.mock.calls[0]?.[1]).toEqual({
+      hook: "experimental.session.compacting",
+      sessionID,
+      error: "Error",
+    })
+    warn.mockRestore()
   })
 
-  test("rejects a repeated cursor while searching older plugin-valid ledgers", async () => {
+  test("degrades to native compaction for a repeated older-ledger cursor", async () => {
     const sessionID = "repeated-cursor"
     const recent = user("zzz", sessionID, "Current request")
     const fixture: SessionFixture = {
@@ -849,11 +893,14 @@ describe("real hook compaction flows", () => {
       pageByCursor: { repeat: 1 },
     }
     const hooks = await server(pluginInput(state([sessionID, fixture])), TEST_OPTIONS)
+    const warn = spyOn(console, "warn").mockImplementation(() => {})
 
-    await expect(compact(hooks, sessionID)).rejects.toThrow("repeated message cursor")
+    expect((await compact(hooks, sessionID)).prompt).toBeUndefined()
+    expect(warn).toHaveBeenCalledTimes(1)
+    warn.mockRestore()
   })
 
-  test("rejects overlapping message pages", async () => {
+  test("degrades to native compaction for overlapping or duplicate message pages", async () => {
     const sessionID = "overlapping-pages"
     const recent = user("msg-recent", sessionID, "Current request")
     const fixture: SessionFixture = {
@@ -864,19 +911,20 @@ describe("real hook compaction flows", () => {
         { messages: [recent] },
       ],
     }
+    const warn = spyOn(console, "warn").mockImplementation(() => {})
 
-    await expect(compact(await server(pluginInput(state([sessionID, fixture])), TEST_OPTIONS), sessionID)).rejects.toThrow(
-      "overlapping message pages",
-    )
+    expect((await compact(await server(pluginInput(state([sessionID, fixture])), TEST_OPTIONS), sessionID)).prompt)
+      .toBeUndefined()
 
     const duplicate: SessionFixture = {
       messages: [recent],
       todos: [],
       pages: [{ messages: [recent, recent] }],
     }
-    await expect(compact(await server(pluginInput(state([sessionID, duplicate])), TEST_OPTIONS), sessionID)).rejects.toThrow(
-      "duplicate message identity",
-    )
+    expect((await compact(await server(pluginInput(state([sessionID, duplicate])), TEST_OPTIONS), sessionID)).prompt)
+      .toBeUndefined()
+    expect(warn).toHaveBeenCalledTimes(2)
+    warn.mockRestore()
   })
 
   test("bounds older-ledger discovery across fresh cursors and identities", async () => {
@@ -1437,6 +1485,116 @@ describe("real hook compaction flows", () => {
 
     expect((firstProviderHistory[0]?.parts[0] as { text: string }).text).toContain("historical text omitted")
     expect((secondProviderHistory[0]?.parts[0] as { text: string }).text).toContain("historical text omitted")
+  })
+
+  test("falls back to native compaction and logs metadata only when ledger input fails", async () => {
+    const sessionID = "todo-api-failure"
+    const secret = "PRIVATE-TODO-ERROR-SENTINEL"
+    const secretName = "PRIVATE-TODO-ERROR-NAME"
+    const fixture = { messages: [user("request", sessionID, "Do not log this request")], todos: [] }
+    const mock = state([sessionID, fixture])
+    mock.todoError = new Error(secret)
+    mock.todoError.name = secretName
+    const warn = spyOn(console, "warn").mockImplementation(() => {})
+    const output = await compact(await server(pluginInput(mock), TEST_OPTIONS), sessionID)
+
+    expect(output.prompt).toBeUndefined()
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn.mock.calls[0]?.[1]).toEqual({
+      hook: "experimental.session.compacting",
+      sessionID,
+      error: "Error",
+    })
+    expect(JSON.stringify(warn.mock.calls)).not.toContain(secret)
+    expect(JSON.stringify(warn.mock.calls)).not.toContain(secretName)
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("Do not log this request")
+    warn.mockRestore()
+  })
+
+  test("leaves provider history unchanged when sanitization fails internally", async () => {
+    const sessionID = "sanitize-failure"
+    const fixture = { messages: [user("request", sessionID, "Retain the durable request")], todos: [] }
+    const hooks = await server(pluginInput(state([sessionID, fixture])), TEST_OPTIONS)
+    await compact(hooks, sessionID)
+    const providerHistory = [storedMessage("malformed", sessionID, "assistant", [
+      textPart("malformed", sessionID, "x".repeat(1_000)),
+      {
+        id: "bad-tool",
+        sessionID,
+        messageID: "malformed",
+        type: "tool",
+        callID: "bad-call",
+        tool: "shell",
+        state: { status: "error", input: {}, error: undefined, time: { start: 1, end: 2 } },
+      },
+    ])]
+    const before = structuredClone(providerHistory)
+    const warn = spyOn(console, "warn").mockImplementation(() => {})
+
+    await hooks["experimental.chat.messages.transform"]?.({}, transformOutput(providerHistory))
+
+    expect(providerHistory).toEqual(before)
+    expect(warn.mock.calls[0]?.[1]).toEqual({
+      hook: "experimental.chat.messages.transform",
+      sessionID,
+      error: "TypeError",
+    })
+    warn.mockRestore()
+  })
+
+  test("preserves provider text but suppresses continuation when completion handling fails", async () => {
+    const sessionID = "completion-failure"
+    const secret = "PRIVATE-COMPLETION-ERROR-SENTINEL"
+    const fixture = { messages: [user("request", sessionID, "Retain completion state")], todos: [] }
+    const mock = state([sessionID, fixture])
+    const hooks = await server(pluginInput(mock), TEST_OPTIONS)
+    await compact(hooks, sessionID)
+    const exchange = compactionExchange(sessionID, "")
+    fixture.messages.push(exchange.request, exchange.summary)
+    const providerText = buildAuthoritativeSummary({
+      ledger: expectedLedger(fixture, exchange.summary.info.id),
+      maxBytes: Number(TEST_OPTIONS.max_summary_bytes),
+    })
+    ;(exchange.summary.parts[0] as { text: string }).text = providerText
+    mock.targetError = new Error(secret)
+    const warn = spyOn(console, "warn").mockImplementation(() => {})
+    const output = { text: providerText }
+
+    await hooks["experimental.text.complete"]?.({
+      sessionID,
+      messageID: exchange.summary.info.id,
+      partID: exchange.partIDs[0]!,
+    }, output)
+    mock.targetError = undefined
+
+    expect(output.text).toBe(providerText)
+    expect(await autocontinue(hooks, sessionID)).toBe(false)
+    expect(warn.mock.calls[0]?.[1]).toEqual({
+      hook: "experimental.text.complete",
+      sessionID,
+      error: "Error",
+    })
+    expect(JSON.stringify(warn.mock.calls)).not.toContain(secret)
+    warn.mockRestore()
+  })
+
+  test("fails auto-continuation closed when durable revalidation fails internally", async () => {
+    const sessionID = "autocontinue-failure"
+    const fixture = { messages: [user("request", sessionID, "Retain fail-closed state")], todos: [] }
+    const mock = state([sessionID, fixture])
+    const hooks = await server(pluginInput(mock), TEST_OPTIONS)
+    await compact(hooks, sessionID)
+    mock.messagesError = new Error("PRIVATE-AUTOCONTINUE-ERROR-SENTINEL")
+    const warn = spyOn(console, "warn").mockImplementation(() => {})
+
+    expect(await autocontinue(hooks, sessionID)).toBe(false)
+    expect(warn.mock.calls[0]?.[1]).toEqual({
+      hook: "experimental.compaction.autocontinue",
+      sessionID,
+      error: "Error",
+    })
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("PRIVATE-AUTOCONTINUE-ERROR-SENTINEL")
+    warn.mockRestore()
   })
 
   test("emits no conversation content through console logging", async () => {

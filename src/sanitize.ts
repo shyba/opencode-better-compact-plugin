@@ -61,8 +61,9 @@ export function sanitizeHistory(
   messages: Array<{ info: { id: string; sessionID: string; role: string }; parts: HookPart[] }>,
   options: PluginOptions,
 ) {
-  for (const message of messages) {
-    message.parts = message.parts.map((part) => {
+  const sanitized = messages.map((message) => ({
+    message,
+    parts: message.parts.map((part): HookPart => {
       if (part.type === "text") {
         const text = sanitizeText(part.text, options.max_historical_part_bytes)
         const metadata = text === part.text ? boundedProviderMetadata(part.metadata) : undefined
@@ -160,8 +161,11 @@ export function sanitizeHistory(
         }
       }
       return part
-    })
-  }
+    }),
+  }))
+  sanitized.forEach((item) => {
+    item.message.parts = item.parts
+  })
 }
 
 function sanitizeText(value: string, maxBytes: number) {

@@ -117,12 +117,14 @@ The plugin has five defensive stages:
 
 The plugin stores only bounded attempt metadata in process memory, keyed by the full Session ID, with a 30-minute TTL and a 128-attempt cap. Idle can retain a small recovery-complete tombstone until expiry so later turns in the same process do not repeat recovery. After a restart there is no durable proof that clone-only recovery was seen, so the plugin conservatively reinjects bounded recovery context. Events remain cleanup/audit signals, not correctness gates.
 
+Internal failures in the experimental compaction, history-transform, completion, and event hooks are contained at the plugin boundary. Before a summary is accepted, the plugin leaves the hook output unchanged so OpenCode can use its native behavior. Auto-continuation fails closed when durable summary validation cannot complete. A metadata-only warning identifies the hook, Session ID when available, and error class; it never includes the error message, stack, conversation content, ledger, todo, or tool output. Configuration errors, unsafe model-limit combinations, and oversized newly admitted requests remain deliberate failures because silently ignoring them would weaken the configured safety policy.
+
 ## Security and privacy
 
 - The runtime plugin has no telemetry, external network client, or runtime dependency. Its OpenCode client calls read the active session and todo records from the host server.
 - It creates no shadow transcript, sidecar recovery file, or external cache. Durable conversation history remains owned by OpenCode.
 - Recovery content is bounded, credential-shaped values are redacted, and provider-authored legacy summary prose is omitted. A prior plugin-valid canonical ledger may be chained to retain bounded facts across repeated compactions; its provider-authored prose is never carried forward.
-- Runtime logging contains metadata only; conversation text, tool output, ledger bodies, and credentials are not logged.
+- Runtime logging contains metadata only. Contained internal failures warn with the hook, Session ID when available, and error class; conversation text, error messages and stacks, tool output, ledger bodies, and credentials are not logged.
 - New oversized requests fail closed. Historical truncation affects only the cloned model-visible history used during recovery, not durable records.
 
 The optional live eval adapters described below either spawn an installed OpenCode executable or make an explicit HTTP request to the configured evaluation endpoint. They are development tooling, are never imported by the runtime entry point, and use only the checked-in synthetic corpus.
