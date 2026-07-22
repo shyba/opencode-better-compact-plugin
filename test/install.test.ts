@@ -204,6 +204,9 @@ describe("installer", () => {
     const temporaryDirectory = path.join(root, "temporary")
     await mkdir(temporaryDirectory)
     const bootstrap = await bootstrapFixtures(root)
+    const opencodeDirectory = path.join(root, ".opencode/bin")
+    await mkdir(opencodeDirectory, { recursive: true })
+    await openCodeFixture(opencodeDirectory, "opencode")
     const environment = {
       ...process.env,
       HOME: root,
@@ -214,19 +217,38 @@ describe("installer", () => {
       OPENCODE_SAFE_COMPACTION_REPO: origin,
       OPENCODE_SAFE_COMPACTION_DIR: install,
       OPENCODE_SAFE_COMPACTION_CONFIG_DIR: config,
-      OPENCODE_SAFE_COMPACTION_OPENCODE: await openCodeFixture(root, "opencode-bootstrap"),
     }
     delete environment.OPENCODE_SAFE_COMPACTION_BUN
+    delete environment.OPENCODE_SAFE_COMPACTION_OPENCODE
 
     const result = await command(["sh", "install.sh"], environment)
 
     expect(result.exitCode).toBe(0)
+    expect(result.stdout).toContain(`OpenCode not found on PATH; using ${path.join(opencodeDirectory, "opencode")}`)
     expect(result.stdout).toContain("Bun not found; downloading temporary Bun 1.3.14 for Linux/x86_64")
     expect(await Bun.file(bootstrap.log).text()).toBe(
       "https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-linux-x64-baseline.zip\n",
     )
     expect(await Bun.file(path.join(install, "src/index.ts")).exists()).toBe(true)
     expect(await Array.fromAsync(new Bun.Glob("opencode-safe-compaction.*").scan(temporaryDirectory))).toEqual([])
+  })
+
+  test("keeps an explicit missing OpenCode override authoritative", async () => {
+    const root = await directory()
+    const fallback = path.join(root, ".opencode/bin")
+    await mkdir(fallback, { recursive: true })
+    await openCodeFixture(fallback, "opencode")
+
+    const result = await command(["sh", "install.sh"], {
+      ...process.env,
+      HOME: root,
+      OPENCODE_SAFE_COMPACTION_DIR: path.join(root, "install"),
+      OPENCODE_SAFE_COMPACTION_CONFIG_DIR: path.join(root, "config"),
+      OPENCODE_SAFE_COMPACTION_OPENCODE: path.join(root, "explicit-missing-opencode"),
+    })
+
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr).toContain(`executable not found: ${path.join(root, "explicit-missing-opencode")}`)
   })
 
   test("refuses an unverified temporary Bun archive before cloning or editing configuration", async () => {

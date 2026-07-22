@@ -174,6 +174,47 @@ select_bun() {
   check_bun_version
 }
 
+select_opencode() {
+  if [ "${OPENCODE_SAFE_COMPACTION_OPENCODE+x}" = x ]; then
+    opencode_bin=$(resolve_command "$opencode_command")
+    return
+  fi
+  if command -v opencode >/dev/null 2>&1; then
+    opencode_bin=$(command -v opencode)
+    return
+  fi
+  if [ -n "${OPENCODE_INSTALL_DIR:-}" ] && [ -x "$OPENCODE_INSTALL_DIR/opencode" ]; then
+    opencode_bin=$OPENCODE_INSTALL_DIR/opencode
+    say "OpenCode not found on PATH; using $opencode_bin"
+    return
+  fi
+  if [ -n "${XDG_BIN_DIR:-}" ] && [ -x "$XDG_BIN_DIR/opencode" ]; then
+    opencode_bin=$XDG_BIN_DIR/opencode
+    say "OpenCode not found on PATH; using $opencode_bin"
+    return
+  fi
+  for candidate in \
+    "$HOME/bin/opencode" \
+    "$HOME/.opencode/bin/opencode" \
+    "$HOME/.local/bin/opencode" \
+    "$HOME/.bun/bin/opencode" \
+    "$HOME/.local/share/pnpm/opencode" \
+    "$HOME/.local/share/mise/shims/opencode" \
+    "$HOME/.nix-profile/bin/opencode" \
+    /opt/homebrew/bin/opencode \
+    /home/linuxbrew/.linuxbrew/bin/opencode \
+    /usr/local/bin/opencode \
+    /usr/bin/opencode
+  do
+    if [ -x "$candidate" ]; then
+      opencode_bin=$candidate
+      say "OpenCode not found on PATH; using $opencode_bin"
+      return
+    fi
+  done
+  fail "OpenCode executable not found on PATH or in a supported install location; set OPENCODE_SAFE_COMPACTION_OPENCODE=/absolute/path/to/opencode"
+}
+
 check_opencode_version() {
   version=$("$opencode_bin" --version)
   stable=${version%%-*}
@@ -201,7 +242,7 @@ case "$config_dir" in ""|/) fail "config directory is unsafe: $config_dir" ;; es
 reject_insecure_repository "$repository"
 
 git_bin=$(resolve_command git)
-opencode_bin=$(resolve_command "$opencode_command")
+select_opencode
 check_opencode_version
 
 temporary_root=${TMPDIR:-/tmp}
