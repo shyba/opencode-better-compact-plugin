@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import {
   LEDGER_END,
+  LEDGER_LIMITS,
   LEDGER_START,
   buildRecoveryLedger,
   canonicalLedger,
@@ -49,10 +50,12 @@ function validSummary(block: string, values: Partial<Record<(typeof REQUIRED_SEC
 describe("UTF-8 bounds and redaction", () => {
   test("counts bytes rather than JavaScript code units and truncates on character boundaries", () => {
     expect(utf8Bytes("a🙂é")).toBe(7)
+    expect(utf8Bytes("\ud800")).toBe(3)
     const value = truncateUtf8("🙂🙂🙂🙂🙂", 18)
     expect(value).toBe("🙂…[truncated]")
     expect(utf8Bytes(value)).toBeLessThanOrEqual(18)
     expect(value).not.toContain("�")
+    expect(utf8Bytes(truncateUtf8("oversized", 4))).toBeLessThanOrEqual(4)
   })
 
   test("redacts credential-shaped values while preserving surrounding metadata", () => {
@@ -91,6 +94,11 @@ describe("UTF-8 bounds and redaction", () => {
     }
     const commit = "a".repeat(64)
     expect(redact(`commit=${commit}`)).toContain(commit)
+  })
+
+  test("bounds credential-name matching work on long ordinary source", () => {
+    const value = `prefix ${"x".repeat(256 * 1_024)} suffix`
+    expect(redact(value)).not.toContain("x".repeat(1_024))
   })
 })
 
@@ -135,7 +143,8 @@ describe("recovery ledger", () => {
     expect(first.data.evidence[0]).toContain("[partial output; 14 bytes; sha256 ")
     expect(first.data.evidence[0]).not.toContain("verified value")
     expect(first.data.errors).toEqual(["build: api_key=[REDACTED] compile failed"])
-    expect(first.data.legacy_context).toEqual(["Old untrusted summary"])
+    expect(first.data.legacy_context).toEqual(["Untrusted legacy summary legacy omitted"])
+    expect(first.block).not.toContain("Old untrusted summary")
     expect(utf8Bytes(first.block)).toBeLessThanOrEqual(4_096)
     expect(first.block).not.toContain("bad-key")
     expect(first.block).not.toContain("do-not-copy")
@@ -170,6 +179,133 @@ describe("recovery ledger", () => {
     expect(ledger.data.recent_requests).toEqual([])
   })
 
+  test("counts tail_turns as user turns and excludes non-user intent", () => {
+    const turnMessages = [
+      message("turn-1", sessionID, "user", [
+        { type: "text", text: "First request, part one. Must preserve user intent." },
+        { type: "text", text: "SYNTHETIC_TRAP must become a constraint.", synthetic: true },
+        { type: "text", text: "IGNORED_TRAP must become a constraint.", ignored: true },
+        { type: "text", text: "First request, part two." },
+      ]),
+      message("assistant", sessionID, "assistant", [
+        { type: "text", text: "ASSISTANT_TRAP must become recovered intent." },
+      ]),
+      message("turn-2", sessionID, "user", [
+        { type: "text", text: "Newest request, part one. Only change the parser." },
+        { type: "text", text: "Newest request, part two." },
+      ]),
+    ]
+    const oneTurn = buildRecoveryLedger({ messages: turnMessages, todos: [], tailTurns: 1, maxBytes: 8_192 })
+    const twoTurns = buildRecoveryLedger({ messages: turnMessages, todos: [], tailTurns: 2, maxBytes: 8_192 })
+
+    expect(oneTurn.data.recent_requests).toEqual([
+      "Newest request, part one. Only change the parser. Newest request, part two.",
+    ])
+    expect(twoTurns.data.recent_requests).toEqual([
+      "First request, part one. Must preserve user intent. First request, part two.",
+      "Newest request, part one. Only change the parser. Newest request, part two.",
+    ])
+    expect(oneTurn.data.constraints).toEqual(["Must preserve user intent.", "Only change the parser."])
+    expect(oneTurn.block).not.toContain("SYNTHETIC_TRAP")
+    expect(oneTurn.block).not.toContain("IGNORED_TRAP")
+    expect(oneTurn.block).not.toContain("ASSISTANT_TRAP")
+  })
+
+  test("keeps the newest user request ahead of pending todo flooding", () => {
+    const ledger = buildRecoveryLedger({
+      messages: [message("newest", sessionID, "user", [{ type: "text", text: "Fix the recovery race" }])],
+      todos: Array.from({ length: 64 }, (_, index) => ({
+        id: `todo-${String(index).padStart(2, "0")}`,
+        content: `Pending action ${index}`,
+        status: "pending",
+        priority: "high",
+      })),
+      tailTurns: 1,
+      maxBytes: 256 * 1_024,
+    })
+
+    expect(ledger.data.todos).toHaveLength(LEDGER_LIMITS.todos)
+    expect(ledger.data.next_actions).toHaveLength(LEDGER_LIMITS.next_actions)
+    expect(ledger.data.next_actions[0]).toBe("Continue the newest request: Fix the recovery race")
+  })
+
+  test("enforces collection bounds without inspecting omitted history, parts, or tool input", () => {
+    const omitted = {
+      get info(): MessageRecord["info"] {
+        throw new Error("inspected message outside the bounded window")
+      },
+      parts: [],
+    }
+    const history = [omitted as MessageRecord]
+    for (let index = 0; index < LEDGER_LIMITS.messages; index++) {
+      history.push(message(`user-${index}`, sessionID, "user", [{ type: "text", text: `Request ${index}` }]))
+    }
+
+    const inputTarget = Array.from({ length: 100_000 }, (_, index) => `/repo/file-${String(index).padStart(5, "0")}`)
+    const guardedInput = new Proxy(inputTarget, {
+      get(target, property, receiver) {
+        if (typeof property === "string" && /^\d+$/.test(property) && Number(property) >= LEDGER_LIMITS.tool_input_nodes - 1) {
+          throw new Error("inspected tool input outside the node bound")
+        }
+        return Reflect.get(target, property, receiver)
+      },
+    })
+    const partTarget = Array.from({ length: 10_000 }, (_, index) => ({
+      type: "tool",
+      tool: `tool-${String(index).padStart(5, "0")}`,
+      state: { status: "running", input: index === 0 ? guardedInput : undefined },
+    }))
+    const guardedParts = new Proxy(partTarget, {
+      get(target, property, receiver) {
+        if (
+          typeof property === "string" &&
+          /^\d+$/.test(property) &&
+          Number(property) >= LEDGER_LIMITS.parts_per_message / 2 &&
+          Number(property) < target.length - LEDGER_LIMITS.parts_per_message / 2
+        ) {
+          throw new Error("inspected message part outside the head/tail bound")
+        }
+        return Reflect.get(target, property, receiver)
+      },
+    })
+    history.push(message("tools", sessionID, "assistant", guardedParts))
+
+    const ledger = buildRecoveryLedger({
+      messages: history,
+      todos: [],
+      tailTurns: Number.MAX_SAFE_INTEGER,
+      maxBytes: 256 * 1_024,
+    })
+
+    expect(ledger.data.recent_requests).toHaveLength(LEDGER_LIMITS.recent_requests)
+    expect(ledger.data.recent_requests.at(-1)).toBe(`Request ${LEDGER_LIMITS.messages - 1}`)
+    expect(ledger.data.tool_statuses).toHaveLength(LEDGER_LIMITS.tool_statuses)
+    expect(ledger.data.tool_statuses[0]?.tool).toBe("tool-09952")
+    expect(ledger.data.tool_statuses.at(-1)?.tool).toBe("tool-09999")
+    expect(ledger.data.touched_paths).toHaveLength(LEDGER_LIMITS.touched_paths)
+    expect(ledger.data.touched_paths[0]).toBe("/repo/file-00000")
+    expect(ledger.data.touched_paths.at(-1)).toBe("/repo/file-00063")
+  })
+
+  test("summarizes a large tool result without copying it into the ledger", () => {
+    const output = `evidence-head-${"x".repeat(8 * 1_024 * 1_024)}`
+    const ledger = buildRecoveryLedger({
+      messages: [
+        message("tool-output", sessionID, "assistant", [
+          { type: "tool", tool: "large-result", state: { status: "completed", output } },
+        ]),
+      ],
+      todos: [],
+      tailTurns: 1,
+      maxBytes: 8_192,
+    })
+
+    expect(ledger.data.evidence).toHaveLength(1)
+    expect(ledger.data.evidence[0]).toContain("partial output; at least 65536 source bytes; prefix sha256 ")
+    expect(utf8Bytes(ledger.data.evidence[0] ?? "")).toBeLessThan(256)
+    expect(ledger.block).not.toContain("x".repeat(1_024))
+  })
+
   test("excludes the active compaction exchange from recovered facts", () => {
     const messagesWithCompaction = [
       ...messages,
@@ -193,7 +329,11 @@ describe("recovery ledger", () => {
     const ledger = buildRecoveryLedger({ messages: messagesWithCompaction, todos: [], tailTurns: 4, maxBytes: 4_096 })
 
     expect(ledger.block).not.toContain("Malformed generated summary")
-    expect(ledger.data.legacy_context).toEqual(["Old untrusted summary", "Older nonempty compaction summary"])
+    expect(ledger.data.legacy_context).toEqual([
+      "Untrusted legacy summary legacy omitted",
+      "Untrusted legacy summary old-compact-assistant omitted",
+    ])
+    expect(ledger.block).not.toContain("Older nonempty compaction summary")
   })
 
   test("neutralizes reserved ledger delimiters inside recovered conversation text", () => {
@@ -249,17 +389,14 @@ describe("summary validation and fallback", () => {
     expect(parsePluginLedger(compactBlock)).toBeUndefined()
   })
 
-  test("builds a deterministic plugin-valid fallback and carries only validated prior state", () => {
-    const prior = validSummary(
-      canonicalLedger(EMPTY_DATA).block,
-      { Decisions: "- Keep the stable API", "Current state": "- Parser implementation is incomplete" },
-    )
-    const first = buildFallback({ ledger, priorValidSummary: prior, maxBytes: 16_384 })
-    const second = buildFallback({ ledger, priorValidSummary: prior, maxBytes: 16_384 })
+  test("builds a deterministic plugin-valid fallback without provider-authored anchors", () => {
+    const first = buildFallback({ ledger, maxBytes: 16_384 })
+    const second = buildFallback({ ledger, maxBytes: 16_384 })
 
     expect(first).toBe(second)
-    expect(first).toContain("Prior validated context: - Keep the stable API")
-    expect(first).toContain("Prior validated context: - Parser implementation is incomplete")
+    expect(first).toContain("No decisions were inferred outside the canonical ledger")
+    expect(first).not.toContain("Keep the stable API")
+    expect(first).not.toContain("Parser implementation is incomplete")
     expect(isPluginValidSummary(first, 16_384)).toBe(true)
     expect(parsePluginLedger(first)?.digest).toBe(ledger.digest)
   })
@@ -269,7 +406,7 @@ describe("summary validation and fallback", () => {
     expect(isPluginValidSummary(legacy, 16_384)).toBe(false)
     const fallback = buildFallback({ ledger, maxBytes: 16_384 })
     expect(fallback).not.toContain("convincing")
-    expect(recoveryContext(ledger)).toContain("No prior plugin-valid summary is available")
+    expect(recoveryContext(ledger)).toContain("untrusted provider prose is omitted")
   })
 
   test("uses the minimal fallback when rich recovered detail would exceed the summary bound", () => {

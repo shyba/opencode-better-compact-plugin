@@ -10,7 +10,13 @@ import {
 } from "../src/ledger.js"
 import { parseOptions, resolveOptions } from "../src/options.js"
 import { decodedDataUrlBytes, sanitizeHistory, server } from "../src/server.js"
-import { REQUIRED_SECTIONS, isPluginValidSummary, parsePluginLedger } from "../src/validation.js"
+import {
+  REQUIRED_SECTIONS,
+  buildAuthoritativeSummary,
+  isAuthoritativeSummary,
+  isPluginValidSummary,
+  parsePluginLedger,
+} from "../src/validation.js"
 
 type StoredMessage = MessageRecord & {
   info: MessageRecord["info"] & {
@@ -22,12 +28,17 @@ type StoredMessage = MessageRecord & {
 type SessionFixture = {
   messages: StoredMessage[]
   todos: TodoRecord[]
+  pages?: Array<{ messages: StoredMessage[]; nextCursor?: string }>
+  pageByCursor?: Record<string, number>
 }
 
 type MockState = {
   sessions: Map<string, SessionFixture>
   metadataRequests: string[]
+  messageLimits: Array<number | undefined>
+  messageCursors: Array<string | undefined>
   targetRequests: string[]
+  targetStatuses: Map<string, number>
 }
 
 const TEST_OPTIONS = {
@@ -44,24 +55,53 @@ const TEST_OPTIONS = {
 } satisfies Record<string, unknown>
 
 function state(...fixtures: Array<[string, SessionFixture]>): MockState {
-  return { sessions: new Map(fixtures), metadataRequests: [], targetRequests: [] }
+  return {
+    sessions: new Map(fixtures),
+    metadataRequests: [],
+    messageLimits: [],
+    messageCursors: [],
+    targetRequests: [],
+    targetStatuses: new Map(),
+  }
 }
 
 function pluginInput(mock: MockState) {
   const client = {
     session: {
-      messages: async (input: { path: { id: string }; throwOnError: boolean }) => {
+      messages: async (input: {
+        path: { id: string }
+        query?: { limit?: number; before?: string }
+        throwOnError: boolean
+      }) => {
         mock.metadataRequests.push(`messages:${input.path.id}`)
-        return { data: mock.sessions.get(input.path.id)?.messages }
+        mock.messageLimits.push(input.query?.limit)
+        mock.messageCursors.push(input.query?.before)
+        const fixture = mock.sessions.get(input.path.id)
+        if (!fixture?.pages) return { data: fixture?.messages }
+        const pageIndex = input.query?.before
+          ? fixture.pageByCursor?.[input.query.before] ?? Number(input.query.before.replace("cursor-", ""))
+          : 0
+        const page = fixture.pages[pageIndex]
+        const headers = new Headers()
+        if (page?.nextCursor) headers.set("X-Next-Cursor", page.nextCursor)
+        return { data: page?.messages, response: new Response(null, { headers }) }
       },
       todo: async (input: { path: { id: string }; throwOnError: boolean }) => {
         mock.metadataRequests.push(`todos:${input.path.id}`)
         return { data: mock.sessions.get(input.path.id)?.todos }
       },
       message: async (input: { path: { id: string; messageID: string }; throwOnError: boolean }) => {
-        mock.targetRequests.push(`${input.path.id}:${input.path.messageID}`)
+        const key = `${input.path.id}:${input.path.messageID}`
+        mock.targetRequests.push(key)
+        const fixture = mock.sessions.get(input.path.id)
+        const message = [...(fixture?.messages ?? []), ...(fixture?.pages ?? []).flatMap((page) => page.messages)].find(
+          (item) => item.info.id === input.path.messageID,
+        )
+        const status = mock.targetStatuses.get(key) ?? (message ? 200 : 404)
         return {
-          data: mock.sessions.get(input.path.id)?.messages.find((message) => message.info.id === input.path.messageID),
+          data: status === 200 ? message : undefined,
+          ...(status === 200 ? {} : { error: { status } }),
+          response: new Response(null, { status }),
         }
       },
     },
@@ -121,6 +161,7 @@ function compactionExchange(
         summary: true,
         parentID: userID,
         mode: "compaction",
+        agent: "compaction",
         ...(options.error ? { error: options.error } : {}),
       },
     ),
@@ -160,9 +201,17 @@ async function complete(
   return output.text
 }
 
-async function autocontinue(hooks: Hooks, sessionID: string, enabled = true) {
+async function autocontinue(
+  hooks: Hooks,
+  sessionID: string,
+  enabled = true,
+  messageID = `${sessionID}-compaction-user`,
+) {
   const output = { enabled }
-  const input = { sessionID } as unknown as Parameters<NonNullable<Hooks["experimental.compaction.autocontinue"]>>[0]
+  const input = {
+    sessionID,
+    message: { id: messageID, sessionID, role: "user" },
+  } as unknown as Parameters<NonNullable<Hooks["experimental.compaction.autocontinue"]>>[0]
   await hooks["experimental.compaction.autocontinue"]?.(input, output)
   return output.enabled
 }
@@ -178,7 +227,7 @@ function expectedLedger(fixture: SessionFixture, excludeSummaryID?: string) {
 }
 
 describe("admission limits", () => {
-  test("measures UTF-8 text, sums parts, and ignores synthetic recovery text", async () => {
+  test("measures UTF-8 text, sums parts, and does not trust client-controlled synthetic flags", async () => {
     const hooks = await server(pluginInput(state()), TEST_OPTIONS)
     const hook = hooks["chat.message"]
     expect(hook).toBeDefined()
@@ -211,15 +260,19 @@ describe("admission limits", () => {
           parts: [textPart("synthetic", "admission", "secret conversation text".repeat(100), true)],
         } as unknown as Parameters<NonNullable<Hooks["chat.message"]>>[1],
       ),
-    ).resolves.toBeUndefined()
+    ).rejects.toThrow("user message")
   })
 
   test("measures decoded base64 and percent-encoded inline data", async () => {
     expect(decodedDataUrlBytes("data:text/plain;base64,YWJj")).toBe(3)
     expect(decodedDataUrlBytes("DATA:text/plain;base64,YWJj")).toBe(3)
     expect(decodedDataUrlBytes("data:text/plain,hello%20world")).toBe(11)
+    expect(decodedDataUrlBytes("data:text/plain,%F0%9F%99%82")).toBe(4)
     expect(() => decodedDataUrlBytes("data:text/plain,%zz")).toThrow("Invalid percent-encoding")
+    expect(decodedDataUrlBytes("data:text/plain,%FF")).toBe(1)
+    expect(decodedDataUrlBytes("data:text/plain,%E2%82")).toBe(2)
     expect(() => decodedDataUrlBytes("data:text/plain;base64,%%%%")).toThrow("Invalid base64")
+    expect(() => decodedDataUrlBytes(`data:${"x".repeat(16_385)},a`)).toThrow("metadata exceeds 16384 bytes")
 
     const hooks = await server(pluginInput(state()), TEST_OPTIONS)
     const output = (url: string) =>
@@ -239,16 +292,22 @@ describe("admission limits", () => {
 
     await expect(hooks["chat.message"]?.({ sessionID: "admission" }, output("data:text/plain;base64,YWJj"))).resolves.toBeUndefined()
     await expect(hooks["chat.message"]?.({ sessionID: "admission" }, output("data:text/plain;base64,YWJjZA=="))).rejects.toThrow(
-      "rejected 4 decoded inline-data bytes (limit 3)",
+      "rejected 4 decoded inline-data bytes or more (limit 3)",
     )
     await expect(hooks["chat.message"]?.({ sessionID: "admission" }, output("DATA:text/plain;base64,YWJjZA=="))).rejects.toThrow(
-      "rejected 4 decoded inline-data bytes (limit 3)",
+      "rejected 4 decoded inline-data bytes or more (limit 3)",
     )
     const splitInline = output("data:text/plain;base64,YWI=")
     splitInline.parts.push(...output("data:text/plain;base64,Y2Q=").parts)
     await expect(hooks["chat.message"]?.({ sessionID: "admission" }, splitInline)).rejects.toThrow(
-      "rejected 4 decoded inline-data bytes (limit 3)",
+      "rejected 4 decoded inline-data bytes or more (limit 3)",
     )
+    await expect(
+      hooks["chat.message"]?.(
+        { sessionID: "admission" },
+        output(`data:text/plain;base64,${" ".repeat(17_000)}YWJj`),
+      ),
+    ).rejects.toThrow("encoded inline-data bytes")
   })
 })
 
@@ -321,6 +380,19 @@ describe("configuration and model request parameters", () => {
     expect(output.temperature).toBe(0)
     expect(output.maxOutputTokens).toBe(64)
 
+    const cleared = { ...output, temperature: 0.9, maxOutputTokens: undefined }
+    await hooks["chat.params"]?.(
+      { ...base, model: { ...base.model, limit: { context: 40, output: 80 } } },
+      cleared,
+    )
+    expect(cleared.temperature).toBe(0)
+    expect(cleared.maxOutputTokens).toBeUndefined()
+
+    const unsupported = { ...output, temperature: undefined, maxOutputTokens: undefined }
+    await hooks["chat.params"]?.(base, unsupported)
+    expect(unsupported.temperature).toBeUndefined()
+    expect(unsupported.maxOutputTokens).toBeUndefined()
+
     const ordinary = { ...output, temperature: 0.8, maxOutputTokens: 500 }
     await hooks["chat.params"]?.({ ...base, agent: "build" }, ordinary)
     expect(ordinary).toMatchObject({ temperature: 0.8, maxOutputTokens: 500 })
@@ -334,9 +406,21 @@ describe("configuration and model request parameters", () => {
     await expect(
       hooks["chat.params"]?.(
         { ...base, model: { ...base.model, limit: { context: 100, output: 80 } } },
-        { ...output },
+        { ...output, maxOutputTokens: 80 },
       ),
-    ).rejects.toThrow("leaves no usable input")
+    ).resolves.toBeUndefined()
+    await expect(
+      hooks["chat.params"]?.(
+        { ...base, model: { ...base.model, limit: { context: 1_000, input: 100, output: 80 } } },
+        { ...output, maxOutputTokens: 80 },
+      ),
+    ).rejects.toThrow("has no usable input")
+    await expect(
+      hooks["chat.params"]?.(
+        { ...base, model: { ...base.model, limit: { context: 1_000, output: 2_000 } } },
+        { ...output, maxOutputTokens: 2_000 },
+      ),
+    ).rejects.toThrow("has no usable input")
     await expect(
       hooks["chat.params"]?.(
         { ...base, model: { ...base.model, limit: { context: 1_000, output: 0 } } },
@@ -392,7 +476,7 @@ describe("model-visible history sanitization", () => {
     expect(text.text).toContain("historical text omitted")
     expect(tool.state.output).toStartWith("TOOL-HEAD-")
     expect(tool.state.output).toEndWith("-TOOL-TAIL")
-    expect(tool.state.output).toContain("characters omitted")
+    expect(tool.state.output).toContain("middle omitted")
     expect(Array.from(tool.state.output).length).toBeLessThan(1_900)
     expect(file).toMatchObject({ type: "text", synthetic: true })
     expect(file.text).toContain("payload.bin")
@@ -433,7 +517,8 @@ describe("model-visible history sanitization", () => {
       messages: [user("000-context", sessionID, "earlier context"), user("original", sessionID, overflowText)],
       todos: [],
     }
-    const hooks = await server(pluginInput(state([sessionID, fixture])), TEST_OPTIONS)
+    const mock = state([sessionID, fixture])
+    const hooks = await server(pluginInput(mock), TEST_OPTIONS)
     await compact(hooks, sessionID)
     const exchange = compactionExchange(sessionID, summaryFor(expectedLedger(fixture)), { overflow: true })
     const replay = user(`${sessionID}-replay`, sessionID, overflowText)
@@ -448,6 +533,34 @@ describe("model-visible history sanitization", () => {
     await hooks["experimental.chat.messages.transform"]?.({}, transformOutput(providerHistory))
     expect((providerHistory.at(-1)?.parts[0] as { text: string }).text).toContain("historical text omitted")
     expect((fixture.messages.at(-1)?.parts[0] as { text: string }).text).toBe(overflowText)
+    expect(mock.messageLimits).toEqual([10_000, 10_000, 256])
+  })
+
+  test("paginates only until two durable pre-compaction requests prove an overflow replay", async () => {
+    const sessionID = "paged-overflow"
+    const overflowText = "H" + "x".repeat(1_000) + "T"
+    const fixture: SessionFixture = {
+      messages: [user("000-context", sessionID, "earlier context"), user("original", sessionID, overflowText)],
+      todos: [],
+    }
+    const mock = state([sessionID, fixture])
+    const hooks = await server(pluginInput(mock), TEST_OPTIONS)
+    await compact(hooks, sessionID)
+    const exchange = compactionExchange(sessionID, summaryFor(expectedLedger(fixture)), { overflow: true })
+    const replay = user(`${sessionID}-replay`, sessionID, overflowText)
+    fixture.messages.push(exchange.request, exchange.summary, replay)
+    fixture.pages = [
+      { messages: [exchange.request, exchange.summary, replay], nextCursor: "cursor-1" },
+      { messages: fixture.messages.slice(0, 2) },
+    ]
+    const providerHistory = structuredClone([exchange.request, exchange.summary, replay])
+
+    await hooks["experimental.chat.messages.transform"]?.({}, transformOutput(providerHistory))
+
+    expect((providerHistory.at(-1)?.parts[0] as { text: string }).text).toContain("historical text omitted")
+    expect((fixture.messages.at(-1)?.parts[0] as { text: string }).text).toBe(overflowText)
+    expect(mock.messageLimits).toEqual([10_000, 256, 256])
+    expect(mock.messageCursors).toEqual([undefined, undefined, "cursor-1"])
   })
 
   test("targets the durable overflow replay without truncating a later admitted user request", async () => {
@@ -465,7 +578,7 @@ describe("model-visible history sanitization", () => {
       sessionID,
       "assistant",
       [textPart("003", sessionID, summaryFor(expectedLedger(fixture)))],
-      { summary: true, parentID: "002", mode: "compaction" },
+      { summary: true, parentID: "002", mode: "compaction", agent: "compaction" },
     )
     const replay = user("004", sessionID, overflowText)
     const response = storedMessage("005", sessionID, "assistant", [textPart("005", sessionID, "processed replay")])
@@ -498,7 +611,7 @@ describe("model-visible history sanitization", () => {
       sessionID,
       "assistant",
       [textPart("003", sessionID, summaryFor(expectedLedger(fixture)))],
-      { summary: true, parentID: "002", mode: "compaction" },
+      { summary: true, parentID: "002", mode: "compaction", agent: "compaction" },
     )
     const manual = user("004", sessionID, manualText)
     fixture.messages.push(request, summary, manual)
@@ -528,7 +641,7 @@ describe("model-visible history sanitization", () => {
         filename,
         url: "data:application/octet-stream;base64,YWJj",
       },
-      textPart("002-synthetic", sessionID, overflowText, true),
+      textPart("002", sessionID, overflowText, true),
     ])
     const fixture = { messages: [user("001", sessionID, "earlier context"), original], todos: [] }
     const request = storedMessage("003", sessionID, "user", [
@@ -539,7 +652,7 @@ describe("model-visible history sanitization", () => {
       sessionID,
       "assistant",
       [textPart("004", sessionID, summaryFor(expectedLedger(fixture)))],
-      { summary: true, parentID: "003", mode: "compaction" },
+      { summary: true, parentID: "003", mode: "compaction", agent: "compaction" },
     )
     const replay = storedMessage("005", sessionID, "user", [
       {
@@ -549,7 +662,7 @@ describe("model-visible history sanitization", () => {
         type: "text",
         text: `[Attached ${mime}: ${filename}]`,
       },
-      textPart("005-synthetic", sessionID, overflowText, true),
+      textPart("005", sessionID, overflowText, true),
     ])
     fixture.messages.push(request, summary, replay)
     const hooks = await server(pluginInput(state([sessionID, fixture])), TEST_OPTIONS)
@@ -559,6 +672,32 @@ describe("model-visible history sanitization", () => {
     expect((providerHistory.at(-1)?.parts[0] as { text: string }).text).toBe(`[Attached ${mime}: ${filename}]`)
     expect((providerHistory.at(-1)?.parts[1] as { text: string }).text).toContain("historical text omitted")
     expect((fixture.messages.at(-1)?.parts[1] as { text: string }).text).toBe(overflowText)
+  })
+
+  test("uses durable page order instead of caller-controlled Message ID order for overflow proof", async () => {
+    const sessionID = "overflow-nonmonotonic-ids"
+    const overflowText = "H" + "x".repeat(1_000) + "T"
+    const older = user("msg_e_older", sessionID, "older context")
+    const original = user("msg_a_newest", sessionID, overflowText)
+    const request = storedMessage("msg_c_parent", sessionID, "user", [
+      { id: "parent-part", sessionID, messageID: "msg_c_parent", type: "compaction", auto: true, overflow: true },
+    ])
+    const fixture = { messages: [older, original], todos: [] }
+    const summary = storedMessage(
+      "msg_b_summary",
+      sessionID,
+      "assistant",
+      [textPart("msg_b_summary", sessionID, summaryFor(expectedLedger(fixture)))],
+      { summary: true, parentID: request.info.id, mode: "compaction", agent: "compaction" },
+    )
+    const replay = user("msg_z_replay", sessionID, overflowText)
+    fixture.messages.push(request, summary, replay)
+    const providerHistory = structuredClone([request, summary, replay])
+    const hooks = await server(pluginInput(state([sessionID, fixture])), TEST_OPTIONS)
+
+    await hooks["experimental.chat.messages.transform"]?.({}, transformOutput(providerHistory))
+
+    expect((providerHistory.at(-1)?.parts[0] as { text: string }).text).toContain("historical text omitted")
   })
 
   test("does not guess a Session when provider history contains multiple Session IDs", async () => {
@@ -577,23 +716,184 @@ describe("model-visible history sanitization", () => {
     await hooks["experimental.chat.messages.transform"]?.({}, transformOutput(providerHistory))
     expect(providerHistory).toEqual(before)
   })
+
+  test("does not infer a Session when any provider-history identity is empty", async () => {
+    const sessionID = "mixed-empty"
+    const fixture = { messages: [user("first", sessionID, "first")], todos: [] }
+    const hooks = await server(pluginInput(state([sessionID, fixture])), TEST_OPTIONS)
+    await compact(hooks, sessionID)
+    const providerHistory = [user("valid", sessionID, "x".repeat(1_000)), user("invalid", "", "y".repeat(1_000))]
+    const before = structuredClone(providerHistory)
+
+    await hooks["experimental.chat.messages.transform"]?.({}, transformOutput(providerHistory))
+    expect(providerHistory).toEqual(before)
+  })
+
+  test("rejects duplicate model-visible Message identities", async () => {
+    const sessionID = "duplicate-provider"
+    const hooks = await server(pluginInput(state()), TEST_OPTIONS)
+    const providerHistory = [user("same", sessionID, "first"), user("same", sessionID, "second")]
+
+    await expect(
+      hooks["experimental.chat.messages.transform"]?.({}, transformOutput(providerHistory)),
+    ).rejects.toThrow("duplicate model-visible message identity")
+  })
 })
 
 describe("real hook compaction flows", () => {
   test("manual compaction installs the deterministic single-response prompt", async () => {
     const sessionID = "manual"
     const fixture = { messages: [user("manual-user", sessionID, "Must finish the manual request")], todos: [] }
-    const hooks = await server(pluginInput(state([sessionID, fixture])), TEST_OPTIONS)
+    const mock = state([sessionID, fixture])
+    const hooks = await server(pluginInput(mock), TEST_OPTIONS)
     const output = await compact(hooks, sessionID)
     const ledger = expectedLedger(fixture)
 
-    expect(output.prompt).toStartWith("Create one recovery summary")
-    expect(output.prompt).toContain("Return one Markdown response and no commentary outside it")
+    expect(output.prompt).toStartWith("Return exactly the Markdown below")
+    expect(output.prompt).toContain("Do not add commentary or code fences around it")
     for (const section of REQUIRED_SECTIONS) expect(output.prompt).toContain(`## ${section}`)
     expect(output.prompt).toEndWith(ledger.block)
+    expect(mock.messageLimits).toEqual([10_000])
   })
 
-  test("accepts a valid original summary and permits auto-continuation", async () => {
+  test("chains the newest plugin-valid ledger beyond the bounded recent-history page", async () => {
+    const sessionID = "paged-prior"
+    const priorLedger = buildRecoveryLedger({
+      messages: [user("001", sessionID, "Preserve the old durable requirement")],
+      todos: [],
+      tailTurns: Number(TEST_OPTIONS.tail_turns),
+      maxBytes: Number(TEST_OPTIONS.max_ledger_bytes),
+    })
+    const prior = compactionExchange(sessionID, summaryFor(priorLedger), { suffix: "-old" })
+    const recent = user("zzz", sessionID, "Continue the newest request")
+    const fixture: SessionFixture = {
+      messages: [recent],
+      todos: [],
+      pages: [
+        { messages: [recent], nextCursor: "cursor-1" },
+        { messages: [prior.request, prior.summary] },
+      ],
+    }
+    const mock = state([sessionID, fixture])
+    const output = await compact(await server(pluginInput(mock), TEST_OPTIONS), sessionID)
+    const ledger = parsePluginLedger(output.prompt ?? "")
+
+    expect(ledger?.data.recent_requests).toEqual([
+      "Preserve the old durable requirement",
+      "Continue the newest request",
+    ])
+    expect(ledger?.data.legacy_context[0]).toContain("Trusted plugin summary")
+    expect(mock.messageLimits).toEqual([10_000, 256])
+    expect(mock.messageCursors).toEqual([undefined, "cursor-1"])
+    expect(mock.targetRequests).not.toContain(`${sessionID}:${prior.request.info.id}`)
+  })
+
+  test("chains a valid summary split from its parent at the first page boundary", async () => {
+    const sessionID = "split-prior"
+    const priorLedger = buildRecoveryLedger({
+      messages: [user("001", sessionID, "OLD FACT")],
+      todos: [],
+      tailTurns: Number(TEST_OPTIONS.tail_turns),
+      maxBytes: Number(TEST_OPTIONS.max_ledger_bytes),
+    })
+    const prior = compactionExchange(sessionID, summaryFor(priorLedger), { suffix: "-old" })
+    const recent = user("zzz", sessionID, "NEW FACT")
+    const fixture: SessionFixture = {
+      messages: [prior.summary, recent],
+      todos: [],
+      pages: [
+        { messages: [prior.summary, recent], nextCursor: "cursor-1" },
+        { messages: [prior.request] },
+      ],
+    }
+    const mock = state([sessionID, fixture])
+    const output = await compact(await server(pluginInput(mock), TEST_OPTIONS), sessionID)
+
+    expect(parsePluginLedger(output.prompt ?? "")?.data.recent_requests).toEqual(["OLD FACT", "NEW FACT"])
+    expect(mock.messageLimits).toEqual([10_000])
+    expect(mock.targetRequests).toContain(`${sessionID}:${prior.request.info.id}`)
+  })
+
+  test("skips missing prior parents but propagates parent lookup server failures", async () => {
+    const sessionID = "parent-status"
+    const priorLedger = buildRecoveryLedger({
+      messages: [user("001", sessionID, "unreachable old fact")],
+      todos: [],
+      tailTurns: Number(TEST_OPTIONS.tail_turns),
+      maxBytes: Number(TEST_OPTIONS.max_ledger_bytes),
+    })
+    const prior = compactionExchange(sessionID, summaryFor(priorLedger), { suffix: "-missing" })
+    const recent = user("zzz", sessionID, "Current fact")
+    const fixture = { messages: [prior.summary, recent], todos: [] }
+    const missing = state([sessionID, fixture])
+    const missingOutput = await compact(await server(pluginInput(missing), TEST_OPTIONS), sessionID)
+    expect(parsePluginLedger(missingOutput.prompt ?? "")?.data.recent_requests).toEqual(["Current fact"])
+
+    const failed = state([sessionID, fixture])
+    failed.targetStatuses.set(`${sessionID}:${prior.request.info.id}`, 500)
+    await expect(compact(await server(pluginInput(failed), TEST_OPTIONS), sessionID)).rejects.toThrow(
+      "could not validate compaction parent",
+    )
+  })
+
+  test("rejects a repeated cursor while searching older plugin-valid ledgers", async () => {
+    const sessionID = "repeated-cursor"
+    const recent = user("zzz", sessionID, "Current request")
+    const fixture: SessionFixture = {
+      messages: [recent],
+      todos: [],
+      pages: [
+        { messages: [recent], nextCursor: "repeat" },
+        { messages: [user("older", sessionID, "Older request")], nextCursor: "repeat" },
+      ],
+      pageByCursor: { repeat: 1 },
+    }
+    const hooks = await server(pluginInput(state([sessionID, fixture])), TEST_OPTIONS)
+
+    await expect(compact(hooks, sessionID)).rejects.toThrow("repeated message cursor")
+  })
+
+  test("rejects overlapping message pages", async () => {
+    const sessionID = "overlapping-pages"
+    const recent = user("msg-recent", sessionID, "Current request")
+    const fixture: SessionFixture = {
+      messages: [recent],
+      todos: [],
+      pages: [
+        { messages: [recent], nextCursor: "cursor-1" },
+        { messages: [recent] },
+      ],
+    }
+
+    await expect(compact(await server(pluginInput(state([sessionID, fixture])), TEST_OPTIONS), sessionID)).rejects.toThrow(
+      "overlapping message pages",
+    )
+
+    const duplicate: SessionFixture = {
+      messages: [recent],
+      todos: [],
+      pages: [{ messages: [recent, recent] }],
+    }
+    await expect(compact(await server(pluginInput(state([sessionID, duplicate])), TEST_OPTIONS), sessionID)).rejects.toThrow(
+      "duplicate message identity",
+    )
+  })
+
+  test("bounds older-ledger discovery across fresh cursors and identities", async () => {
+    const sessionID = "bounded-pages"
+    const pages = Array.from({ length: 256 }, (_, index) => ({
+      messages: [user(`msg-page-${index}`, sessionID, `request ${index}`)],
+      nextCursor: `cursor-${index + 1}`,
+    }))
+    const fixture: SessionFixture = { messages: pages[0]!.messages, todos: [], pages }
+    const mock = state([sessionID, fixture])
+
+    expect((await compact(await server(pluginInput(mock), TEST_OPTIONS), sessionID)).prompt).toContain("## Goal")
+    expect(mock.messageLimits).toHaveLength(256)
+    expect(mock.messageCursors.at(-1)).toBe("cursor-255")
+  })
+
+  test("replaces structurally valid provider prose with the deterministic authoritative summary", async () => {
     const sessionID = "valid"
     const fixture = { messages: [user("valid-user", sessionID, "Must retain this request")], todos: [] }
     const mock = state([sessionID, fixture])
@@ -601,9 +901,14 @@ describe("real hook compaction flows", () => {
     await compact(hooks, sessionID)
     const exchange = compactionExchange(sessionID, "")
     fixture.messages.push(exchange.request, exchange.summary)
-    const original = summaryFor(expectedLedger(fixture, exchange.summary.info.id), "original")
+    const ledger = expectedLedger(fixture, exchange.summary.info.id)
+    const original = summaryFor(ledger, "password=provider-secret unsupported deployment completed")
+    const authoritative = buildAuthoritativeSummary({ ledger, maxBytes: Number(TEST_OPTIONS.max_summary_bytes) })
 
-    expect(await complete(hooks, sessionID, exchange.summary.info.id, exchange.partIDs[0]!, original, exchange.summary)).toBe(original)
+    expect(await complete(hooks, sessionID, exchange.summary.info.id, exchange.partIDs[0]!, original, exchange.summary)).toBe(authoritative)
+    expect(authoritative).not.toContain("provider-secret")
+    expect(authoritative).not.toContain("unsupported deployment completed")
+    expect(isAuthoritativeSummary(authoritative, Number(TEST_OPTIONS.max_summary_bytes))).toBe(true)
     expect(await autocontinue(hooks, sessionID)).toBe(true)
   })
 
@@ -634,6 +939,7 @@ describe("real hook compaction flows", () => {
 
       expect(fallback).not.toContain(providerText)
       expect(isPluginValidSummary(fallback, Number(TEST_OPTIONS.max_summary_bytes))).toBe(true)
+      expect(isAuthoritativeSummary(fallback, Number(TEST_OPTIONS.max_summary_bytes))).toBe(true)
       expect(parsePluginLedger(fallback)?.data.recent_requests).toEqual(["Do not lose this fact"])
       expect(await autocontinue(hooks, sessionID)).toBe(true)
     },
@@ -732,10 +1038,119 @@ describe("real hook compaction flows", () => {
     const providerUser = providerHistory.find((message) => message.info.id === "zzz-new")
     const injected = providerUser?.parts.at(-1) as { synthetic: boolean; text: string }
     expect(injected.synthetic).toBe(true)
-    expect(injected.text).toContain("No prior plugin-valid summary is available")
-    expect(injected.text).toContain("Legacy summary claim")
+    expect(injected.text).toContain("untrusted provider prose is omitted")
+    expect(injected.text).not.toContain("Legacy summary claim")
+    expect(injected.text).toContain("Untrusted legacy summary legacy omitted")
     expect(injected.text).not.toContain("EmptySummary")
     expect(fixture.messages.find((message) => message.info.id === "zzz-new")?.parts).toHaveLength(1)
+  })
+
+  test("reinjects recovery into each fresh provider clone across a tool loop", async () => {
+    const sessionID = "recovery-tool-loop"
+    const exchange = compactionExchange(sessionID, "", { error: { name: "EmptySummary" } })
+    const recoveryUser = user("z-recovery-user", sessionID, "Continue the interrupted work")
+    const fixture = {
+      messages: [user("001-old", sessionID, "Preserve the original request"), exchange.request, exchange.summary, recoveryUser],
+      todos: [],
+    }
+    const hooks = await server(pluginInput(state([sessionID, fixture])), TEST_OPTIONS)
+    const firstProviderHistory = structuredClone(fixture.messages)
+
+    await hooks["experimental.chat.messages.transform"]?.({}, transformOutput(firstProviderHistory))
+    expect(firstProviderHistory.find((message) => message.info.id === recoveryUser.info.id)?.parts).toHaveLength(2)
+
+    fixture.messages.push(
+      storedMessage(
+        "zz-tool-assistant",
+        sessionID,
+        "assistant",
+        [{ id: "tool", sessionID, messageID: "zz-tool-assistant", type: "tool", tool: "read", state: { status: "completed", output: "ok" } }],
+        { parentID: recoveryUser.info.id, finish: "tool-calls" },
+      ),
+    )
+    const secondProviderHistory = structuredClone(fixture.messages)
+    await hooks["experimental.chat.messages.transform"]?.({}, transformOutput(secondProviderHistory))
+
+    const reinjected = secondProviderHistory.find((message) => message.info.id === recoveryUser.info.id)?.parts.at(-1) as { text: string }
+    expect(reinjected.text).toContain("Safe-compaction recovery context")
+    expect(fixture.messages.find((message) => message.info.id === recoveryUser.info.id)?.parts).toHaveLength(1)
+  })
+
+  test("does not repeat consumed recovery on a later user turn", async () => {
+    const sessionID = "recovery-consumed"
+    const exchange = compactionExchange(sessionID, "", { error: { name: "EmptySummary" } })
+    const recoveryUser = user("z-recovery-user", sessionID, "Recover once")
+    const completed = storedMessage(
+      "zz-completed",
+      sessionID,
+      "assistant",
+      [textPart("zz-completed", sessionID, "Recovery completed")],
+      { parentID: recoveryUser.info.id, finish: "stop" },
+    )
+    const laterText = `L${"x".repeat(200)}R`
+    const laterUser = user("zzz-later-user", sessionID, laterText)
+    const fixture = {
+      messages: [user("001-old", sessionID, "Original context"), exchange.request, exchange.summary, recoveryUser],
+      todos: [],
+    }
+    const hooks = await server(pluginInput(state([sessionID, fixture])), TEST_OPTIONS)
+    await hooks["experimental.chat.messages.transform"]?.({}, transformOutput(structuredClone(fixture.messages)))
+    await hooks.event?.({
+      event: { type: "session.idle", properties: { sessionID } } as unknown as Parameters<NonNullable<Hooks["event"]>>[0]["event"],
+    })
+    fixture.messages.push(completed, laterUser)
+    const laterProviderHistory = structuredClone(fixture.messages)
+
+    await hooks["experimental.chat.messages.transform"]?.({}, transformOutput(laterProviderHistory))
+
+    const providerUser = laterProviderHistory.find((message) => message.info.id === laterUser.info.id)
+    expect(providerUser?.parts).toHaveLength(1)
+    expect((providerUser?.parts[0] as { text: string }).text).toBe(laterText)
+  })
+
+  test("conservatively reinjects recovery after restart without durable provenance", async () => {
+    const sessionID = "recovery-consumed-restart"
+    const exchange = compactionExchange(sessionID, "", { error: { name: "EmptySummary" } })
+    const recoveryUser = user("z-recovery-user", sessionID, "Recover once")
+    const completed = storedMessage(
+      "zz-completed",
+      sessionID,
+      "assistant",
+      [textPart("zz-completed", sessionID, "Recovery completed")],
+      { parentID: recoveryUser.info.id, finish: "stop" },
+    )
+    const laterUser = user("zzz-later-user", sessionID, "Continue with unrelated work")
+    const fixture = {
+      messages: [user("001-old", sessionID, "Original context"), exchange.request, exchange.summary, recoveryUser, completed, laterUser],
+      todos: [],
+    }
+    const restarted = await server(pluginInput(state([sessionID, fixture])), TEST_OPTIONS)
+    const providerHistory = structuredClone(fixture.messages)
+
+    await restarted["experimental.chat.messages.transform"]?.({}, transformOutput(providerHistory))
+
+    const recovered = providerHistory.find((message) => message.info.id === laterUser.info.id)?.parts
+    expect(recovered).toHaveLength(2)
+    expect((recovered?.at(-1) as { text: string }).text).toContain("recovery-ledger")
+  })
+
+  test("recovers a nonempty unterminated compaction after plugin restart", async () => {
+    const sessionID = "partial-restart"
+    const exchange = compactionExchange(sessionID, "## Goal\n- partial provider text")
+    exchange.summary.info.finish = "stop"
+    const newest = user("zzz-new", sessionID, "Resume after restart")
+    const fixture = {
+      messages: [user("001-old", sessionID, "Must survive the partial summary"), exchange.request, exchange.summary, newest],
+      todos: [],
+    }
+    const hooks = await server(pluginInput(state([sessionID, fixture])), TEST_OPTIONS)
+    const providerHistory = structuredClone(fixture.messages)
+
+    await hooks["experimental.chat.messages.transform"]?.({}, transformOutput(providerHistory))
+
+    const injected = providerHistory.find((message) => message.info.id === newest.info.id)?.parts.at(-1) as { text: string }
+    expect(injected.text).toContain("Must survive the partial summary")
+    expect(injected.text).toContain("No provider-authored compaction prose is trusted")
   })
 
   test("preserves a newly admitted recovery request above the historical-part limit", async () => {
@@ -772,7 +1187,7 @@ describe("real hook compaction flows", () => {
       sessionID,
       "assistant",
       [textPart("004", sessionID, "")],
-      { summary: true, parentID: "003", mode: "compaction", error: { name: "EmptySummary" } },
+      { summary: true, parentID: "003", mode: "compaction", agent: "compaction", error: { name: "EmptySummary" } },
     )
     const replay = user("005", sessionID, overflowText)
     const fixture = {
@@ -788,7 +1203,7 @@ describe("real hook compaction flows", () => {
     expect((fixture.messages.at(-1)?.parts[0] as { text: string }).text).toBe(overflowText)
   })
 
-  test("selects the max-ID invalid compaction from reordered retained-tail history", async () => {
+  test("uses durable creation time for reordered retained-tail history", async () => {
     const sessionID = "recovery-reordered-tail"
     const olderRequest = storedMessage("020", sessionID, "user", [
       { id: "020-part", sessionID, messageID: "020", type: "compaction" },
@@ -798,7 +1213,7 @@ describe("real hook compaction flows", () => {
       sessionID,
       "assistant",
       [textPart("021", sessionID, "Older retained legacy summary")],
-      { summary: true, parentID: "020", mode: "compaction" },
+      { summary: true, parentID: "020", mode: "compaction", agent: "compaction" },
     )
     const currentRequest = storedMessage("100", sessionID, "user", [
       { id: "100-part", sessionID, messageID: "100", type: "compaction" },
@@ -808,13 +1223,16 @@ describe("real hook compaction flows", () => {
       sessionID,
       "assistant",
       [textPart("101", sessionID, "")],
-      { summary: true, parentID: "100", mode: "compaction", error: { name: "EmptySummary" } },
+      { summary: true, parentID: "100", mode: "compaction", agent: "compaction", error: { name: "EmptySummary" } },
     )
     const newest = user("102", sessionID, "Resume from the current failure")
     const fixture = {
       messages: [user("010", sessionID, "retained old request"), olderRequest, olderSummary, currentRequest, currentSummary, newest],
       todos: [],
     }
+    fixture.messages.forEach((message, index) => {
+      message.info.time = { created: index }
+    })
     const hooks = await server(pluginInput(state([sessionID, fixture])), TEST_OPTIONS)
     const providerHistory = structuredClone([
       currentRequest,
@@ -831,7 +1249,7 @@ describe("real hook compaction flows", () => {
     expect((providerUser?.parts.at(-1) as { text: string }).text).toContain("Safe-compaction recovery context")
   })
 
-  test("injects the newest plugin-valid prior state but never trusts a newer legacy summary as the anchor", async () => {
+  test("never promotes prior provider prose into the recovery instruction", async () => {
     const sessionID = "prior-valid"
     const priorLedger = canonicalLedger({
       recent_requests: [],
@@ -859,8 +1277,10 @@ describe("real hook compaction flows", () => {
 
     await hooks["experimental.chat.messages.transform"]?.({}, transformOutput(providerHistory))
     const injected = providerHistory.find((message) => message.info.id === "zzz-new")?.parts.at(-1) as { text: string }
-    expect(injected.text).toContain("Prior validated state: - TRUSTED-PRIOR-STATE: Current state")
-    expect(injected.text.slice(0, injected.text.indexOf("<!-- opencode-safe-compaction"))).not.toContain("UNTRUSTED-LEGACY-ANCHOR")
+    const instruction = injected.text.slice(0, injected.text.indexOf("<!-- opencode-safe-compaction"))
+    expect(instruction).toContain("No provider-authored compaction prose is trusted")
+    expect(instruction).not.toContain("TRUSTED-PRIOR-STATE")
+    expect(instruction).not.toContain("UNTRUSTED-LEGACY-ANCHOR")
   })
 
   test("ignores text completion for an ordinary assistant message", async () => {
@@ -876,15 +1296,60 @@ describe("real hook compaction flows", () => {
     )
   })
 
+  test.each([
+    ["wrong agent", { agent: "build" }],
+    ["wrong mode", { mode: "build" }],
+  ])("ignores a summary target with %s identity", async (_, identity) => {
+    const sessionID = `forged-${identity.agent ?? identity.mode}`
+    const fixture = { messages: [user("request", sessionID, "Request")], todos: [] }
+    const exchange = compactionExchange(sessionID, "")
+    Object.assign(exchange.summary.info, identity)
+    fixture.messages.push(exchange.request, exchange.summary)
+    const hooks = await server(pluginInput(state([sessionID, fixture])), TEST_OPTIONS)
+
+    expect(await complete(hooks, sessionID, exchange.summary.info.id, exchange.partIDs[0]!, "provider text")).toBe("provider text")
+  })
+
+  test("ignores a compaction summary whose parent has no matching compaction part", async () => {
+    const sessionID = "forged-parent"
+    const exchange = compactionExchange(sessionID, "")
+    exchange.request.parts = [textPart(exchange.request.info.id, sessionID, "ordinary parent")]
+    const fixture = { messages: [exchange.request, exchange.summary], todos: [] }
+    const hooks = await server(pluginInput(state([sessionID, fixture])), TEST_OPTIONS)
+
+    expect(await complete(hooks, sessionID, exchange.summary.info.id, exchange.partIDs[0]!, "provider text")).toBe("provider text")
+  })
+
+  test("binds auto-continuation to the compaction parent supplied by core", async () => {
+    const sessionID = "autocontinue-parent"
+    const first = compactionExchange(sessionID, "malformed", { suffix: "-first" })
+    const second = compactionExchange(sessionID, "", { suffix: "-second" })
+    const fixture = {
+      messages: [user("001", sessionID, "Original request"), first.request, first.summary, second.request, second.summary],
+      todos: [],
+    }
+    ;(second.summary.parts[0] as { text: string }).text = buildAuthoritativeSummary({
+      ledger: expectedLedger(fixture, second.summary.info.id),
+      maxBytes: Number(TEST_OPTIONS.max_summary_bytes),
+    })
+    const hooks = await server(pluginInput(state([sessionID, fixture])), TEST_OPTIONS)
+
+    expect(await autocontinue(hooks, sessionID, true, first.request.info.id)).toBe(false)
+    expect(await autocontinue(hooks, sessionID, true, second.request.info.id)).toBe(true)
+  })
+
   test("recovers a validated compaction from durable history after plugin restart", async () => {
     const sessionID = "restart"
     const fixture = { messages: [user("request", sessionID, "Restart-safe fact")], todos: [] }
     const exchange = compactionExchange(sessionID, "")
     fixture.messages.push(exchange.request, exchange.summary)
-    ;(exchange.summary.parts[0] as { text: string }).text = summaryFor(expectedLedger(fixture, exchange.summary.info.id), "durable")
+    ;(exchange.summary.parts[0] as { text: string }).text = buildAuthoritativeSummary({
+      ledger: expectedLedger(fixture, exchange.summary.info.id),
+      maxBytes: Number(TEST_OPTIONS.max_summary_bytes),
+    })
     const hooks = await server(pluginInput(state([sessionID, fixture])), TEST_OPTIONS)
 
-    expect(await autocontinue(hooks, sessionID)).toBe(true)
+    expect(await autocontinue(hooks, sessionID, true, exchange.request.info.id)).toBe(true)
   })
 
   test("keeps a second real compaction valid when its ledger carries the prior plugin summary", async () => {
@@ -904,8 +1369,9 @@ describe("real hook compaction flows", () => {
       first.summary,
     )
     expect(isPluginValidSummary(firstFallback, Number(options.max_summary_bytes))).toBe(true)
-    expect(await autocontinue(hooks, sessionID)).toBe(true)
+    expect(await autocontinue(hooks, sessionID, true, first.request.info.id)).toBe(true)
 
+    fixture.messages.shift()
     fixture.messages.push(user("900", sessionID, "Second durable request"))
     await compact(hooks, sessionID)
     const second = compactionExchange(sessionID, "", { suffix: "-second" })
@@ -921,8 +1387,11 @@ describe("real hook compaction flows", () => {
     )
 
     expect(isPluginValidSummary(secondFallback, Number(options.max_summary_bytes))).toBe(true)
-    expect(parsePluginLedger(secondFallback)?.data.legacy_context[0]).toContain("## Goal")
-    expect(await autocontinue(restarted, sessionID)).toBe(true)
+    const chained = parsePluginLedger(secondFallback)?.data
+    expect(chained?.legacy_context[0]).toContain("Trusted plugin summary")
+    expect(chained?.recent_requests).toContain("First durable request")
+    expect(chained?.recent_requests).toContain("Second durable request")
+    expect(await autocontinue(restarted, sessionID, true, second.request.info.id)).toBe(true)
   })
 
   test("isolates two concurrent session attempts by Session ID", async () => {
@@ -946,6 +1415,28 @@ describe("real hook compaction flows", () => {
     expect(first).not.toContain("Second session fact")
     expect(second).not.toContain("First session fact")
     expect(await Promise.all([autocontinue(hooks, firstID), autocontinue(hooks, secondID)])).toEqual([true, true])
+  })
+
+  test("does not clear other Session attempts for an unscoped error event", async () => {
+    const firstID = "unscoped-a"
+    const secondID = "unscoped-b"
+    const firstFixture = { messages: [user("a-user", firstID, "First session fact")], todos: [] }
+    const secondFixture = { messages: [user("b-user", secondID, "Second session fact")], todos: [] }
+    const hooks = await server(pluginInput(state([firstID, firstFixture], [secondID, secondFixture])), TEST_OPTIONS)
+    await Promise.all([compact(hooks, firstID), compact(hooks, secondID)])
+    await hooks.event?.({
+      event: { type: "session.error", properties: { error: "unscoped" } } as unknown as Parameters<NonNullable<Hooks["event"]>>[0]["event"],
+    })
+    const firstProviderHistory = [user("a-provider", firstID, "a".repeat(1_000))]
+    const secondProviderHistory = [user("b-provider", secondID, "b".repeat(1_000))]
+
+    await Promise.all([
+      hooks["experimental.chat.messages.transform"]?.({}, transformOutput(firstProviderHistory)),
+      hooks["experimental.chat.messages.transform"]?.({}, transformOutput(secondProviderHistory)),
+    ])
+
+    expect((firstProviderHistory[0]?.parts[0] as { text: string }).text).toContain("historical text omitted")
+    expect((secondProviderHistory[0]?.parts[0] as { text: string }).text).toContain("historical text omitted")
   })
 
   test("emits no conversation content through console logging", async () => {

@@ -5,7 +5,6 @@ import {
   canonicalLedger,
   record,
   sha256,
-  truncateUtf8,
   utf8Bytes,
   type RecoveryLedger,
   type RecoveryLedgerData,
@@ -22,25 +21,10 @@ export const REQUIRED_SECTIONS = [
   "Next actions",
 ] as const
 
-export function buildCompactionPrompt(ledger: RecoveryLedger) {
-  return `Create one recovery summary for the next model turn.
+export function buildCompactionPrompt(ledger: RecoveryLedger, maxBytes: number) {
+  return `Return exactly the Markdown below, byte-for-byte, in one response. Do not add commentary or code fences around it.
 
-Return one Markdown response and no commentary outside it. Include every H2 section below exactly once and in this order:
-
-## Goal
-## Constraints
-## Decisions
-## Current state
-## Files
-## Evidence
-## Blockers/questions
-## Next actions
-
-State only facts supported by the supplied conversation and recovery ledger. Mark unknowns as unknown. Keep paths, commands, errors, verification results, and unfinished work precise. Never include credentials or invent completed work.
-
-End the response with the following recovery-ledger block copied byte-for-byte, including its markers, version, digest, JSON fence, whitespace, and content:
-
-${ledger.block}`
+${buildAuthoritativeSummary({ ledger, maxBytes })}`
 }
 
 export function validateSummary(text: string, expected: RecoveryLedger, maxBytes: number) {
@@ -82,15 +66,26 @@ export function isPluginValidSummary(text: string, maxBytes: number) {
   return validateSummary(text, ledger, maxBytes)
 }
 
+export function buildAuthoritativeSummary(input: { ledger: RecoveryLedger; maxBytes: number }) {
+  return buildFallback({ ledger: input.ledger, maxBytes: input.maxBytes })
+}
+
+export function isAuthoritativeSummary(text: string, maxBytes: number) {
+  const ledger = parsePluginLedger(text)
+  if (!ledger) return false
+  try {
+    return text === buildAuthoritativeSummary({ ledger, maxBytes })
+  } catch {
+    return false
+  }
+}
+
 export function buildFallback(input: {
   ledger: RecoveryLedger
-  priorValidSummary?: string
   maxBytes: number
 }) {
   const list = (values: string[], empty: string) =>
     values.length ? values.map((value) => `- ${safeMarkdown(value)}`).join("\n") : `- ${empty}`
-  const priorDecisions = input.priorValidSummary ? section(input.priorValidSummary, "Decisions") : ""
-  const priorState = input.priorValidSummary ? section(input.priorValidSummary, "Current state") : ""
   const text = `## Goal
 ${list(input.ledger.data.recent_requests.slice(-1), "No recoverable user request was recorded.")}
 
@@ -98,10 +93,10 @@ ${list(input.ledger.data.recent_requests.slice(-1), "No recoverable user request
 ${list(input.ledger.data.constraints, "No explicit constraints were recovered.")}
 
 ## Decisions
-${priorDecisions ? `- Prior validated context: ${safeMarkdown(priorDecisions)}` : "- No validated prior decisions were recovered."}
+- No decisions were inferred outside the canonical ledger.
 
 ## Current state
-${priorState ? `- Prior validated context: ${safeMarkdown(priorState)}` : list(input.ledger.data.tool_statuses.map((item) => `${item.tool}: ${item.status}`), "Recovery fallback generated from durable history.")}
+${list(input.ledger.data.tool_statuses.map((item) => `${item.tool}: ${item.status}`), "Recovery summary generated from bounded durable history.")}
 
 ## Files
 ${list(input.ledger.data.touched_paths, "No touched paths were recovered.")}
@@ -148,13 +143,12 @@ ${input.ledger.block}`
   return minimal
 }
 
-export function recoveryContext(ledger: RecoveryLedger, priorValidSummary?: string) {
-  const prior = priorValidSummary
-    ? truncateUtf8(section(priorValidSummary, "Current state") || "A prior plugin-valid summary exists.", 4_096)
-    : "No prior plugin-valid summary is available."
+export function recoveryContext(ledger: RecoveryLedger) {
   return `Safe-compaction recovery context for this model-visible turn only. Durable history was not modified.
 
-Prior validated state: ${safeMarkdown(prior)}
+The canonical recovery ledger below is authoritative. legacy_context records only bounded provenance: untrusted provider prose is omitted, while a prior plugin-valid canonical ledger may be chained.
+
+No provider-authored compaction prose is trusted by opencode-safe-compaction.
 
 ${ledger.block}`
 }
@@ -206,16 +200,6 @@ function parseData(value: string): RecoveryLedgerData | undefined {
   } catch {
     return
   }
-}
-
-function section(text: string, name: (typeof REQUIRED_SECTIONS)[number]) {
-  const ledgerStart = markerLines(text, LEDGER_START)[0]
-  const prefix = ledgerStart === undefined ? text : text.slice(0, ledgerStart)
-  const heading = new RegExp(`^## ${escapeRegExp(name)}$`, "m").exec(prefix)
-  if (heading?.index === undefined) return ""
-  const content = prefix.slice(heading.index + heading[0].length)
-  const end = content.search(/^## /m)
-  return truncateUtf8((end < 0 ? content : content.slice(0, end)).trim(), 2_048)
 }
 
 function safeMarkdown(value: string) {

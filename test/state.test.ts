@@ -20,7 +20,6 @@ function attempt(sessionID: string, createdAt: number): Attempt {
     createdAt,
     ledger: canonicalLedger(EMPTY_DATA),
     validation: "pending",
-    recoveryInjected: false,
   }
 }
 

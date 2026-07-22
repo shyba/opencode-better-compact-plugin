@@ -1,10 +1,10 @@
 import { buildRecoveryLedger, type MessageRecord } from "../../src/ledger.js"
 import { DEFAULT_OPTIONS } from "../../src/options.js"
 import {
+  buildAuthoritativeSummary,
   buildCompactionPrompt,
-  buildFallback,
+  isAuthoritativeSummary,
   parsePluginLedger,
-  validateSummary,
 } from "../../src/validation.js"
 import type { EvalCase, PreparedCondition } from "../types.js"
 import { transcriptMessages } from "./transcript.js"
@@ -17,7 +17,10 @@ export function preparePlugin(test: EvalCase): PreparedCondition {
     maxBytes: DEFAULT_OPTIONS.max_ledger_bytes,
   })
   return {
-    messages: [...transcriptMessages(test), { role: "user", content: buildCompactionPrompt(ledger) }],
+    messages: [
+      ...transcriptMessages(test),
+      { role: "user", content: buildCompactionPrompt(ledger, DEFAULT_OPTIONS.max_summary_bytes) },
+    ],
     finish(text) {
       // In the V1 runtime an empty stream does not emit experimental.text.complete.
       // It is therefore not replaced, and must never authorize continuation.
@@ -31,17 +34,14 @@ export function preparePlugin(test: EvalCase): PreparedCondition {
           zeroText: true,
         }
       }
-      const original = validateSummary(text, ledger, DEFAULT_OPTIONS.max_summary_bytes)
-      const acceptedText = original
-        ? text
-        : buildFallback({ ledger, maxBytes: DEFAULT_OPTIONS.max_summary_bytes })
+      const acceptedText = buildAuthoritativeSummary({ ledger, maxBytes: DEFAULT_OPTIONS.max_summary_bytes })
       const parsed = parsePluginLedger(acceptedText)
       return {
         acceptedText,
-        structuralValid: validateSummary(acceptedText, ledger, DEFAULT_OPTIONS.max_summary_bytes),
+        structuralValid: isAuthoritativeSummary(acceptedText, DEFAULT_OPTIONS.max_summary_bytes),
         digestValid: parsed?.block === ledger.block,
         autoContinue: true,
-        usedFallback: !original,
+        usedFallback: text !== acceptedText,
         zeroText: false,
       }
     },

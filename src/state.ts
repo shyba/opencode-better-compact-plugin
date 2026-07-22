@@ -7,11 +7,11 @@ export type Attempt = {
   sessionID: string
   createdAt: number
   ledger: RecoveryLedger
-  priorValidSummary?: string
   summaryMessageID?: string
   textPartID?: string
-  validation: "pending" | "original" | "fallback" | "invalid"
-  recoveryInjected: boolean
+  validation: "pending" | "fallback" | "invalid"
+  recoveryUserID?: string
+  recoveryComplete?: boolean
 }
 
 export class AttemptStore {

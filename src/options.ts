@@ -45,6 +45,18 @@ export const DEFAULT_OPTIONS = {
   max_summary_bytes: 49_152,
 } satisfies Omit<PluginOptions, "model">
 
+// These limits bound work performed before the provider request. They are deliberately
+// above the documented defaults while preventing one tuple from disabling the plugin's
+// memory-safety guarantees.
+export const MAX_OPTIONS = {
+  tail_turns: 64,
+  max_user_text_bytes: 8 * 1_024 * 1_024,
+  max_inline_data_bytes: 64 * 1_024 * 1_024,
+  max_historical_part_bytes: 1 * 1_024 * 1_024,
+  max_ledger_bytes: 256 * 1_024,
+  max_summary_bytes: 1 * 1_024 * 1_024,
+} as const
+
 export function parseOptions(input: Record<string, unknown> | undefined) {
   const value = input ?? {}
   const unknown = Object.keys(value).filter((key) => !OPTION_KEYS.includes(key as (typeof OPTION_KEYS)[number]))
@@ -83,6 +95,11 @@ export function resolveOptions(options: ParsedOptions, existing: ExistingOptions
     max_summary_bytes: options.max_summary_bytes ?? DEFAULT_OPTIONS.max_summary_bytes,
   }
   if (!result.model) throw new TypeError('Option "model" is required when OpenCode has no compaction model')
+  for (const key of Object.keys(MAX_OPTIONS) as Array<keyof typeof MAX_OPTIONS>) {
+    if (result[key] > MAX_OPTIONS[key]) {
+      throw new TypeError(`Option "${key}" must not exceed ${MAX_OPTIONS[key]}`)
+    }
+  }
   if (result.max_historical_part_bytes < 128) {
     throw new TypeError('Option "max_historical_part_bytes" must be at least 128 bytes')
   }

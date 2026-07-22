@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { DEFAULT_OPTIONS, OPTION_KEYS, parseOptions, resolveOptions } from "../src/options.js"
+import { DEFAULT_OPTIONS, MAX_OPTIONS, OPTION_KEYS, parseOptions, resolveOptions } from "../src/options.js"
 
 describe("plugin option validation", () => {
   test("accepts every documented snake-case option", () => {
@@ -115,5 +115,13 @@ describe("plugin option precedence", () => {
     expect(() =>
       resolveOptions(parseOptions({ model: "test/model", max_ledger_bytes: 1_023 })),
     ).toThrow('Option "max_ledger_bytes" must be at least 1024 bytes')
+  })
+
+  test("rejects resource limits that would disable the plugin's safety bounds", () => {
+    for (const [key, maximum] of Object.entries(MAX_OPTIONS)) {
+      expect(() => resolveOptions(parseOptions({ model: "test/model", [key]: maximum + 1 }))).toThrow(
+        `Option "${key}" must not exceed ${maximum}`,
+      )
+    }
   })
 })

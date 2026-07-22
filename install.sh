@@ -36,9 +36,14 @@ canonical_repository() {
     git@github.com:*) printf 'github.com/%s\n' "${1#git@github.com:}" ;;
     ssh://git@github.com/*) printf 'github.com/%s\n' "${1#ssh://git@github.com/}" ;;
     https://github.com/*) printf 'github.com/%s\n' "${1#https://github.com/}" ;;
-    http://github.com/*) printf 'github.com/%s\n' "${1#http://github.com/}" ;;
     *) printf '%s\n' "$1" ;;
   esac | sed 's#/*$##; s#\.git$##'
+}
+
+reject_insecure_repository() {
+  case "$1" in
+    [Hh][Tt][Tt][Pp]://*|[Gg][Ii][Tt]://*) fail "insecure repository URL is not allowed: $1" ;;
+  esac
 }
 
 check_bun_version() {
@@ -74,49 +79,235 @@ check_opencode_version() {
 }
 
 case "$install_dir" in /*) ;; *) fail "install directory must be absolute: $install_dir" ;; esac
+case "$install_dir" in /) fail "install directory is unsafe: $install_dir" ;; esac
+while [ "${install_dir%/}" != "$install_dir" ]; do install_dir=${install_dir%/}; done
+case "$install_dir" in ""|/) fail "install directory is unsafe: $install_dir" ;; esac
+[ "$install_dir" != "${HOME%/}" ] || fail "install directory is unsafe: $install_dir"
 case "$config_dir" in /*) ;; *) fail "config directory must be absolute: $config_dir" ;; esac
+case "$config_dir" in /) fail "config directory is unsafe: $config_dir" ;; esac
+while [ "${config_dir%/}" != "$config_dir" ]; do config_dir=${config_dir%/}; done
+case "$config_dir" in ""|/) fail "config directory is unsafe: $config_dir" ;; esac
+reject_insecure_repository "$repository"
 
 git_bin=$(resolve_command git)
 bun_bin=$(resolve_command "$bun_command")
 opencode_bin=$(resolve_command "$opencode_command")
-"$git_bin" check-ref-format --branch "$ref" >/dev/null 2>&1 || fail "invalid Git branch: $ref"
 check_bun_version
 check_opencode_version
+
+temporary_root=${TMPDIR:-/tmp}
+case "$temporary_root" in /*) ;; *) fail "temporary directory must be absolute: $temporary_root" ;; esac
+transaction_dir=$(mktemp -d "$temporary_root/opencode-safe-compaction.XXXXXX") || fail "could not create transaction directory"
+state_file=$transaction_dir/config-state.json
+verification_config_dir=$transaction_dir/verify-config
+transaction_active=1
+checkout_changed=0
+cloned_checkout=0
+previous_head=
+previous_branch=
+checkout_lock=
+config_lock=
+checkout_lock_held=0
+config_lock_held=0
+
+finish() {
+  status=$?
+  trap - 0 1 2 15
+  set +e
+  rollback_failed=0
+  config_rollback_failed=0
+  if [ "$transaction_active" -eq 1 ] && [ "$status" -ne 0 ]; then
+    if [ -f "$state_file" ]; then
+      OPENCODE_SAFE_COMPACTION_ACTION=rollback \
+      OPENCODE_SAFE_COMPACTION_STATE_FILE=$state_file \
+      OPENCODE_SAFE_COMPACTION_CONFIG_DIR=$config_dir \
+      OPENCODE_SAFE_COMPACTION_DIR=$install_dir \
+      OPENCODE_SAFE_COMPACTION_MODEL=$model \
+        "$bun_bin" "$install_dir/scripts/configure.ts" || {
+          rollback_failed=1
+          config_rollback_failed=1
+        }
+    fi
+    if [ "$config_rollback_failed" -eq 0 ] && [ "$cloned_checkout" -eq 1 ]; then
+      rm -rf -- "$install_dir" || rollback_failed=1
+      say "rolled back the new checkout"
+    elif [ "$config_rollback_failed" -eq 0 ] && [ "$checkout_changed" -eq 1 ]; then
+      if [ -n "$previous_branch" ]; then
+        "$git_bin" -C "$install_dir" checkout --quiet "$previous_branch" || rollback_failed=1
+      else
+        "$git_bin" -C "$install_dir" checkout --quiet --detach "$previous_head" || rollback_failed=1
+      fi
+      "$git_bin" -C "$install_dir" reset --hard "$previous_head" >/dev/null || rollback_failed=1
+      say "rolled back the checkout to $previous_head"
+    elif [ "$config_rollback_failed" -ne 0 ]; then
+      say "preserved the checkout because configuration rollback was refused"
+    fi
+    if [ "$rollback_failed" -ne 0 ]; then
+      printf 'opencode-safe-compaction: rollback was incomplete; inspect %s and %s\n' "$install_dir" "$config_dir" >&2
+    fi
+  fi
+  if [ "$config_lock_held" -eq 1 ]; then rm -rf -- "$config_lock"; fi
+  if [ "$checkout_lock_held" -eq 1 ]; then rm -rf -- "$checkout_lock"; fi
+  rm -rf -- "$transaction_dir"
+  exit "$status"
+}
+
+trap finish 0
+trap 'exit 129' 1
+trap 'exit 130' 2
+trap 'exit 143' 15
+
+acquire_lock() {
+  lock_target=$1
+  lock_attempts=0
+  until mkdir -m 700 "$lock_target" 2>/dev/null; do
+    lock_pid=
+    if [ -r "$lock_target/pid" ]; then read -r lock_pid < "$lock_target/pid" || lock_pid=; fi
+    case "$lock_pid" in
+      ""|*[!0-9]*) ;;
+      *)
+        if ! kill -0 "$lock_pid" 2>/dev/null; then
+          rm -rf -- "$lock_target"
+          continue
+        fi
+        ;;
+    esac
+    lock_attempts=$((lock_attempts + 1))
+    [ "$lock_attempts" -lt 300 ] || fail "timed out waiting for installer lock: $lock_target"
+    sleep 0.1
+  done
+  printf '%s\n' "$$" > "$lock_target/pid"
+}
+
+mkdir -p "$(dirname "$install_dir")" "$config_dir"
+checkout_lock=$(dirname "$install_dir")/.opencode-safe-compaction-checkout.lock
+config_lock=$config_dir/.opencode-safe-compaction-install.lock
+acquire_lock "$checkout_lock"
+checkout_lock_held=1
+acquire_lock "$config_lock"
+config_lock_held=1
+
+commit_ref=0
+if [ "${#ref}" -eq 40 ]; then
+  case "$ref" in
+    *[!0-9a-f]*) ;;
+    *) commit_ref=1 ;;
+  esac
+fi
+if [ "$commit_ref" -eq 0 ]; then
+  "$git_bin" check-ref-format --branch "$ref" >/dev/null 2>&1 || fail "invalid Git branch: $ref"
+fi
 
 if [ -e "$install_dir" ]; then
   [ -d "$install_dir/.git" ] || fail "install path exists but is not a Git checkout: $install_dir"
   actual_repository=$("$git_bin" -C "$install_dir" remote get-url origin 2>/dev/null) ||
     fail "existing checkout has no origin remote: $install_dir"
+  reject_insecure_repository "$actual_repository"
   [ "$(canonical_repository "$actual_repository")" = "$(canonical_repository "$repository")" ] ||
     fail "existing checkout origin does not match $repository"
   [ -z "$("$git_bin" -C "$install_dir" status --porcelain --untracked-files=normal)" ] ||
     fail "existing checkout has local changes; commit, stash, or remove them before updating"
-  current_branch=$("$git_bin" -C "$install_dir" symbolic-ref --quiet --short HEAD 2>/dev/null) ||
-    fail "existing checkout is detached; check out $ref before updating"
-  [ "$current_branch" = "$ref" ] || fail "existing checkout is on $current_branch, expected $ref"
+  previous_branch=$("$git_bin" -C "$install_dir" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+  if [ "$commit_ref" -eq 0 ]; then
+    [ -n "$previous_branch" ] || fail "existing checkout is detached; check out $ref before updating"
+    [ "$previous_branch" = "$ref" ] || fail "existing checkout is on $previous_branch, expected $ref"
+  fi
+  previous_head=$("$git_bin" -C "$install_dir" rev-parse HEAD)
+  checkout_changed=1
   say "updating $install_dir"
-  "$git_bin" -C "$install_dir" fetch origin "$ref"
-  "$git_bin" -C "$install_dir" merge --ff-only FETCH_HEAD
+  if [ "$commit_ref" -eq 1 ]; then
+    "$git_bin" -C "$install_dir" fetch --depth 1 origin "$ref"
+    [ "$("$git_bin" -C "$install_dir" rev-parse FETCH_HEAD)" = "$ref" ] || fail "repository did not return pinned commit $ref"
+    "$git_bin" -C "$install_dir" checkout --quiet --detach FETCH_HEAD
+  else
+    "$git_bin" -C "$install_dir" fetch origin "$ref"
+    "$git_bin" -C "$install_dir" merge --ff-only FETCH_HEAD
+  fi
 else
   say "cloning $repository into $install_dir"
   mkdir -p "$(dirname "$install_dir")"
-  "$git_bin" clone --branch "$ref" --depth 1 -- "$repository" "$install_dir"
+  cloned_checkout=1
+  if [ "$commit_ref" -eq 1 ]; then
+    "$git_bin" init --quiet "$install_dir"
+    "$git_bin" -C "$install_dir" remote add origin "$repository"
+    "$git_bin" -C "$install_dir" fetch --depth 1 origin "$ref"
+    [ "$("$git_bin" -C "$install_dir" rev-parse FETCH_HEAD)" = "$ref" ] || fail "repository did not return pinned commit $ref"
+    "$git_bin" -C "$install_dir" checkout --quiet --detach FETCH_HEAD
+  else
+    "$git_bin" clone --branch "$ref" --depth 1 -- "$repository" "$install_dir"
+  fi
 fi
 
+OPENCODE_SAFE_COMPACTION_STATE_FILE=$state_file \
+OPENCODE_SAFE_COMPACTION_CONFIG_DIR=$config_dir \
+OPENCODE_SAFE_COMPACTION_DIR=$install_dir \
+OPENCODE_SAFE_COMPACTION_MODEL=$model \
+OPENCODE_SAFE_COMPACTION_VERIFY_DIR=$verification_config_dir \
+  "$bun_bin" "$install_dir/scripts/configure.ts"
+
+say "verifying the installed plugin in isolation"
+mkdir -p \
+  "$transaction_dir/home" \
+  "$transaction_dir/xdg-config" \
+  "$transaction_dir/target-xdg" \
+  "$transaction_dir/xdg-data" \
+  "$transaction_dir/xdg-cache" \
+  "$transaction_dir/xdg-state"
+ln -s "$config_dir" "$transaction_dir/target-xdg/opencode"
+debug_config() {
+  debug_phase=$1
+  if [ "$debug_phase" = "isolated" ]; then
+    debug_xdg_config=$transaction_dir/xdg-config
+    debug_config_dir=$verification_config_dir
+  else
+    debug_xdg_config=$transaction_dir/target-xdg
+    debug_config_dir=
+  fi
+  HOME="$transaction_dir/home" \
+  XDG_CONFIG_HOME="$debug_xdg_config" \
+  XDG_DATA_HOME="$transaction_dir/xdg-data" \
+  XDG_CACHE_HOME="$transaction_dir/xdg-cache" \
+  XDG_STATE_HOME="$transaction_dir/xdg-state" \
+  OPENCODE_SAFE_COMPACTION_DIR="$install_dir" \
+  OPENCODE_SAFE_COMPACTION_MODEL="$model" \
+  OPENCODE_SAFE_COMPACTION_VERIFY_PHASE="$debug_phase" \
+  OPENCODE_CONFIG= \
+  OPENCODE_CONFIG_CONTENT= \
+  OPENCODE_CONFIG_DIR="$debug_config_dir" \
+  OPENCODE_DISABLE_PROJECT_CONFIG=true \
+  OPENCODE_DISABLE_MODELS_FETCH=1 \
+  OPENCODE_DISABLE_DEFAULT_PLUGINS=1 \
+  OPENCODE_PURE=0 \
+  "$opencode_bin" debug config
+}
+
+verify_debug_output() {
+  verify_phase=$1
+  verify_output=$2
+  printf '%s' "$verify_output" | \
+    OPENCODE_SAFE_COMPACTION_ACTION=verify \
+    OPENCODE_SAFE_COMPACTION_VERIFY_PHASE=$verify_phase \
+    OPENCODE_SAFE_COMPACTION_VERIFY_DIR=$verification_config_dir \
+    OPENCODE_SAFE_COMPACTION_CONFIG_DIR=$config_dir \
+    OPENCODE_SAFE_COMPACTION_DIR=$install_dir \
+    OPENCODE_SAFE_COMPACTION_MODEL=$model \
+    "$bun_bin" "$install_dir/scripts/configure.ts" >/dev/null
+}
+
+debug_output=$(debug_config isolated) || fail "OpenCode could not load the isolated plugin configuration"
+verify_debug_output isolated "$debug_output" || fail "OpenCode loaded the isolated configuration but did not activate the plugin config hook"
+
+say "verifying compatibility with the target OpenCode configuration"
+debug_output=$(debug_config target) || fail "OpenCode could not load the installed configuration"
+verify_debug_output target "$debug_output" || fail "OpenCode loaded the configuration but did not activate the plugin config hook"
+
+OPENCODE_SAFE_COMPACTION_ACTION=commit \
+OPENCODE_SAFE_COMPACTION_STATE_FILE=$state_file \
 OPENCODE_SAFE_COMPACTION_CONFIG_DIR=$config_dir \
 OPENCODE_SAFE_COMPACTION_DIR=$install_dir \
 OPENCODE_SAFE_COMPACTION_MODEL=$model \
   "$bun_bin" "$install_dir/scripts/configure.ts"
-
-say "verifying the installed plugin with OpenCode"
-debug_output=$(OPENCODE_CONFIG_DIR="$config_dir" \
-  OPENCODE_DISABLE_PROJECT_CONFIG=true \
-  OPENCODE_DISABLE_MODELS_FETCH=1 \
-  "$opencode_bin" debug config) || fail "OpenCode could not load the installed configuration"
-printf '%s' "$debug_output" | grep -F -e "$install_dir/src/index.ts" >/dev/null ||
-  fail "OpenCode loaded the configuration but did not report the installed plugin path"
-printf '%s' "$debug_output" | grep -F -e "$model" >/dev/null ||
-  fail "OpenCode loaded the configuration but did not report the selected model"
+transaction_active=0
 
 say "installed successfully"
 say "restart any running OpenCode server before using the plugin"

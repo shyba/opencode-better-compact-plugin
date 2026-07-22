@@ -1,6 +1,6 @@
 # opencode-safe-compaction
 
-`opencode-safe-compaction` is a global OpenCode V1 server plugin that builds a bounded recovery ledger, asks the compaction model for a verifiable summary, and replaces malformed nonempty summaries with a deterministic fallback. It is an independent MIT-licensed repository and makes no OpenCode core changes.
+`opencode-safe-compaction` is a global OpenCode V1 server plugin that builds a bounded recovery ledger and replaces every nonempty compaction response with an exact deterministic ledger projection. Provider-authored prose is never authoritative. It is an independent MIT-licensed repository and makes no OpenCode core changes.
 
 The package is private at version `0.1.0`. Git/source-path installation is the supported installation path for now; the package metadata and exports are ready for a later npm release.
 
@@ -9,7 +9,7 @@ The package is private at version `0.1.0`. Git/source-path installation is the s
 - Bun 1.3.14 or newer (verified with 1.3.14).
 - OpenCode `>=1.18.4 <1.19.0`. The plugin uses experimental V1 hooks, so the upper bound is intentional.
 - A configured compaction model. The initial configuration below uses `opencode-go/glm-5.2`, but the package itself is provider-neutral.
-- The selected model must have an output limit above zero and a context limit larger than `reserved_tokens`.
+- The selected model must have a positive output limit and leave positive usable input under OpenCode's V1 overflow calculation.
 
 Before enabling the plugin, remove only the stale `deepseek-v4-flash-free` model-limit override from the global OpenCode JSONC configuration. Do not remove the provider, other model entries, credentials, or unrelated settings. The usual global file is `${XDG_CONFIG_HOME:-~/.config}/opencode/opencode.jsonc`; use the path reported by OpenCode if the configuration directory was overridden. The plugin deliberately does not rewrite provider catalogs.
 
@@ -21,7 +21,19 @@ Review the installer, then run it on each server:
 curl -fsSL https://raw.githubusercontent.com/shyba/opencode-better-compact-plugin/default/install.sh | sh
 ```
 
-The installer clones the `default` branch over HTTPS to `$HOME/.local/share/opencode/plugins/safe-compaction`, adds the absolute source tuple to the global OpenCode configuration, preserves JSONC comments and unrelated settings, and verifies the result with `opencode debug config`. It is idempotent: rerunning it fast-forwards a clean checkout and does not duplicate the tuple. When it changes an existing configuration file, it first creates a timestamped `*.safe-compaction-backup-*` copy beside that file.
+The installer clones the `default` branch over HTTPS to `$HOME/.local/share/opencode/plugins/safe-compaction`, adds the absolute source tuple to the global OpenCode configuration, preserves JSONC comments and unrelated settings, and verifies the effective model, temperature, and compaction settings reported by `opencode debug config`. It first loads a generated minimal configuration containing only the exact installed tuple, then checks compatibility with the real target configuration. Fresh installs must retain all three exact numeric thresholds. For a pre-existing partial tuple, values intentionally inherited from earlier configuration or plugin hooks must still satisfy the plugin's type and safety bounds; explicit tuple values remain exact. Both checks use a temporary HOME and XDG directories; inherited `OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`, and pure mode are neutralized. An unrelated plugin therefore cannot impersonate successful activation, while a real effective-setting conflict still fails the transaction. Seeing the tuple alone is not considered successful activation. It is idempotent: rerunning it fast-forwards a clean checkout and does not duplicate the tuple. Configuration edits are serialized with a directory lock and committed by atomic rename. When an existing file changes successfully, a timestamped `*.safe-compaction-backup-*` copy remains beside it.
+
+The shortest command follows the mutable `default` branch. For a security-sensitive server, pin the reviewed installer and checkout to the same lowercase 40-character commit:
+
+```sh
+commit="COPY_A_REVIEWED_40_CHARACTER_COMMIT_HERE"
+curl -fsSL "https://raw.githubusercontent.com/shyba/opencode-better-compact-plugin/$commit/install.sh" |
+  env OPENCODE_SAFE_COMPACTION_REF="$commit" sh
+```
+
+Before writing configuration, the installer imports the exact absolute source module, checks its plugin identity and server factory, initializes the server with the exact tuple options, and runs its configuration hook. Existing tuples go through the same runtime option validation, including unknown-key and cross-limit checks. Duplicate root `plugin` keys are rejected rather than collapsed by JSONC parsing.
+
+Checkout update, configuration activation, and `opencode debug config` verification form one installer transaction. A checkout-parent lock serializes transactions sharing an install path even when their configuration directories differ; a second lock serializes transactions sharing a configuration directory. Both are held from before clone/update through verification and commit. A later failure restores the prior configuration, permissions, and Git commit, or removes a newly created clone. Successfully written configuration and installer-created backups use mode `0600` because OpenCode configuration may contain credentials. Rollback compares the activated configuration digest before restoring it, so it refuses to overwrite a file changed independently during activation; in that case it also preserves the checkout so the independently edited tuple cannot be left pointing at removed or rolled-back source. An uncatchable termination such as `SIGKILL` or a host power loss cannot run the shell rollback trap; the next installer removes a lock whose recorded process no longer exists, but inspect the timestamped backup and checkout before rerunning.
 
 The command requires `git`, Bun 1.3.14 or newer, and OpenCode `>=1.18.4 <1.19.0` on `PATH`. If OpenCode or Bun is installed at a nonstandard path, or a different compaction model is required, pass overrides to `sh`:
 
@@ -33,7 +45,7 @@ curl -fsSL https://raw.githubusercontent.com/shyba/opencode-better-compact-plugi
   sh
 ```
 
-Other supported overrides are `OPENCODE_SAFE_COMPACTION_DIR`, `OPENCODE_SAFE_COMPACTION_CONFIG_DIR`, `OPENCODE_SAFE_COMPACTION_REPO`, and `OPENCODE_SAFE_COMPACTION_REF` (an alternate branch). All directory overrides must be absolute. The installer respects an existing `OPENCODE_CONFIG_DIR`. It refuses to update a dirty checkout, a mismatched remote or branch, duplicate/conflicting plugin entries, and configurations containing the stale `deepseek-v4-flash-free` limit override. It never rewrites provider catalogs.
+Other supported overrides are `OPENCODE_SAFE_COMPACTION_DIR`, `OPENCODE_SAFE_COMPACTION_CONFIG_DIR`, `OPENCODE_SAFE_COMPACTION_REPO`, and `OPENCODE_SAFE_COMPACTION_REF` (an alternate branch or exact lowercase 40-character commit). Exact commits are fetched and checked out detached. All directory overrides must be absolute. The installer respects an existing `OPENCODE_CONFIG_DIR`. It refuses insecure `http://` and `git://` repository URLs, including an insecure existing origin that would otherwise normalize to the requested HTTPS GitHub repository. It also refuses a dirty checkout, a mismatched remote or branch, duplicate/conflicting plugin entries, and configurations containing the stale `deepseek-v4-flash-free` limit override. It never rewrites provider catalogs.
 
 The source plugin has no runtime package dependencies, so the installer does not populate `node_modules`. Restart a running OpenCode server after installation.
 
@@ -83,31 +95,33 @@ Tuple options use snake case. Unknown keys and invalid values fail during plugin
 | `preserve_recent_tokens` | `16000` | Recent-history budget written into OpenCode's V1 compaction settings. |
 | `reserved_tokens` | `32000` | Context reserved from compaction input; must leave usable model context. |
 | `max_output_tokens` | `16384` | Plugin ceiling for compaction output, further capped by the model limit. |
-| `max_user_text_bytes` | `524288` | Maximum combined UTF-8 bytes in newly admitted, non-synthetic text parts. |
-| `max_inline_data_bytes` | `10485760` | Maximum combined decoded bytes in newly admitted inline `data:` attachments. |
+| `max_user_text_bytes` | `524288` | Maximum combined UTF-8 bytes in all newly admitted text parts. Client-supplied `synthetic` flags do not bypass it. |
+| `max_inline_data_bytes` | `10485760` | Maximum combined decoded bytes in newly admitted inline `data:` attachments. Encoded representation and metadata have derived fixed bounds. |
 | `max_historical_part_bytes` | `131072` | Maximum UTF-8 bytes exposed from one historical text part during a compaction/recovery attempt. |
 | `max_ledger_bytes` | `12288` | Maximum canonical recovery-ledger block size. |
 | `max_summary_bytes` | `49152` | Maximum accepted summary size. It must exceed `max_ledger_bytes` by at least 1024 bytes. |
 
-For values OpenCode already exposes (`model`, `tail_turns`, `preserve_recent_tokens`, and `reserved_tokens`), precedence is explicit tuple option, existing OpenCode value, then plugin default. Other plugin limits use the explicit tuple option or plugin default. The configuration hook sets the compaction model and temperature zero, and applies the selected compaction thresholds. Existing explicit `compaction.auto` and `compaction.prune` values are preserved; absent values default to `true` and `false` respectively.
+For values OpenCode already exposes (`model`, `tail_turns`, `preserve_recent_tokens`, and `reserved_tokens`), precedence is explicit tuple option, existing OpenCode value, then plugin default. Other plugin limits use the explicit tuple option or plugin default. The configuration hook selects the compaction model and temperature zero, and applies the selected compaction thresholds. The request hook preserves an omitted temperature when the model declares that parameter unsupported. Existing explicit `compaction.auto` and `compaction.prune` values are preserved; absent values default to `true` and `false` respectively.
+
+Safety-critical tuple values also have hard ceilings: `tail_turns=64`, `max_user_text_bytes=8388608`, `max_inline_data_bytes=67108864`, `max_historical_part_bytes=1048576`, `max_ledger_bytes=262144`, and `max_summary_bytes=1048576`. These ceilings keep a tuple from disabling the plugin's resource bounds.
 
 ## Runtime behavior
 
 The plugin has five defensive stages:
 
-1. Admission rejects oversized new user text or decoded inline data and reports the measured and allowed byte counts. It recommends file references or smaller chunks; it never silently truncates a new request.
-2. Compaction reads complete session messages and todos through the OpenCode client, redacts credential-shaped values, and builds a deterministic bounded ledger of requests, constraints, todos, paths, tool statuses, errors, evidence snippets, and next actions. Full tool outputs are never copied into the ledger.
-3. The compaction prompt requires one Markdown response with `Goal`, `Constraints`, `Decisions`, `Current state`, `Files`, `Evidence`, `Blockers/questions`, and `Next actions`, followed by an exact versioned SHA-256 recovery-ledger block.
-4. During an active compaction/recovery attempt, cloned provider history is bounded: oversized historical text is reduced to a byte-bounded head and tail, long completed tool output is reduced to roughly 900 characters from each end, and oversized inline replay is replaced in the model-visible copy. Normal turns are left unchanged.
-5. A compaction assistant text part is accepted only when it has every required section, is within the byte limit, and carries the exact ledger digest. A malformed, refusal, oversized, or later split text part is replaced or blanked as appropriate. Auto-continuation is permitted only for an original valid summary or deterministic fallback, and an earlier plugin's disabled setting is preserved.
+1. Admission rejects oversized new user text, decoded inline data, or an oversized encoded data-URL representation and reports the measured and allowed byte counts. Data-URL metadata has a fixed 16 KiB ceiling. It recommends file references or smaller chunks; it never silently truncates a new request.
+2. Compaction asks the OpenCode API for the newest 10,000 session messages plus todos, then applies smaller deterministic newest-first message, part, node, and collection budgets while building the ledger. If that recent window has no prior plugin-valid ledger, it follows at most 255 older 256-message cursor pages until it finds the newest older one or reaches the scan budget; the surrounding provider prose is never trusted. Overflow-replay matching uses the same paging contract and stops as soon as it has the two distinct durable requests needed for proof. Page order or durable creation time establishes chronology rather than caller-controlled Message IDs. Requests and constraints come only from eligible user text; assistant, synthetic, and ignored prose cannot become recovered intent. The newest request outranks todo flooding. Credential-shaped values are redacted, and tool evidence hashes only a bounded source prefix rather than scanning or copying an unbounded output.
+3. The compaction prompt supplies the exact deterministic Markdown response to return byte-for-byte, with `Goal`, `Constraints`, `Decisions`, `Current state`, `Files`, `Evidence`, `Blockers/questions`, and `Next actions`, followed by a versioned SHA-256 recovery-ledger block.
+4. During an active compaction/recovery attempt, only the cloned provider history is changed. Historical text is redacted and byte-bounded; reasoning is converted to unsigned text; credential-keyed tool input values, outputs, errors, state metadata, and attachments are redacted or bounded; inline and external attachments are replaced by metadata-only omission markers. Bounded opaque provider continuation metadata is preserved because same-model Gemini and similar providers require their signatures to replay tool calls. Malformed historical data URLs cannot abort compaction. Normal turns are left byte-for-byte unchanged.
+5. Every targeted nonempty compaction text is replaced with the exact deterministic summary derived from the canonical ledger. Auto-continuation re-loads durable history, binds to the precise core compaction parent, and permits continuation only when that exact summary and ledger still match. An earlier plugin's disabled setting is preserved.
 
-The plugin stores only bounded attempt metadata in process memory, keyed by the full Session ID, with a 30-minute TTL. Completion, idle, deletion, error, and disposal signals clean it up. Events are cleanup/audit signals, not correctness gates.
+The plugin stores only bounded attempt metadata in process memory, keyed by the full Session ID, with a 30-minute TTL and a 128-attempt cap. Idle can retain a small recovery-complete tombstone until expiry so later turns in the same process do not repeat recovery. After a restart there is no durable proof that clone-only recovery was seen, so the plugin conservatively reinjects bounded recovery context. Events remain cleanup/audit signals, not correctness gates.
 
 ## Security and privacy
 
 - The runtime plugin has no telemetry, external network client, or runtime dependency. Its OpenCode client calls read the active session and todo records from the host server.
 - It creates no shadow transcript, sidecar recovery file, or external cache. Durable conversation history remains owned by OpenCode.
-- Recovery content is bounded and credential-shaped values are redacted before they enter ledger fields.
+- Recovery content is bounded, credential-shaped values are redacted, and provider-authored legacy summary prose is omitted. A prior plugin-valid canonical ledger may be chained to retain bounded facts across repeated compactions; its provider-authored prose is never carried forward.
 - Runtime logging contains metadata only; conversation text, tool output, ledger bodies, and credentials are not logged.
 - New oversized requests fail closed. Historical truncation affects only the cloned model-visible history used during recovery, not durable records.
 
@@ -120,9 +134,11 @@ This plugin mitigates compaction failures; it cannot make OpenCode's core cutove
 - Support is limited to the legacy V1 session compactor. V2 support is deferred until public V2 compaction hooks exist.
 - Core still owns history head/tail selection, `tail_start_id`, boundary acceptance, durable replay, and cutover.
 - A zero-text provider response emits no text-complete hook, so the plugin cannot insert a replacement summary. It suppresses ordinary auto-continuation and can rebuild recovery context on the next user turn.
-- A split response can expose more than one text part. When all parts are already visible, the first targeted part is replaced by one fallback and later parts are blanked. If a later part appears only after a valid first part was persisted, V1 offers no hook to replace that earlier text retroactively; the plugin blanks the late part and suppresses auto-continuation.
+- A split response can expose more than one text part. The first targeted part is replaced by one deterministic summary and later text parts are blanked.
 - Overflow replay bypasses the normal auto-continue hook and remains in durable storage. The plugin can sanitize only the cloned provider-visible replay.
-- Nonempty summaries written before this plugin are retained as legacy context, but they are not trusted as validation anchors. Only summaries with a valid plugin ledger may anchor plugin recovery.
+- Nonempty summaries without a valid plugin ledger are represented only by metadata-only `legacy_context` omission records. A prior plugin-valid canonical ledger can be chained as bounded input, but its surrounding provider-authored prose is neither copied nor trusted.
+- Direct recovery facts are extracted from the newest 10,000 messages. Older plugin-valid ledgers remain discoverable across a bounded scan of up to 65,280 additional messages and can carry their already-bounded facts forward. Ordinary pre-plugin history outside those windows is not reprocessed, because V1 exposes neither metadata-only projection nor a response-byte limit.
+- V1 pagination bounds message count, not serialized response bytes. The plugin validates page size, distinct and non-overlapping message identities, cursor reuse, the total page budget, and Session identity, but a single historical message with enormous parts can still make one host API response large; a strict response-byte cap requires a core/API change.
 - Attempt state is process-local. This plugin does not implement clustered compaction ownership or crash-safe provider retries.
 
 ## Development and packaging
@@ -147,7 +163,7 @@ For a portability smoke test, copy or clone the repository outside any OpenCode 
 The `eval/` directory contains 30 sanitized, synthetic transcripts. The runner evaluates three repetitions per case under two separately implemented conditions:
 
 - `baseline` uses a checked-in snapshot of the OpenCode 1.18.4 V1 compaction prompt. It is informational and does not import OpenCode core.
-- `plugin` uses this package's real ledger builder, compaction prompt, digest validator, and fallback generator.
+- `plugin` uses this package's real ledger builder, compaction prompt, and authoritative deterministic-summary generator.
 
 Provider transport is a separate adapter shared by both conditions. The default fixture adapter is deterministic and deliberately cycles through valid, malformed, and refusal responses so the harness and fallback path can be tested offline. It is not evidence of model quality or live-provider performance.
 
