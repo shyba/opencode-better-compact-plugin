@@ -74,20 +74,22 @@ async function configure() {
     }
   }
 
-  const installed = existing.flatMap((config) => pluginSpecs(config.value).map((spec) => ({ file: config.file, spec })))
-  const conflict = installed.find((item) => isSafeCompaction(item.spec) && pluginSource(item.spec) !== source)
-  if (conflict) {
-    throw new Error(`A different safe-compaction plugin entry already exists in ${conflict.file}; remove it and rerun`)
+  const installed = existing.flatMap((config) =>
+    pluginSpecs(config.value).map((spec) => ({ config, spec }))
+  )
+  const safeCompaction = installed.filter((item) =>
+    isSafeCompaction(item.spec) || samePluginSource(pluginSource(item.spec), source)
+  )
+  if (safeCompaction.length > 1) {
+    throw new Error("The safe-compaction plugin is configured more than once; keep one entry and rerun")
   }
-
-  const matching = installed.filter((item) => pluginSource(item.spec) === source)
-  if (matching.length > 1) throw new Error("The safe-compaction plugin is configured more than once; keep one entry and rerun")
-  if (matching.length === 1) {
-    const options = tupleOptions(matching[0]!.spec, matching[0]!.file)
+  const installedSafeCompaction = safeCompaction[0]
+  if (installedSafeCompaction && samePluginSource(pluginSource(installedSafeCompaction.spec), source)) {
+    const options = tupleOptions(installedSafeCompaction.spec, installedSafeCompaction.config.file)
     const expectations = await preflight(source, options, merged)
     if (options.model !== model) {
       throw new Error(
-        `The existing safe-compaction entry in ${matching[0]!.file} does not select ${model}; edit or remove it and rerun`,
+        `The existing safe-compaction entry in ${installedSafeCompaction.config.file} does not select ${model}; edit or remove it and rerun`,
       )
     }
     await writeVerificationConfig(source, options, expectations)
@@ -95,43 +97,57 @@ async function configure() {
     return
   }
 
-  const target = existing.at(-1) ?? {
+  const target = installedSafeCompaction?.config ?? existing.at(-1) ?? {
     file: path.join(configDir, "opencode.jsonc"),
     text: '{\n  "$schema": "https://opencode.ai/config.json"\n}\n',
     value: { $schema: "https://opencode.ai/config.json" },
   }
-  const options = {
-    model,
-    tail_turns: 4,
-    preserve_recent_tokens: 16_000,
-    reserved_tokens: 32_000,
-    max_output_tokens: 16_384,
-    max_user_text_bytes: 524_288,
-    max_inline_data_bytes: 10_485_760,
-    max_historical_part_bytes: 131_072,
-    max_ledger_bytes: 12_288,
-    max_summary_bytes: 49_152,
+  const previousSource = installedSafeCompaction ? pluginSource(installedSafeCompaction.spec) : undefined
+  const options = installedSafeCompaction
+    ? tupleOptions(installedSafeCompaction.spec, target.file)
+    : {
+      model,
+      tail_turns: 4,
+      preserve_recent_tokens: 16_000,
+      reserved_tokens: 32_000,
+      max_output_tokens: 16_384,
+      max_user_text_bytes: 524_288,
+      max_inline_data_bytes: 10_485_760,
+      max_historical_part_bytes: 131_072,
+      max_ledger_bytes: 12_288,
+      max_summary_bytes: 49_152,
+    }
+  if (options.model !== model) {
+    throw new Error(`The existing safe-compaction entry in ${target.file} does not select ${model}; edit or remove it and rerun`)
   }
+  if (previousSource) await verifyExistingPluginIdentity(previousSource, target.file)
   const expectations = await preflight(source, options, merged)
   await writeVerificationConfig(source, options, expectations)
-  const output = addPlugin(target.text, target.value, [source, options])
-  const existed = await Bun.file(target.file).exists()
-  const backup = existed ? `${target.file}.safe-compaction-backup-${Date.now()}-${process.pid}` : undefined
-  const originalMode = existed ? (await stat(target.file)).mode & 0o777 : undefined
+  const output = previousSource
+    ? replacePluginSource(target.text, previousSource, source)
+    : addPlugin(target.text, target.value, [source, options])
+  await writeConfiguredFile(target.file, target.text, output)
+  console.log(previousSource ? `Migrated ${previousSource} to ${source}` : `Configured ${target.file}`)
+}
+
+async function writeConfiguredFile(file: string, original: string, output: string) {
+  const existed = await Bun.file(file).exists()
+  const backup = existed ? `${file}.safe-compaction-backup-${Date.now()}-${process.pid}` : undefined
+  const originalMode = existed ? (await stat(file)).mode & 0o777 : undefined
   const mode = 0o600
-  const originalDigest = existed ? sha256(target.text) : undefined
+  const originalDigest = existed ? sha256(original) : undefined
   if (backup) {
-    await copyFile(target.file, backup)
+    await copyFile(file, backup)
     await chmod(backup, 0o600)
   }
   try {
-    await atomicWrite(target.file, output, mode)
+    await atomicWrite(file, output, mode)
     if (stateFile) {
       await atomicWrite(
         stateFile,
         JSON.stringify({
           version: 1,
-          target: target.file,
+          target: file,
           ...(backup ? { backup } : {}),
           existed,
           ...(originalDigest ? { originalDigest } : {}),
@@ -142,15 +158,34 @@ async function configure() {
       )
     }
   } catch (error) {
-    if (existed && backup) await atomicRestore(backup, target.file, originalMode ?? mode)
-    if (!existed) await rm(target.file, { force: true })
+    if (existed && backup) await atomicRestore(backup, file, originalMode ?? mode)
+    if (!existed) await rm(file, { force: true })
     if (backup) await rm(backup, { force: true })
     if (stateFile) await rm(stateFile, { force: true })
     throw error
   }
 
-  console.log(`Configured ${target.file}`)
   if (backup) console.log(`Backup: ${backup}`)
+}
+
+async function verifyExistingPluginIdentity(source: string, file: string) {
+  try {
+    const url = source.startsWith("file:")
+      ? new URL(source)
+      : path.isAbsolute(source)
+        ? pathToFileURL(source)
+        : undefined
+    if (!url || url.protocol !== "file:") throw new TypeError("source is not an absolute local path")
+    url.searchParams.set("installer-migration", `${Date.now()}-${process.pid}`)
+    const module: unknown = await import(url.href)
+    const imported = isRecord(module) ? module : undefined
+    const plugin = isRecord(imported?.default) ? imported.default : undefined
+    if (plugin?.id !== "opencode-safe-compaction" || typeof plugin.server !== "function") {
+      throw new TypeError("module does not export the expected plugin identity")
+    }
+  } catch (error) {
+    throw new Error(`Could not verify the existing safe-compaction entry in ${file}: ${errorText(error)}`)
+  }
 }
 
 async function writeVerificationConfig(
@@ -540,6 +575,37 @@ function addPlugin(text: string, value: Record<string, unknown>, entry: unknown[
   const block = `${propertyIndentation}"plugin": [\n${indent(JSON.stringify(entry, null, 2), `${propertyIndentation}  `)}\n${propertyIndentation}]`
   const separator = previous.value === "{" || previous.value === "," ? "" : ","
   const output = `${text.slice(0, previous.end)}${separator}\n${block}${text.slice(previous.end)}`
+  parseConfig(output, "updated configuration")
+  return output
+}
+
+function replacePluginSource(text: string, previous: string, source: string) {
+  const tokens = tokenize(text)
+  if (tokens[0]?.value !== "{") throw new TypeError("OpenCode configuration must start with an object")
+  const plugin = rootProperties(tokens).find((item) => item.key === "plugin")
+  if (!plugin || tokens[plugin.value]?.value !== "[") {
+    throw new TypeError("Could not locate the existing OpenCode plugin array")
+  }
+  const close = matchingClose(tokens, plugin.value)
+  const matches: Token[] = []
+  let index = plugin.value + 1
+  while (index < close) {
+    const entry = tokens[index]
+    const sourceToken = entry?.kind === "string"
+      ? entry
+      : entry?.value === "["
+        ? tokens[index + 1]
+        : undefined
+    if (sourceToken?.kind === "string" && sourceToken.value === previous) matches.push(sourceToken)
+    index = skipValue(tokens, index)
+    if (tokens[index]?.value === ",") index++
+    else if (index !== close) throw new TypeError("Invalid OpenCode plugin array")
+  }
+  if (matches.length !== 1) {
+    throw new Error(`Expected exactly one existing safe-compaction source in the OpenCode plugin array, found ${matches.length}`)
+  }
+  const match = matches[0]!
+  const output = `${text.slice(0, match.start)}${JSON.stringify(source)}${text.slice(match.end)}`
   parseConfig(output, "updated configuration")
   return output
 }

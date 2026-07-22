@@ -92,6 +92,88 @@ describe("installer", () => {
     expect(await Bun.file(file).text()).toBe(original)
   })
 
+  test("migrates a verified legacy checkout while preserving tuple options and JSONC comments", async () => {
+    const root = await directory()
+    const config = path.join(root, "config")
+    const install = path.join(root, "managed-install")
+    const legacy = path.join(root, "legacy", "safe-compaction")
+    await prepareInstall(install)
+    await prepareInstall(legacy)
+    const file = path.join(config, "opencode.jsonc")
+    const previousSource = path.join(legacy, "src/index.ts")
+    await Bun.write(
+      file,
+      `{
+  // Preserve this comment and the existing options during migration.
+  "theme": "system",
+  "plugin": [
+    "file:///opt/existing-plugin.ts",
+    [
+      ${JSON.stringify(previousSource)},
+      {
+        "model": "opencode-go/glm-5.2",
+        "tail_turns": 7,
+        "max_ledger_bytes": 16384,
+        "max_summary_bytes": 65536
+      }
+    ]
+  ]
+}
+`,
+    )
+
+    const result = await configure(config, install)
+
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout).toContain(`Migrated ${previousSource} to ${path.join(install, "src/index.ts")}`)
+    const text = await Bun.file(file).text()
+    const value = Bun.JSONC.parse(text) as { theme: string; plugin: Array<unknown> }
+    expect(text).toContain("Preserve this comment and the existing options during migration.")
+    expect(text).not.toContain(previousSource)
+    expect(value.theme).toBe("system")
+    expect(value.plugin).toEqual([
+      "file:///opt/existing-plugin.ts",
+      [
+        path.join(install, "src/index.ts"),
+        {
+          model: "opencode-go/glm-5.2",
+          tail_turns: 7,
+          max_ledger_bytes: 16_384,
+          max_summary_bytes: 65_536,
+        },
+      ],
+    ])
+    expect(await Array.fromAsync(new Bun.Glob("*.safe-compaction-backup-*").scan(config))).toHaveLength(1)
+
+    const repeat = await configure(config, install)
+    expect(repeat.exitCode).toBe(0)
+    expect(repeat.stdout).toContain("Configuration already contains")
+    expect(await Bun.file(file).text()).toBe(text)
+    expect(await Array.fromAsync(new Bun.Glob("*.safe-compaction-backup-*").scan(config))).toHaveLength(1)
+  })
+
+  test("refuses to migrate a path-shaped plugin that does not export the expected identity", async () => {
+    const root = await directory()
+    const config = path.join(root, "config")
+    const install = path.join(root, "managed-install")
+    const legacy = path.join(root, "legacy", "safe-compaction")
+    await prepareInstall(install)
+    await mkdir(path.join(legacy, "src"), { recursive: true })
+    await Bun.write(path.join(legacy, "src/index.ts"), 'export default { id: "not-safe-compaction", server() {} }\n')
+    const file = path.join(config, "opencode.json")
+    const original = JSON.stringify({
+      plugin: [[path.join(legacy, "src/index.ts"), { model: "opencode-go/glm-5.2" }]],
+    }, null, 2)
+    await Bun.write(file, original)
+
+    const result = await configure(config, install)
+
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr).toContain("Could not verify the existing safe-compaction entry")
+    expect(await Bun.file(file).text()).toBe(original)
+    expect(await Array.fromAsync(new Bun.Glob("*.safe-compaction-backup-*").scan(config))).toEqual([])
+  })
+
   test("rejects duplicate root plugin keys before mutation", async () => {
     const root = await directory()
     const config = path.join(root, "config")
@@ -315,6 +397,51 @@ exit 1
     expect(await Bun.file(file).text()).toBe(original)
     expect((await stat(file)).mode & 0o777).toBe(0o644)
     expect(await Bun.file(install).exists()).toBe(false)
+    expect(await Array.fromAsync(new Bun.Glob("*.safe-compaction-backup-*").scan(config))).toHaveLength(0)
+  })
+
+  test("rolls back a legacy-path migration when OpenCode verification fails", async () => {
+    const root = await directory()
+    const origin = await installerOrigin(root)
+    const install = path.join(root, "installed")
+    const legacy = path.join(root, "legacy", "safe-compaction")
+    const config = path.join(root, "config")
+    const file = path.join(config, "opencode.json")
+    await prepareInstall(legacy)
+    const original = JSON.stringify({
+      theme: "system",
+      plugin: [[path.join(legacy, "src/index.ts"), { model: "opencode-go/glm-5.2", tail_turns: 6 }]],
+    }, null, 2)
+    await Bun.write(file, original)
+    const fakeOpenCode = path.join(root, "opencode-migration-failing")
+    await executable(
+      fakeOpenCode,
+      `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '1.18.4\\n'
+  exit 0
+fi
+if [ "$1" = "debug" ] && [ "$2" = "config" ]; then
+  exit 41
+fi
+exit 1
+`,
+    )
+
+    const result = await command(["sh", "install.sh"], {
+      ...process.env,
+      OPENCODE_SAFE_COMPACTION_REPO: origin,
+      OPENCODE_SAFE_COMPACTION_DIR: install,
+      OPENCODE_SAFE_COMPACTION_CONFIG_DIR: config,
+      OPENCODE_SAFE_COMPACTION_BUN: process.execPath,
+      OPENCODE_SAFE_COMPACTION_OPENCODE: fakeOpenCode,
+    })
+
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr).toContain("OpenCode could not load the isolated plugin configuration")
+    expect(await Bun.file(file).text()).toBe(original)
+    expect(await Bun.file(install).exists()).toBe(false)
+    expect(await Bun.file(path.join(legacy, "src/index.ts")).exists()).toBe(true)
     expect(await Array.fromAsync(new Bun.Glob("*.safe-compaction-backup-*").scan(config))).toHaveLength(0)
   })
 
