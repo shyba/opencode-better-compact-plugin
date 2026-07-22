@@ -1,0 +1,96 @@
+export const OPTION_KEYS = [
+  "model",
+  "tail_turns",
+  "preserve_recent_tokens",
+  "reserved_tokens",
+  "max_output_tokens",
+  "max_user_text_bytes",
+  "max_inline_data_bytes",
+  "max_historical_part_bytes",
+  "max_ledger_bytes",
+  "max_summary_bytes",
+] as const
+
+export type PluginOptions = {
+  model: string
+  tail_turns: number
+  preserve_recent_tokens: number
+  reserved_tokens: number
+  max_output_tokens: number
+  max_user_text_bytes: number
+  max_inline_data_bytes: number
+  max_historical_part_bytes: number
+  max_ledger_bytes: number
+  max_summary_bytes: number
+}
+
+export type ParsedOptions = Partial<PluginOptions>
+
+export type ExistingOptions = {
+  model?: string | undefined
+  tail_turns?: number | undefined
+  preserve_recent_tokens?: number | undefined
+  reserved_tokens?: number | undefined
+}
+
+export const DEFAULT_OPTIONS = {
+  tail_turns: 4,
+  preserve_recent_tokens: 16_000,
+  reserved_tokens: 32_000,
+  max_output_tokens: 16_384,
+  max_user_text_bytes: 524_288,
+  max_inline_data_bytes: 10_485_760,
+  max_historical_part_bytes: 131_072,
+  max_ledger_bytes: 12_288,
+  max_summary_bytes: 49_152,
+} satisfies Omit<PluginOptions, "model">
+
+export function parseOptions(input: Record<string, unknown> | undefined) {
+  const value = input ?? {}
+  const unknown = Object.keys(value).filter((key) => !OPTION_KEYS.includes(key as (typeof OPTION_KEYS)[number]))
+  if (unknown.length) throw new TypeError(`Unknown opencode-safe-compaction option: ${unknown.sort().join(", ")}`)
+
+  const result: ParsedOptions = {}
+  if (value.model !== undefined) {
+    if (typeof value.model !== "string" || !/^[^/\s]+\/[^\s]+$/.test(value.model)) {
+      throw new TypeError('Option "model" must use the provider/model format')
+    }
+    result.model = value.model
+  }
+
+  for (const key of OPTION_KEYS.filter((item) => item !== "model")) {
+    if (value[key] === undefined) continue
+    if (!Number.isSafeInteger(value[key]) || (key === "tail_turns" ? Number(value[key]) < 0 : Number(value[key]) <= 0)) {
+      throw new TypeError(`Option "${key}" must be a ${key === "tail_turns" ? "non-negative" : "positive"} integer`)
+    }
+    result[key] = Number(value[key])
+  }
+  return result
+}
+
+export function resolveOptions(options: ParsedOptions, existing: ExistingOptions = {}) {
+  const result: PluginOptions = {
+    model: options.model ?? existing.model ?? "",
+    tail_turns: options.tail_turns ?? existing.tail_turns ?? DEFAULT_OPTIONS.tail_turns,
+    preserve_recent_tokens:
+      options.preserve_recent_tokens ?? existing.preserve_recent_tokens ?? DEFAULT_OPTIONS.preserve_recent_tokens,
+    reserved_tokens: options.reserved_tokens ?? existing.reserved_tokens ?? DEFAULT_OPTIONS.reserved_tokens,
+    max_output_tokens: options.max_output_tokens ?? DEFAULT_OPTIONS.max_output_tokens,
+    max_user_text_bytes: options.max_user_text_bytes ?? DEFAULT_OPTIONS.max_user_text_bytes,
+    max_inline_data_bytes: options.max_inline_data_bytes ?? DEFAULT_OPTIONS.max_inline_data_bytes,
+    max_historical_part_bytes: options.max_historical_part_bytes ?? DEFAULT_OPTIONS.max_historical_part_bytes,
+    max_ledger_bytes: options.max_ledger_bytes ?? DEFAULT_OPTIONS.max_ledger_bytes,
+    max_summary_bytes: options.max_summary_bytes ?? DEFAULT_OPTIONS.max_summary_bytes,
+  }
+  if (!result.model) throw new TypeError('Option "model" is required when OpenCode has no compaction model')
+  if (result.max_historical_part_bytes < 128) {
+    throw new TypeError('Option "max_historical_part_bytes" must be at least 128 bytes')
+  }
+  if (result.max_ledger_bytes < 1_024) {
+    throw new TypeError('Option "max_ledger_bytes" must be at least 1024 bytes')
+  }
+  if (result.max_summary_bytes < result.max_ledger_bytes + 1_024) {
+    throw new TypeError('Option "max_summary_bytes" must exceed "max_ledger_bytes" by at least 1024 bytes')
+  }
+  return result
+}
