@@ -6,22 +6,44 @@ The package is private at version `0.1.0`. Git/source-path installation is the s
 
 ## Compatibility and prerequisites
 
-- Bun 1.3.14.
+- Bun 1.3.14 or newer (verified with 1.3.14).
 - OpenCode `>=1.18.4 <1.19.0`. The plugin uses experimental V1 hooks, so the upper bound is intentional.
 - A configured compaction model. The initial configuration below uses `opencode-go/glm-5.2`, but the package itself is provider-neutral.
 - The selected model must have an output limit above zero and a context limit larger than `reserved_tokens`.
 
 Before enabling the plugin, remove only the stale `deepseek-v4-flash-free` model-limit override from the global OpenCode JSONC configuration. Do not remove the provider, other model entries, credentials, or unrelated settings. The usual global file is `${XDG_CONFIG_HOME:-~/.config}/opencode/opencode.jsonc`; use the path reported by OpenCode if the configuration directory was overridden. The plugin deliberately does not rewrite provider catalogs.
 
-## Git-first installation
+## One-command installation
 
-Clone this repository to a stable absolute path, then install its development dependencies:
+Review the installer, then run it on each server:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/shyba/opencode-better-compact-plugin/default/install.sh | sh
+```
+
+The installer clones the `default` branch over HTTPS to `$HOME/.local/share/opencode/plugins/safe-compaction`, adds the absolute source tuple to the global OpenCode configuration, preserves JSONC comments and unrelated settings, and verifies the result with `opencode debug config`. It is idempotent: rerunning it fast-forwards a clean checkout and does not duplicate the tuple. When it changes an existing configuration file, it first creates a timestamped `*.safe-compaction-backup-*` copy beside that file.
+
+The command requires `git`, Bun 1.3.14 or newer, and OpenCode `>=1.18.4 <1.19.0` on `PATH`. If OpenCode or Bun is installed at a nonstandard path, or a different compaction model is required, pass overrides to `sh`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/shyba/opencode-better-compact-plugin/default/install.sh |
+  OPENCODE_SAFE_COMPACTION_OPENCODE="$HOME/.local/bin/opencode" \
+  OPENCODE_SAFE_COMPACTION_BUN="$HOME/.bun/bin/bun" \
+  OPENCODE_SAFE_COMPACTION_MODEL="provider/model" \
+  sh
+```
+
+Other supported overrides are `OPENCODE_SAFE_COMPACTION_DIR`, `OPENCODE_SAFE_COMPACTION_CONFIG_DIR`, `OPENCODE_SAFE_COMPACTION_REPO`, and `OPENCODE_SAFE_COMPACTION_REF` (an alternate branch). All directory overrides must be absolute. The installer respects an existing `OPENCODE_CONFIG_DIR`. It refuses to update a dirty checkout, a mismatched remote or branch, duplicate/conflicting plugin entries, and configurations containing the stale `deepseek-v4-flash-free` limit override. It never rewrites provider catalogs.
+
+The source plugin has no runtime package dependencies, so the installer does not populate `node_modules`. Restart a running OpenCode server after installation.
+
+## Manual Git installation
+
+Clone this repository to a stable absolute path:
 
 ```sh
 install_dir="$HOME/.local/share/opencode/plugins/safe-compaction"
-git clone <repository-url> "$install_dir"
-cd "$install_dir"
-bun install --frozen-lockfile
+git clone --branch default https://github.com/shyba/opencode-better-compact-plugin.git "$install_dir"
 ```
 
 Add the tuple below to the global server configuration's existing `plugin` array, replacing `USER` with the account's actual home directory. The plugin path must be absolute; environment variables are not expanded inside JSON. JSONC comments are allowed. Keep other plugin entries intact.

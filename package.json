@@ -29,7 +29,7 @@
     "README.md"
   ],
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.scripts.json",
     "test": "bun test",
     "build:js": "bun build src/index.ts --outdir dist --target bun --format esm",
     "build:types": "tsc --emitDeclarationOnly",
