@@ -8,7 +8,7 @@ The package is private at version `0.1.0`. Git/source-path installation is the s
 
 - OpenCode supplies the Bun runtime used by the plugin. A separate Bun installation is optional for the one-command installer and required only for development or packaging.
 - OpenCode `>=1.18.4 <1.19.0`. The plugin uses experimental V1 hooks, so the upper bound is intentional.
-- A configured compaction model. The initial configuration below uses `opencode-go/glm-5.2`, but the package itself is provider-neutral.
+- Either `model: "selected"` to follow each compaction's selected model, or a fixed `provider/model`. The initial configuration below uses `opencode-go/glm-5.2`, but the package itself is provider-neutral.
 - The selected model must have a positive output limit and leave positive usable input under OpenCode's V1 overflow calculation.
 
 Before enabling the plugin, remove only the stale `deepseek-v4-flash-free` model-limit override from the global OpenCode JSONC configuration. Do not remove the provider, other model entries, credentials, or unrelated settings. The usual global file is `${XDG_CONFIG_HOME:-~/.config}/opencode/opencode.jsonc`; use the path reported by OpenCode if the configuration directory was overridden. The plugin deliberately does not rewrite provider catalogs.
@@ -20,6 +20,22 @@ Review the installer, then run it on each server:
 ```sh
 curl -fsSL https://raw.githubusercontent.com/shyba/opencode-better-compact-plugin/default/install.sh | sh
 ```
+
+Choose the model policy during installation or rerun the same command later to change it:
+
+```sh
+# Follow the model selected in OpenCode for each automatic or manual compaction.
+curl -fsSL https://raw.githubusercontent.com/shyba/opencode-better-compact-plugin/default/install.sh |
+  sh -s -- --model selected
+
+# Use a dedicated compaction model.
+curl -fsSL https://raw.githubusercontent.com/shyba/opencode-better-compact-plugin/default/install.sh |
+  sh -s -- --model provider/model
+```
+
+The no-argument installer keeps the established `opencode-go/glm-5.2` default for a fresh installation and preserves the current policy when rerun. The `selected` value is the source plugin's fallback when neither its tuple nor OpenCode defines a dedicated compaction model.
+
+In `selected` mode, changing the model in OpenCode applies to the next compaction without reconfiguring the plugin. Automatic compaction uses the model on the latest user turn, while manual `/compact` uses the model selected when the command runs. Changing between `selected` and a dedicated model rewrites only the tuple's `model` value transactionally; restart a running OpenCode server after that configuration change.
 
 The installer clones the `default` branch over HTTPS to `$HOME/.local/share/opencode/plugins/safe-compaction`, adds the absolute source tuple to the global OpenCode configuration, preserves JSONC comments and unrelated settings, and verifies the effective model, temperature, and compaction settings reported by `opencode debug config`. If exactly one entry points to a different local safe-compaction checkout, the installer imports that module to verify the expected plugin identity, preserves its validated tuple options, and replaces only its source string with the managed path. Unverifiable lookalikes and duplicate entries are refused. It first loads a generated minimal configuration containing only the exact installed tuple, then checks compatibility with the real target configuration. Fresh installs must retain all three exact numeric thresholds. For a pre-existing partial tuple, values intentionally inherited from earlier configuration or plugin hooks must still satisfy the plugin's type and safety bounds; explicit tuple values remain exact. Both checks use a temporary HOME and XDG directories; inherited `OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`, and pure mode are neutralized. An unrelated plugin therefore cannot impersonate successful activation. Seeing the tuple alone is not considered successful activation. It is idempotent: rerunning it fast-forwards a clean checkout and does not duplicate the tuple. Configuration edits are serialized with a directory lock and committed by atomic rename. When an existing file changes successfully, a timestamped `*.safe-compaction-backup-*` copy remains beside it.
 
@@ -90,7 +106,7 @@ Tuple options use snake case. Unknown keys and invalid values fail during plugin
 
 | Option | Default | Meaning |
 | --- | ---: | --- |
-| `model` | none | Required `provider/model` identifier unless OpenCode already defines the compaction agent model. |
+| `model` | `selected` | `selected` follows the model chosen for each compaction; `provider/model` pins a dedicated compaction model. |
 | `tail_turns` | `4` | Number of recent ordinary user requests retained in the recovery ledger. May be zero. |
 | `preserve_recent_tokens` | `16000` | Recent-history budget written into OpenCode's V1 compaction settings. |
 | `reserved_tokens` | `32000` | Context reserved from compaction input; must leave usable model context. |
@@ -101,7 +117,7 @@ Tuple options use snake case. Unknown keys and invalid values fail during plugin
 | `max_ledger_bytes` | `12288` | Maximum canonical recovery-ledger block size. |
 | `max_summary_bytes` | `49152` | Maximum accepted summary size. It must exceed `max_ledger_bytes` by at least 1024 bytes. |
 
-For values OpenCode already exposes (`model`, `tail_turns`, `preserve_recent_tokens`, and `reserved_tokens`), precedence is explicit tuple option, existing OpenCode value, then plugin default. Other plugin limits use the explicit tuple option or plugin default. The configuration hook selects the compaction model and temperature zero, and applies the selected compaction thresholds. The request hook preserves an omitted temperature when the model declares that parameter unsupported. Existing explicit `compaction.auto` and `compaction.prune` values are preserved; absent values default to `true` and `false` respectively.
+For values OpenCode already exposes (`model`, `tail_turns`, `preserve_recent_tokens`, and `reserved_tokens`), precedence is explicit tuple option, existing OpenCode value, then plugin default. Other plugin limits use the explicit tuple option or plugin default. The configuration hook pins a dedicated model or removes that override in `selected` mode, sets temperature zero, and applies the selected compaction thresholds. The request hook validates and caps the actual per-compaction model in either mode while preserving an omitted temperature when the model declares that parameter unsupported. Existing explicit `compaction.auto` and `compaction.prune` values are preserved; absent values default to `true` and `false` respectively.
 
 Safety-critical tuple values also have hard ceilings: `tail_turns=64`, `max_user_text_bytes=8388608`, `max_inline_data_bytes=67108864`, `max_historical_part_bytes=1048576`, `max_ledger_bytes=262144`, and `max_summary_bytes=1048576`. These ceilings keep a tuple from disabling the plugin's resource bounds.
 

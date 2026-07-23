@@ -374,6 +374,30 @@ describe("configuration and model request parameters", () => {
     })
   })
 
+  test("removes a dedicated compaction model in selected mode and accepts each request model", async () => {
+    const hooks = await server(pluginInput(state()), { ...TEST_OPTIONS, model: "selected" })
+    const config = {
+      agent: { compaction: { model: "old/dedicated", keep: "value" } },
+    } as unknown as Config
+    await hooks.config?.(config)
+
+    expect(config).toMatchObject({
+      agent: { compaction: { temperature: 0, keep: "value" } },
+    })
+    expect((config as unknown as { agent: { compaction: Record<string, unknown> } }).agent.compaction).not.toHaveProperty(
+      "model",
+    )
+
+    const output = { temperature: 0.9, topP: 1, topK: 0, maxOutputTokens: 500, options: {} }
+    const input = {
+      sessionID: "selected-model",
+      agent: "compaction",
+      model: { providerID: "another", id: "current", limit: { context: 1_000, output: 80 } },
+    } as unknown as Parameters<NonNullable<Hooks["chat.params"]>>[0]
+    await expect(hooks["chat.params"]?.(input, output)).resolves.toBeUndefined()
+    expect(output).toMatchObject({ temperature: 0, maxOutputTokens: 64 })
+  })
+
   test("scopes model checks and output caps to the compaction agent", async () => {
     const hooks = await server(pluginInput(state()), TEST_OPTIONS)
     const output = { temperature: 0.9, topP: 1, topK: 0, maxOutputTokens: 500, options: {} }

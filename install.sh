@@ -6,7 +6,13 @@ repository=${OPENCODE_SAFE_COMPACTION_REPO:-https://github.com/shyba/opencode-be
 ref=${OPENCODE_SAFE_COMPACTION_REF:-default}
 install_dir=${OPENCODE_SAFE_COMPACTION_DIR:-${HOME:?HOME must be set}/.local/share/opencode/plugins/safe-compaction}
 config_dir=${OPENCODE_SAFE_COMPACTION_CONFIG_DIR:-${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}}
-model=${OPENCODE_SAFE_COMPACTION_MODEL:-opencode-go/glm-5.2}
+if [ "${OPENCODE_SAFE_COMPACTION_MODEL+x}" = x ]; then
+  model=$OPENCODE_SAFE_COMPACTION_MODEL
+  model_explicit=1
+else
+  model=opencode-go/glm-5.2
+  model_explicit=0
+fi
 bun_command=${OPENCODE_SAFE_COMPACTION_BUN:-bun}
 opencode_command=${OPENCODE_SAFE_COMPACTION_OPENCODE:-opencode}
 bun_bootstrap_version=1.3.14
@@ -19,6 +25,46 @@ fail() {
 say() {
   printf 'opencode-safe-compaction: %s\n' "$1"
 }
+
+usage() {
+  printf '%s\n' \
+    "Usage: install.sh [--model selected|provider/model]" \
+    "" \
+    "  --model selected       Follow the model selected for each compaction." \
+    "  --model provider/model Use a dedicated compaction model."
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --model)
+      [ "$#" -ge 2 ] || fail "--model requires selected or provider/model"
+      model=$2
+      model_explicit=1
+      shift 2
+      ;;
+    --model=*)
+      model=${1#--model=}
+      model_explicit=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *) fail "unknown argument: $1" ;;
+  esac
+done
+
+case "$model" in
+  selected) ;;
+  */*)
+    provider=${model%%/*}
+    model_id=${model#*/}
+    [ -n "$provider" ] && [ -n "$model_id" ] || fail "model must be selected or use provider/model format: $model"
+    case "$model" in *[[:space:]]*) fail "model must be selected or use provider/model format: $model" ;; esac
+    ;;
+  *) fail "model must be selected or use provider/model format: $model" ;;
+esac
 
 resolve_command() {
   case "$1" in
@@ -273,6 +319,7 @@ finish() {
       OPENCODE_SAFE_COMPACTION_CONFIG_DIR=$config_dir \
       OPENCODE_SAFE_COMPACTION_DIR=$install_dir \
       OPENCODE_SAFE_COMPACTION_MODEL=$model \
+      OPENCODE_SAFE_COMPACTION_MODEL_EXPLICIT=$model_explicit \
         "$bun_bin" "$install_dir/scripts/configure.ts" || {
           rollback_failed=1
           config_rollback_failed=1
@@ -394,6 +441,7 @@ OPENCODE_SAFE_COMPACTION_STATE_FILE=$state_file \
 OPENCODE_SAFE_COMPACTION_CONFIG_DIR=$config_dir \
 OPENCODE_SAFE_COMPACTION_DIR=$install_dir \
 OPENCODE_SAFE_COMPACTION_MODEL=$model \
+OPENCODE_SAFE_COMPACTION_MODEL_EXPLICIT=$model_explicit \
 OPENCODE_SAFE_COMPACTION_VERIFY_DIR=$verification_config_dir \
   "$bun_bin" "$install_dir/scripts/configure.ts"
 
@@ -422,6 +470,7 @@ debug_config() {
   XDG_STATE_HOME="$transaction_dir/xdg-state" \
   OPENCODE_SAFE_COMPACTION_DIR="$install_dir" \
   OPENCODE_SAFE_COMPACTION_MODEL="$model" \
+  OPENCODE_SAFE_COMPACTION_MODEL_EXPLICIT="$model_explicit" \
   OPENCODE_SAFE_COMPACTION_VERIFY_PHASE="$debug_phase" \
   OPENCODE_CONFIG= \
   OPENCODE_CONFIG_CONTENT= \
@@ -443,6 +492,7 @@ verify_debug_output() {
     OPENCODE_SAFE_COMPACTION_CONFIG_DIR=$config_dir \
     OPENCODE_SAFE_COMPACTION_DIR=$install_dir \
     OPENCODE_SAFE_COMPACTION_MODEL=$model \
+    OPENCODE_SAFE_COMPACTION_MODEL_EXPLICIT=$model_explicit \
     "$bun_bin" "$install_dir/scripts/configure.ts" >/dev/null
 }
 
@@ -458,6 +508,7 @@ OPENCODE_SAFE_COMPACTION_STATE_FILE=$state_file \
 OPENCODE_SAFE_COMPACTION_CONFIG_DIR=$config_dir \
 OPENCODE_SAFE_COMPACTION_DIR=$install_dir \
 OPENCODE_SAFE_COMPACTION_MODEL=$model \
+OPENCODE_SAFE_COMPACTION_MODEL_EXPLICIT=$model_explicit \
   "$bun_bin" "$install_dir/scripts/configure.ts"
 transaction_active=0
 

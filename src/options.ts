@@ -33,6 +33,8 @@ export type ExistingOptions = {
   reserved_tokens?: number | undefined
 }
 
+export const SELECTED_MODEL = "selected"
+
 export const DEFAULT_OPTIONS = {
   tail_turns: 4,
   preserve_recent_tokens: 16_000,
@@ -64,8 +66,11 @@ export function parseOptions(input: Record<string, unknown> | undefined) {
 
   const result: ParsedOptions = {}
   if (value.model !== undefined) {
-    if (typeof value.model !== "string" || !/^[^/\s]+\/[^\s]+$/.test(value.model)) {
-      throw new TypeError('Option "model" must use the provider/model format')
+    if (
+      typeof value.model !== "string" ||
+      (value.model !== SELECTED_MODEL && !/^[^/\s]+\/[^\s]+$/.test(value.model))
+    ) {
+      throw new TypeError('Option "model" must be "selected" or use the provider/model format')
     }
     result.model = value.model
   }
@@ -82,7 +87,7 @@ export function parseOptions(input: Record<string, unknown> | undefined) {
 
 export function resolveOptions(options: ParsedOptions, existing: ExistingOptions = {}) {
   const result: PluginOptions = {
-    model: options.model ?? existing.model ?? "",
+    model: options.model ?? existing.model ?? SELECTED_MODEL,
     tail_turns: options.tail_turns ?? existing.tail_turns ?? DEFAULT_OPTIONS.tail_turns,
     preserve_recent_tokens:
       options.preserve_recent_tokens ?? existing.preserve_recent_tokens ?? DEFAULT_OPTIONS.preserve_recent_tokens,
@@ -94,7 +99,6 @@ export function resolveOptions(options: ParsedOptions, existing: ExistingOptions
     max_ledger_bytes: options.max_ledger_bytes ?? DEFAULT_OPTIONS.max_ledger_bytes,
     max_summary_bytes: options.max_summary_bytes ?? DEFAULT_OPTIONS.max_summary_bytes,
   }
-  if (!result.model) throw new TypeError('Option "model" is required when OpenCode has no compaction model')
   for (const key of Object.keys(MAX_OPTIONS) as Array<keyof typeof MAX_OPTIONS>) {
     if (result[key] > MAX_OPTIONS[key]) {
       throw new TypeError(`Option "${key}" must not exceed ${MAX_OPTIONS[key]}`)

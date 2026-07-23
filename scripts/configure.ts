@@ -7,6 +7,8 @@ const installInput = requiredEnvironment("OPENCODE_SAFE_COMPACTION_DIR")
 const configDir = path.resolve(configInput)
 const installDir = path.resolve(installInput)
 const model = requiredEnvironment("OPENCODE_SAFE_COMPACTION_MODEL")
+const modelExplicitInput = process.env.OPENCODE_SAFE_COMPACTION_MODEL_EXPLICIT ?? "1"
+const modelExplicit = modelExplicitInput !== "0"
 const action = process.env.OPENCODE_SAFE_COMPACTION_ACTION ?? "apply"
 const stateFile = process.env.OPENCODE_SAFE_COMPACTION_STATE_FILE
 const verificationInput = process.env.OPENCODE_SAFE_COMPACTION_VERIFY_DIR
@@ -18,7 +20,12 @@ if (configDir === path.parse(configDir).root) throw new TypeError(`Config direct
 if (installDir === path.parse(installDir).root || (process.env.HOME && installDir === path.resolve(process.env.HOME))) {
   throw new TypeError(`Install directory is unsafe: ${installDir}`)
 }
-if (!/^[^/\s]+\/[^\s]+$/.test(model)) throw new TypeError(`Model must use provider/model format: ${model}`)
+if (model !== "selected" && !/^[^/\s]+\/[^\s]+$/.test(model)) {
+  throw new TypeError(`Model must be "selected" or use provider/model format: ${model}`)
+}
+if (modelExplicitInput !== "0" && modelExplicitInput !== "1") {
+  throw new TypeError("OPENCODE_SAFE_COMPACTION_MODEL_EXPLICIT must be 0 or 1")
+}
 if (stateFile && !path.isAbsolute(stateFile)) throw new TypeError(`Transaction state path must be absolute: ${stateFile}`)
 if (verificationInput && !path.isAbsolute(verificationInput)) {
   throw new TypeError(`Verification directory must be absolute: ${verificationInput}`)
@@ -85,14 +92,24 @@ async function configure() {
   }
   const installedSafeCompaction = safeCompaction[0]
   if (installedSafeCompaction && samePluginSource(pluginSource(installedSafeCompaction.spec), source)) {
-    const options = tupleOptions(installedSafeCompaction.spec, installedSafeCompaction.config.file)
+    const currentOptions = tupleOptions(installedSafeCompaction.spec, installedSafeCompaction.config.file)
+    const selectedModel = modelExplicit || typeof currentOptions.model !== "string" ? model : currentOptions.model
+    const options = { ...currentOptions, model: selectedModel }
     const expectations = await preflight(source, options, merged)
-    if (options.model !== model) {
-      throw new Error(
-        `The existing safe-compaction entry in ${installedSafeCompaction.config.file} does not select ${model}; edit or remove it and rerun`,
-      )
-    }
     await writeVerificationConfig(source, options, expectations)
+    if (currentOptions.model !== selectedModel) {
+      await writeConfiguredFile(
+        installedSafeCompaction.config.file,
+        installedSafeCompaction.config.text,
+        replacePluginModel(
+          installedSafeCompaction.config.text,
+          pluginSource(installedSafeCompaction.spec) ?? source,
+          selectedModel,
+        ),
+      )
+      console.log(`Updated the safe-compaction model to ${selectedModel}`)
+      return
+    }
     console.log(`Configuration already contains ${source}`)
     return
   }
@@ -103,10 +120,14 @@ async function configure() {
     value: { $schema: "https://opencode.ai/config.json" },
   }
   const previousSource = installedSafeCompaction ? pluginSource(installedSafeCompaction.spec) : undefined
-  const options = installedSafeCompaction
+  const currentOptions = installedSafeCompaction
     ? tupleOptions(installedSafeCompaction.spec, target.file)
+    : undefined
+  const selectedModel = modelExplicit || typeof currentOptions?.model !== "string" ? model : currentOptions.model
+  const options = currentOptions
+    ? { ...currentOptions, model: selectedModel }
     : {
-      model,
+      model: selectedModel,
       tail_turns: 4,
       preserve_recent_tokens: 16_000,
       reserved_tokens: 32_000,
@@ -117,14 +138,11 @@ async function configure() {
       max_ledger_bytes: 12_288,
       max_summary_bytes: 49_152,
     }
-  if (options.model !== model) {
-    throw new Error(`The existing safe-compaction entry in ${target.file} does not select ${model}; edit or remove it and rerun`)
-  }
   if (previousSource) await verifyExistingPluginIdentity(previousSource, target.file)
   const expectations = await preflight(source, options, merged)
   await writeVerificationConfig(source, options, expectations)
   const output = previousSource
-    ? replacePluginSource(target.text, previousSource, source)
+    ? replacePluginModel(replacePluginSource(target.text, previousSource, source), source, selectedModel)
     : addPlugin(target.text, target.value, [source, options])
   await writeConfiguredFile(target.file, target.text, output)
   console.log(previousSource ? `Migrated ${previousSource} to ${source}` : `Configured ${target.file}`)
@@ -223,8 +241,9 @@ async function verifyResolvedConfig() {
   const expected = expectations[phase]
   const agent = isRecord(value.agent) ? value.agent : undefined
   const compactionAgent = isRecord(agent?.compaction) ? agent.compaction : undefined
-  if (compactionAgent?.model !== expected.model || compactionAgent.temperature !== expected.temperature) {
-    throw new Error(`OpenCode did not activate the safe-compaction config hook for ${model}`)
+  const actualModel = typeof compactionAgent?.model === "string" ? compactionAgent.model : null
+  if (actualModel !== expected.model || compactionAgent?.temperature !== expected.temperature) {
+    throw new Error(`OpenCode did not activate the safe-compaction config hook for ${expected.model ?? "selected model"}`)
   }
   const compaction = isRecord(value.compaction) ? value.compaction : undefined
   if (
@@ -250,7 +269,7 @@ type TransactionState = {
 }
 
 type ExpectedConfig = {
-  model: string
+  model: string | null
   temperature: 0
   auto: boolean | null
   prune: boolean | null
@@ -355,7 +374,7 @@ function expectedConfig(value: Record<string, unknown>, source: string, selected
   const compactionAgent = isRecord(agent?.compaction) ? agent.compaction : undefined
   const compaction = isRecord(value.compaction) ? value.compaction : undefined
   const expected = {
-    model: compactionAgent?.model,
+    model: typeof compactionAgent?.model === "string" ? compactionAgent.model : null,
     temperature: compactionAgent?.temperature,
     auto: compaction?.auto,
     prune: compaction?.prune,
@@ -363,7 +382,8 @@ function expectedConfig(value: Record<string, unknown>, source: string, selected
     preserve_recent_tokens: compaction?.preserve_recent_tokens,
     reserved: compaction?.reserved,
   }
-  if (!isExpectedConfig(expected) || expected.model !== selectedModel) {
+  const expectedModel = selectedModel === "selected" ? null : selectedModel
+  if (!isExpectedConfig(expected) || expected.model !== expectedModel) {
     throw new Error(`Plugin config hook did not activate the selected compaction settings: ${source}`)
   }
   return expected
@@ -376,7 +396,7 @@ function isVerificationExpectations(value: unknown): value is VerificationExpect
 function isExpectedConfig(value: unknown): value is ExpectedConfig {
   if (!isRecord(value)) return false
   return (
-    typeof value.model === "string" &&
+    (typeof value.model === "string" || value.model === null) &&
     value.temperature === 0 &&
     (typeof value.auto === "boolean" || value.auto === null) &&
     (typeof value.prune === "boolean" || value.prune === null) &&
@@ -610,6 +630,52 @@ function replacePluginSource(text: string, previous: string, source: string) {
   return output
 }
 
+function replacePluginModel(text: string, source: string, model: string) {
+  const tokens = tokenize(text)
+  if (tokens[0]?.value !== "{") throw new TypeError("OpenCode configuration must start with an object")
+  const plugin = rootProperties(tokens).find((item) => item.key === "plugin")
+  if (!plugin || tokens[plugin.value]?.value !== "[") {
+    throw new TypeError("Could not locate the existing OpenCode plugin array")
+  }
+  const close = matchingClose(tokens, plugin.value)
+  const matches: number[] = []
+  let index = plugin.value + 1
+  while (index < close) {
+    const entry = tokens[index]
+    if (entry?.value === "[" && tokens[index + 1]?.kind === "string" && tokens[index + 1]?.value === source) {
+      const afterSource = skipValue(tokens, index + 1)
+      const options = tokens[afterSource]?.value === "," ? afterSource + 1 : -1
+      if (options >= 0 && tokens[options]?.value === "{") matches.push(options)
+    }
+    index = skipValue(tokens, index)
+    if (tokens[index]?.value === ",") index++
+    else if (index !== close) throw new TypeError("Invalid OpenCode plugin array")
+  }
+  if (matches.length !== 1) {
+    throw new Error(`Expected exactly one safe-compaction options tuple, found ${matches.length}`)
+  }
+
+  const options = matches[0]!
+  const property = objectProperties(tokens, options).find((item) => item.key === "model")
+  if (property) {
+    const value = tokens[property.value]
+    if (value?.kind !== "string") throw new TypeError('Safe-compaction option "model" must be a string')
+    const output = `${text.slice(0, value.start)}${JSON.stringify(model)}${text.slice(value.end)}`
+    parseConfig(output, "updated configuration")
+    return output
+  }
+
+  const optionsClose = matchingClose(tokens, options)
+  const first = tokens[options + 1]
+  const insertAt = first && options + 1 < optionsClose ? first.start : tokens[optionsClose]!.start
+  const spacing = first && options + 1 < optionsClose ? text.slice(tokens[options]!.end, first.start) : ""
+  const output =
+    `${text.slice(0, insertAt)}"model": ${JSON.stringify(model)}` +
+    `${first && options + 1 < optionsClose ? `,${spacing}` : ""}${text.slice(insertAt)}`
+  parseConfig(output, "updated configuration")
+  return output
+}
+
 function insertArrayValue(text: string, tokens: Token[], open: number, close: number, entry: unknown[]) {
   const previous = tokens[close - 1]
   if (!previous) throw new TypeError("Could not locate the OpenCode plugin array")
@@ -624,9 +690,13 @@ function insertArrayValue(text: string, tokens: Token[], open: number, close: nu
 }
 
 function rootProperties(tokens: Token[]) {
+  return objectProperties(tokens, 0)
+}
+
+function objectProperties(tokens: Token[], open: number) {
   const result: { key: string; value: number }[] = []
-  const close = matchingClose(tokens, 0)
-  let index = 1
+  const close = matchingClose(tokens, open)
+  let index = open + 1
   while (index < close && tokens[index]?.value !== "}") {
     const key = tokens[index]
     const colon = tokens[index + 1]

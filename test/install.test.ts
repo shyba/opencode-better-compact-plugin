@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { chmod, cp, mkdir, mkdtemp, rm, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
+import { pathToFileURL } from "node:url"
 
 const temporary: string[] = []
 
@@ -48,6 +49,46 @@ describe("installer", () => {
     expect(repeat.exitCode).toBe(0)
     expect(await Bun.file(path.join(config, "opencode.jsonc")).text()).toBe(text)
     expect((await Array.fromAsync(new Bun.Glob("*.safe-compaction-backup-*").scan(config))).length).toBe(1)
+  })
+
+  test("switches an existing installation to selected-model mode without disturbing JSONC", async () => {
+    const root = await directory()
+    const config = path.join(root, "config")
+    const install = path.join(root, "install")
+    await prepareInstall(install)
+    const file = path.join(config, "opencode.jsonc")
+    await Bun.write(
+      file,
+      `{
+  "plugin": [
+    [
+      ${JSON.stringify(pathToFileURL(path.join(install, "src/index.ts")).href)},
+      {
+        // Keep this option comment.
+        "model": "opencode-go/glm-5.2",
+        "tail_turns": 7
+      }
+    ]
+  ]
+}
+`,
+    )
+
+    const result = await configure(config, install, "selected")
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout).toContain("Updated the safe-compaction model to selected")
+    const text = await Bun.file(file).text()
+    expect(text).toContain("// Keep this option comment.")
+    const value = Bun.JSONC.parse(text) as { plugin: [[string, { model: string; tail_turns: number }]] }
+    expect(value.plugin[0][0]).toBe(pathToFileURL(path.join(install, "src/index.ts")).href)
+    expect(value.plugin[0][1]).toEqual({ model: "selected", tail_turns: 7 })
+    expect(await Array.fromAsync(new Bun.Glob("*.safe-compaction-backup-*").scan(config))).toHaveLength(1)
+
+    const repeat = await configure(config, install, "opencode-go/glm-5.2", false)
+    expect(repeat.exitCode).toBe(0)
+    expect(repeat.stdout).toContain("Configuration already contains")
+    expect(await Bun.file(file).text()).toBe(text)
+    expect(await Array.fromAsync(new Bun.Glob("*.safe-compaction-backup-*").scan(config))).toHaveLength(1)
   })
 
   test("refuses the stale provider limit override without changing the file", async () => {
@@ -806,8 +847,12 @@ if [ "$1" = "--version" ]; then
   exit 0
 fi
 if [ "$1" = "debug" ] && [ "$2" = "config" ]; then
-  printf '{"plugin":[["%s/src/index.ts",{"model":"%s"}]],"agent":{"compaction":{"model":"%s","temperature":0}},"compaction":{"auto":true,"prune":false,"tail_turns":4,"preserve_recent_tokens":16000,"reserved":32000}}\n' \
-    "$OPENCODE_SAFE_COMPACTION_DIR" "$OPENCODE_SAFE_COMPACTION_MODEL" "$OPENCODE_SAFE_COMPACTION_MODEL"
+  agent_model=
+  if [ "$OPENCODE_SAFE_COMPACTION_MODEL" != "selected" ]; then
+    agent_model='"model":"'"$OPENCODE_SAFE_COMPACTION_MODEL"'",'
+  fi
+  printf '{"plugin":[["%s/src/index.ts",{"model":"%s"}]],"agent":{"compaction":{%s"temperature":0}},"compaction":{"auto":true,"prune":false,"tail_turns":4,"preserve_recent_tokens":16000,"reserved":32000}}\n' \
+    "$OPENCODE_SAFE_COMPACTION_DIR" "$OPENCODE_SAFE_COMPACTION_MODEL" "$agent_model"
   exit 0
 fi
 exit 1
@@ -850,6 +895,22 @@ exit 1
     expect(value.plugin).toHaveLength(1)
     expect(value.plugin[0]?.[0]).toBe(path.join(install, "src/index.ts"))
     expect(value.plugin[0]?.[1].model).toBe("opencode-go/glm-5.2")
+
+    const selected = await command(["sh", "install.sh", "--model", "selected"], environment)
+    expect(selected.exitCode).toBe(0)
+    expect(selected.stdout).toContain("Updated the safe-compaction model to selected")
+    const selectedValue = Bun.JSONC.parse(await Bun.file(path.join(config, "opencode.jsonc")).text()) as {
+      plugin: [[string, { model: string }]]
+    }
+    expect(selectedValue.plugin[0]?.[1].model).toBe("selected")
+
+    const fixed = await command(["sh", "install.sh", "--model=example/compact"], environment)
+    expect(fixed.exitCode).toBe(0)
+    expect(fixed.stdout).toContain("Updated the safe-compaction model to example/compact")
+    const fixedValue = Bun.JSONC.parse(await Bun.file(path.join(config, "opencode.jsonc")).text()) as {
+      plugin: [[string, { model: string }]]
+    }
+    expect(fixedValue.plugin[0]?.[1].model).toBe("example/compact")
   })
 })
 
@@ -859,19 +920,30 @@ async function directory() {
   return value
 }
 
-async function configure(config: string, install: string) {
+async function configure(
+  config: string,
+  install: string,
+  model = "opencode-go/glm-5.2",
+  modelExplicit = true,
+) {
   return command(
     [process.execPath, path.join(process.cwd(), "scripts/configure.ts")],
-    configureEnvironment(config, install),
+    configureEnvironment(config, install, model, modelExplicit),
   )
 }
 
-function configureEnvironment(config: string, install: string) {
+function configureEnvironment(
+  config: string,
+  install: string,
+  model = "opencode-go/glm-5.2",
+  modelExplicit = true,
+) {
   return {
     ...process.env,
     OPENCODE_SAFE_COMPACTION_CONFIG_DIR: config,
     OPENCODE_SAFE_COMPACTION_DIR: install,
-    OPENCODE_SAFE_COMPACTION_MODEL: "opencode-go/glm-5.2",
+    OPENCODE_SAFE_COMPACTION_MODEL: model,
+    OPENCODE_SAFE_COMPACTION_MODEL_EXPLICIT: modelExplicit ? "1" : "0",
   }
 }
 
@@ -956,8 +1028,12 @@ if [ "$1" = "debug" ] && [ "$2" = "config" ]; then
   if [ "$OPENCODE_SAFE_COMPACTION_VERIFY_PHASE" = "target" ] && [ "\${BAD_TARGET_THRESHOLDS:-}" = "1" ]; then
     tail_turns=5
   fi
-  printf '{"plugin":[["%s/src/index.ts",{"model":"%s"}]],"agent":{"compaction":{"model":"%s","temperature":0}},"compaction":{"auto":%s,"prune":%s,"tail_turns":%s,"preserve_recent_tokens":%s,"reserved":%s}}\n' \
-    "$OPENCODE_SAFE_COMPACTION_DIR" "$OPENCODE_SAFE_COMPACTION_MODEL" "$OPENCODE_SAFE_COMPACTION_MODEL" \
+  agent_model=
+  if [ "$OPENCODE_SAFE_COMPACTION_MODEL" != "selected" ]; then
+    agent_model='"model":"'"$OPENCODE_SAFE_COMPACTION_MODEL"'",'
+  fi
+  printf '{"plugin":[["%s/src/index.ts",{"model":"%s"}]],"agent":{"compaction":{%s"temperature":0}},"compaction":{"auto":%s,"prune":%s,"tail_turns":%s,"preserve_recent_tokens":%s,"reserved":%s}}\n' \
+    "$OPENCODE_SAFE_COMPACTION_DIR" "$OPENCODE_SAFE_COMPACTION_MODEL" "$agent_model" \
     "$auto" "$prune" "$tail_turns" "$preserve_recent_tokens" "$reserved"
   exit 0
 fi

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { DEFAULT_OPTIONS, MAX_OPTIONS, OPTION_KEYS, parseOptions, resolveOptions } from "../src/options.js"
+import { DEFAULT_OPTIONS, MAX_OPTIONS, OPTION_KEYS, SELECTED_MODEL, parseOptions, resolveOptions } from "../src/options.js"
 
 describe("plugin option validation", () => {
   test("accepts every documented snake-case option", () => {
@@ -29,7 +29,7 @@ describe("plugin option validation", () => {
   test.each(["model", "provider/", "/model", "provider model/name", 42])(
     "rejects invalid model value %p",
     (model) => {
-      expect(() => parseOptions({ model })).toThrow('Option "model" must use the provider/model format')
+      expect(() => parseOptions({ model })).toThrow('Option "model" must be "selected" or use the provider/model format')
     },
   )
 
@@ -37,6 +37,10 @@ describe("plugin option validation", () => {
     expect(parseOptions({ model: "openrouter/anthropic/claude-v1" })).toEqual({
       model: "openrouter/anthropic/claude-v1",
     })
+  })
+
+  test("accepts selected-model mode", () => {
+    expect(parseOptions({ model: SELECTED_MODEL })).toEqual({ model: SELECTED_MODEL })
   })
 
   test.each([
@@ -96,8 +100,8 @@ describe("plugin option precedence", () => {
     })
   })
 
-  test("requires a model after applying precedence", () => {
-    expect(() => resolveOptions({})).toThrow('Option "model" is required')
+  test("follows the selected model when neither tuple nor OpenCode chooses a dedicated model", () => {
+    expect(resolveOptions({}).model).toBe(SELECTED_MODEL)
   })
 
   test("requires enough room for the ledger in a fallback summary", () => {

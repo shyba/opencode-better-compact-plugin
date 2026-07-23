@@ -1,6 +1,6 @@
 import type { Config, Hooks, PluginInput, PluginOptions as OpenCodePluginOptions } from "@opencode-ai/plugin"
 import { LEDGER_LIMITS, buildRecoveryLedger, record, summaryText, utf8Bytes, type MessageRecord } from "./ledger.js"
-import { parseOptions, resolveOptions, type PluginOptions } from "./options.js"
+import { SELECTED_MODEL, parseOptions, resolveOptions, type PluginOptions } from "./options.js"
 import { decodedDataUrlBytes, sanitizeHistory } from "./sanitize.js"
 import { AttemptStore, type Attempt } from "./state.js"
 import {
@@ -48,13 +48,15 @@ export async function server(input: PluginInput, rawOptions?: OpenCodePluginOpti
         preserve_recent_tokens: config.compaction?.preserve_recent_tokens,
         reserved_tokens: config.compaction?.reserved,
       })
+      const compactionAgent = {
+        ...config.agent?.compaction,
+        temperature: 0,
+      }
+      if (settings.model === SELECTED_MODEL) delete compactionAgent.model
+      else compactionAgent.model = settings.model
       config.agent = {
         ...config.agent,
-        compaction: {
-          ...config.agent?.compaction,
-          model: settings.model,
-          temperature: 0,
-        },
+        compaction: compactionAgent,
       }
       config.compaction = {
         ...config.compaction,
@@ -203,7 +205,7 @@ export async function server(input: PluginInput, rawOptions?: OpenCodePluginOpti
       if (hookInput.agent !== "compaction") return
       const options = requireSettings(settings, parsed)
       const actual = `${hookInput.model.providerID}/${hookInput.model.id}`
-      if (actual !== options.model) {
+      if (options.model !== SELECTED_MODEL && actual !== options.model) {
         throw new Error(`opencode-safe-compaction expected compaction model ${options.model}, received ${actual}`)
       }
       if (hookInput.model.limit.output <= 0) {
