@@ -13,6 +13,9 @@ else
   model=opencode-go/glm-5.2
   model_explicit=0
 fi
+unset OPENCODE_SAFE_COMPACTION_PRESERVE_SOURCE
+unset OPENCODE_SAFE_COMPACTION_SERVER_ENTRY
+unset OPENCODE_SAFE_COMPACTION_TUI_ENTRY
 bun_command=${OPENCODE_SAFE_COMPACTION_BUN:-bun}
 opencode_command=${OPENCODE_SAFE_COMPACTION_OPENCODE:-opencode}
 bun_bootstrap_version=1.3.14
@@ -25,35 +28,6 @@ fail() {
 say() {
   printf 'opencode-safe-compaction: %s\n' "$1"
 }
-
-usage() {
-  printf '%s\n' \
-    "Usage: install.sh [--model selected|provider/model]" \
-    "" \
-    "  --model selected       Follow the model selected for each compaction." \
-    "  --model provider/model Use a dedicated compaction model."
-}
-
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --model)
-      [ "$#" -ge 2 ] || fail "--model requires selected or provider/model"
-      model=$2
-      model_explicit=1
-      shift 2
-      ;;
-    --model=*)
-      model=${1#--model=}
-      model_explicit=1
-      shift
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *) fail "unknown argument: $1" ;;
-  esac
-done
 
 case "$model" in
   selected) ;;
@@ -444,6 +418,8 @@ OPENCODE_SAFE_COMPACTION_MODEL=$model \
 OPENCODE_SAFE_COMPACTION_MODEL_EXPLICIT=$model_explicit \
 OPENCODE_SAFE_COMPACTION_VERIFY_DIR=$verification_config_dir \
   "$bun_bin" "$install_dir/scripts/configure.ts"
+[ -r "$verification_config_dir/model" ] || fail "plugin configuration did not report its effective model"
+IFS= read -r model < "$verification_config_dir/model" || fail "could not read the effective compaction model"
 
 say "verifying the installed plugin in isolation"
 mkdir -p \

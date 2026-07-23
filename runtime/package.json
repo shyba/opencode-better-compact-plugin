@@ -1,0 +1,7 @@
+{
+  "type": "module",
+  "exports": {
+    "./server": "./server.js",
+    "./tui": "./tui.js"
+  }
+}

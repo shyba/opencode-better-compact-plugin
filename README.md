@@ -1,6 +1,6 @@
 # opencode-safe-compaction
 
-`opencode-safe-compaction` is a global OpenCode V1 server plugin that builds a bounded recovery ledger and replaces every nonempty compaction response with an exact deterministic ledger projection. Provider-authored prose is never authoritative. It is an independent MIT-licensed repository and makes no OpenCode core changes.
+`opencode-safe-compaction` is a global OpenCode V1 plugin that builds a bounded recovery ledger and replaces every nonempty compaction response with an exact deterministic ledger projection. Provider-authored prose is never authoritative. Its separate TUI entrypoint provides a native compaction-model selector. It is an independent MIT-licensed repository and makes no OpenCode core changes.
 
 The package is private at version `0.1.0`. Git/source-path installation is the supported installation path for now; the package metadata and exports are ready for a later npm release.
 
@@ -21,23 +21,13 @@ Review the installer, then run it on each server:
 curl -fsSL https://raw.githubusercontent.com/shyba/opencode-better-compact-plugin/default/install.sh | sh
 ```
 
-Choose the model policy during installation or rerun the same command later to change it:
+The installer keeps the established `opencode-go/glm-5.2` default for a fresh installation. It never asks for a model, and an upgrade preserves the policy already configured by the plugin.
 
-```sh
-# Follow the model selected in OpenCode for each automatic or manual compaction.
-curl -fsSL https://raw.githubusercontent.com/shyba/opencode-better-compact-plugin/default/install.sh |
-  sh -s -- --model selected
+After installation, run `/compaction-model` inside the OpenCode TUI (or choose **Compaction model** in the command palette). The native selector lists connected models plus **Follow selected model**. A selection is persisted through the same locked, atomic JSONC update used by the installer, then OpenCode reloads its instances. No LLM request is spent on the settings change.
 
-# Use a dedicated compaction model.
-curl -fsSL https://raw.githubusercontent.com/shyba/opencode-better-compact-plugin/default/install.sh |
-  sh -s -- --model provider/model
-```
+In **Follow selected model** mode, automatic compaction uses the model on the latest user turn and manual `/compact` uses the model selected when the command runs. Changing the ordinary OpenCode model therefore applies to the next compaction without another plugin setting change.
 
-The no-argument installer keeps the established `opencode-go/glm-5.2` default for a fresh installation and preserves the current policy when rerun. The `selected` value is the source plugin's fallback when neither its tuple nor OpenCode defines a dedicated compaction model.
-
-In `selected` mode, changing the model in OpenCode applies to the next compaction without reconfiguring the plugin. Automatic compaction uses the model on the latest user turn, while manual `/compact` uses the model selected when the command runs. Changing between `selected` and a dedicated model rewrites only the tuple's `model` value transactionally; restart a running OpenCode server after that configuration change.
-
-The installer clones the `default` branch over HTTPS to `$HOME/.local/share/opencode/plugins/safe-compaction`, adds the absolute source tuple to the global OpenCode configuration, preserves JSONC comments and unrelated settings, and verifies the effective model, temperature, and compaction settings reported by `opencode debug config`. If exactly one entry points to a different local safe-compaction checkout, the installer imports that module to verify the expected plugin identity, preserves its validated tuple options, and replaces only its source string with the managed path. Unverifiable lookalikes and duplicate entries are refused. It first loads a generated minimal configuration containing only the exact installed tuple, then checks compatibility with the real target configuration. Fresh installs must retain all three exact numeric thresholds. For a pre-existing partial tuple, values intentionally inherited from earlier configuration or plugin hooks must still satisfy the plugin's type and safety bounds; explicit tuple values remain exact. Both checks use a temporary HOME and XDG directories; inherited `OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`, and pure mode are neutralized. An unrelated plugin therefore cannot impersonate successful activation. Seeing the tuple alone is not considered successful activation. It is idempotent: rerunning it fast-forwards a clean checkout and does not duplicate the tuple. Configuration edits are serialized with a directory lock and committed by atomic rename. When an existing file changes successfully, a timestamped `*.safe-compaction-backup-*` copy remains beside it.
+The installer clones the `default` branch over HTTPS to `$HOME/.local/share/opencode/plugins/safe-compaction`, adds the absolute source tuple to both the global server and TUI configurations, preserves JSONC comments and unrelated settings, and verifies the effective model, temperature, and compaction settings reported by `opencode debug config`. The server tuple carries all plugin options; the TUI tuple carries only the synchronized model policy. If exactly one server entry points to a different local safe-compaction checkout, the installer imports that module to verify the expected plugin identity, preserves its validated tuple options, and replaces only its source string with the managed path. Unverifiable lookalikes and duplicate entries are refused. It first loads a generated minimal configuration containing only the exact installed tuple, then checks compatibility with the real target configuration. Fresh installs must retain all three exact numeric thresholds. For a pre-existing partial tuple, values intentionally inherited from earlier configuration or plugin hooks must still satisfy the plugin's type and safety bounds; explicit tuple values remain exact. Both checks use a temporary HOME and XDG directories; inherited `OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`, and pure mode are neutralized. An unrelated plugin therefore cannot impersonate successful activation. Seeing the tuple alone is not considered successful activation. It is idempotent: rerunning it fast-forwards a clean checkout and does not duplicate either tuple. Configuration edits are serialized with a directory lock and committed by atomic rename as one rollback-safe transaction. When an existing file changes successfully, a timestamped `*.safe-compaction-backup-*` copy remains beside it.
 
 The shortest command follows the mutable `default` branch. For a security-sensitive server, pin the reviewed installer and checkout to the same lowercase 40-character commit:
 
@@ -47,7 +37,7 @@ curl -fsSL "https://raw.githubusercontent.com/shyba/opencode-better-compact-plug
   env OPENCODE_SAFE_COMPACTION_REF="$commit" sh
 ```
 
-Before writing configuration, the installer imports the exact absolute source module, checks its plugin identity and server factory, initializes the server with the exact tuple options, and runs its configuration hook. Existing tuples go through the same runtime option validation, including unknown-key and cross-limit checks. Duplicate root `plugin` keys are rejected rather than collapsed by JSONC parsing.
+Before writing configuration, the installer imports the exact absolute server and TUI source modules, checks both plugin identities, initializes the server with the exact tuple options, and runs its configuration hook. Existing tuples go through the same runtime option validation, including unknown-key and cross-limit checks. Duplicate root `plugin` keys are rejected rather than collapsed by JSONC parsing.
 
 Checkout update, configuration activation, and `opencode debug config` verification form one installer transaction. A checkout-parent lock serializes transactions sharing an install path even when their configuration directories differ; a second lock serializes transactions sharing a configuration directory. Both are held from before clone/update through verification and commit. A later failure restores the prior configuration, permissions, and Git commit, or removes a newly created clone. Successfully written configuration and installer-created backups use mode `0600` because OpenCode configuration may contain credentials. Rollback compares the activated configuration digest before restoring it, so it refuses to overwrite a file changed independently during activation; in that case it also preserves the checkout so the independently edited tuple cannot be left pointing at removed or rolled-back source. An uncatchable termination such as `SIGKILL` or a host power loss cannot run the shell rollback trap; the next installer removes a lock whose recorded process no longer exists, but inspect the timestamped backup and checkout before rerunning.
 
@@ -63,7 +53,7 @@ curl -fsSL https://raw.githubusercontent.com/shyba/opencode-better-compact-plugi
 
 Other supported overrides are `OPENCODE_SAFE_COMPACTION_DIR`, `OPENCODE_SAFE_COMPACTION_CONFIG_DIR`, `OPENCODE_SAFE_COMPACTION_REPO`, and `OPENCODE_SAFE_COMPACTION_REF` (an alternate branch or exact lowercase 40-character commit). Exact commits are fetched and checked out detached. All directory overrides must be absolute. The installer respects an existing `OPENCODE_CONFIG_DIR`. It refuses insecure `http://` and `git://` repository URLs, including an insecure existing origin that would otherwise normalize to the requested HTTPS GitHub repository. It also refuses a dirty checkout, a mismatched remote or branch, duplicate or unverifiable plugin entries, and configurations containing the stale `deepseek-v4-flash-free` limit override. It never rewrites provider catalogs.
 
-The source plugin has no runtime package dependencies, so the installer does not populate `node_modules`. A bootstrapped Bun is temporary and is not installed into the user account or retained by the plugin. Restart a running OpenCode server after installation.
+The source plugin has no runtime package dependencies, so the installer does not populate `node_modules`. OpenCode may manage its standard plugin SDK in the configuration directory when it first loads a TUI plugin. A bootstrapped Bun is temporary and is not installed into the user account or retained by the plugin; the in-app selector uses OpenCode's own Bun runtime. Restart a running OpenCode server after installation.
 
 ## Manual Git installation
 
@@ -80,7 +70,7 @@ Add the tuple below to the global server configuration's existing `plugin` array
 {
   "plugin": [
     [
-      "/home/USER/.local/share/opencode/plugins/safe-compaction/src/index.ts",
+      "/home/USER/.local/share/opencode/plugins/safe-compaction/runtime",
       {
         "model": "opencode-go/glm-5.2",
         "tail_turns": 4,
@@ -98,7 +88,22 @@ Add the tuple below to the global server configuration's existing `plugin` array
 }
 ```
 
-The source path must be absolute. Loading `src/index.ts` is intentional for Git installs; no workspace entry, submodule, parent checkout, or prebuilt `dist` directory is required.
+OpenCode loads TUI plugins from its separate global `tui.jsonc`. Add the same runtime directory there with the synchronized model policy:
+
+```jsonc
+{
+  "plugin": [
+    [
+      "/home/USER/.local/share/opencode/plugins/safe-compaction/runtime",
+      {
+        "model": "opencode-go/glm-5.2"
+      }
+    ]
+  ]
+}
+```
+
+The runtime-directory path must be absolute. Its package metadata exposes separate source-first server and TUI entrypoints; the two configuration entries activate the compaction hooks and the in-app selector respectively. No workspace entry, submodule, parent checkout, or prebuilt `dist` directory is required.
 
 ## Options
 
@@ -168,13 +173,13 @@ bun install --frozen-lockfile
 bun run typecheck
 bun test
 bun run build
-bun -e 'await import("./dist/index.js")'
+bun -e 'await Promise.all([import("./dist/index.js"), import("./dist/tui.js")])'
 npm pack --dry-run
 ```
 
-`dist/` is deliberately untracked. `prepack` builds `dist/index.js` and TypeScript declarations. The package exposes both `opencode-safe-compaction` and `opencode-safe-compaction/server`; both resolve to the runtime build, while the root export also supplies declarations. Keep `private: true` until publication is explicitly approved.
+`dist/` is deliberately untracked. `prepack` builds the server and TUI modules plus TypeScript declarations. The package includes the transactional configurator used by the selector and exposes `opencode-safe-compaction`, `opencode-safe-compaction/server`, and `opencode-safe-compaction/tui`; the root and server exports resolve to the server runtime, while the TUI export contains only the selector. Keep `private: true` until publication is explicitly approved.
 
-For a portability smoke test, copy or clone the repository outside any OpenCode checkout, repeat install/build/test, and load either the absolute `src/index.ts` path or the packed artifact from an isolated OpenCode configuration. Nothing in source, tests, or eval tooling depends on the parent checkout.
+For a portability smoke test, copy or clone the repository outside any OpenCode checkout, repeat install/build/test, and load either the absolute `runtime` directory or the packed artifact from an isolated OpenCode configuration. Nothing in source, tests, or eval tooling depends on the parent checkout.
 
 ## Evaluation
 

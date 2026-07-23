@@ -1,6 +1,6 @@
 import { chmod, copyFile, mkdir, open, rename, rm, stat } from "node:fs/promises"
 import path from "node:path"
-import { pathToFileURL } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 
 const configInput = requiredEnvironment("OPENCODE_SAFE_COMPACTION_CONFIG_DIR")
 const installInput = requiredEnvironment("OPENCODE_SAFE_COMPACTION_DIR")
@@ -9,6 +9,10 @@ const installDir = path.resolve(installInput)
 const model = requiredEnvironment("OPENCODE_SAFE_COMPACTION_MODEL")
 const modelExplicitInput = process.env.OPENCODE_SAFE_COMPACTION_MODEL_EXPLICIT ?? "1"
 const modelExplicit = modelExplicitInput !== "0"
+const preserveSourceInput = process.env.OPENCODE_SAFE_COMPACTION_PRESERVE_SOURCE ?? "0"
+const preserveSource = preserveSourceInput === "1"
+const serverEntryInput = process.env.OPENCODE_SAFE_COMPACTION_SERVER_ENTRY
+const tuiEntryInput = process.env.OPENCODE_SAFE_COMPACTION_TUI_ENTRY
 const action = process.env.OPENCODE_SAFE_COMPACTION_ACTION ?? "apply"
 const stateFile = process.env.OPENCODE_SAFE_COMPACTION_STATE_FILE
 const verificationInput = process.env.OPENCODE_SAFE_COMPACTION_VERIFY_DIR
@@ -25,6 +29,15 @@ if (model !== "selected" && !/^[^/\s]+\/[^\s]+$/.test(model)) {
 }
 if (modelExplicitInput !== "0" && modelExplicitInput !== "1") {
   throw new TypeError("OPENCODE_SAFE_COMPACTION_MODEL_EXPLICIT must be 0 or 1")
+}
+if (preserveSourceInput !== "0" && preserveSourceInput !== "1") {
+  throw new TypeError("OPENCODE_SAFE_COMPACTION_PRESERVE_SOURCE must be 0 or 1")
+}
+if (serverEntryInput && !path.isAbsolute(serverEntryInput)) {
+  throw new TypeError(`Server entry must be absolute: ${serverEntryInput}`)
+}
+if (tuiEntryInput && !path.isAbsolute(tuiEntryInput)) {
+  throw new TypeError(`TUI entry must be absolute: ${tuiEntryInput}`)
 }
 if (stateFile && !path.isAbsolute(stateFile)) throw new TypeError(`Transaction state path must be absolute: ${stateFile}`)
 if (verificationInput && !path.isAbsolute(verificationInput)) {
@@ -52,18 +65,9 @@ if (action !== "apply") throw new TypeError(`Unknown configure action: ${action}
 await withConfigLock(configure)
 
 async function configure() {
-  const source = path.join(installDir, "src/index.ts")
-  const names = ["config.json", "opencode.json", "opencode.jsonc"]
-  const existing = (
-    await Promise.all(
-      names.map(async (name) => {
-        const file = path.join(configDir, name)
-        if (!(await Bun.file(file).exists())) return
-        const text = await Bun.file(file).text()
-        return { file, text, value: parseConfig(text, file) }
-      }),
-    )
-  ).filter((item) => item !== undefined)
+  const managedSource = path.join(installDir, "runtime")
+  const serverSource = serverEntryInput ?? path.join(managedSource, "server.js")
+  const existing = await readConfigs(["config.json", "opencode.json", "opencode.jsonc"])
   const merged = existing.reduce<Record<string, unknown>>(
     (result, config) => mergeConfig(result, config.value),
     {},
@@ -85,35 +89,18 @@ async function configure() {
     pluginSpecs(config.value).map((spec) => ({ config, spec }))
   )
   const safeCompaction = installed.filter((item) =>
-    isSafeCompaction(item.spec) || samePluginSource(pluginSource(item.spec), source)
+    isSafeCompaction(item.spec) || samePluginSource(pluginSource(item.spec), managedSource)
   )
   if (safeCompaction.length > 1) {
     throw new Error("The safe-compaction plugin is configured more than once; keep one entry and rerun")
   }
   const installedSafeCompaction = safeCompaction[0]
-  if (installedSafeCompaction && samePluginSource(pluginSource(installedSafeCompaction.spec), source)) {
-    const currentOptions = tupleOptions(installedSafeCompaction.spec, installedSafeCompaction.config.file)
-    const selectedModel = modelExplicit || typeof currentOptions.model !== "string" ? model : currentOptions.model
-    const options = { ...currentOptions, model: selectedModel }
-    const expectations = await preflight(source, options, merged)
-    await writeVerificationConfig(source, options, expectations)
-    if (currentOptions.model !== selectedModel) {
-      await writeConfiguredFile(
-        installedSafeCompaction.config.file,
-        installedSafeCompaction.config.text,
-        replacePluginModel(
-          installedSafeCompaction.config.text,
-          pluginSource(installedSafeCompaction.spec) ?? source,
-          selectedModel,
-        ),
-      )
-      console.log(`Updated the safe-compaction model to ${selectedModel}`)
-      return
-    }
-    console.log(`Configuration already contains ${source}`)
-    return
+  if (preserveSource && !installedSafeCompaction) {
+    throw new Error("The live compaction-model selector could not find the installed server tuple")
   }
-
+  const source = preserveSource
+    ? pluginSource(installedSafeCompaction?.spec) ?? managedSource
+    : managedSource
   const target = installedSafeCompaction?.config ?? existing.at(-1) ?? {
     file: path.join(configDir, "opencode.jsonc"),
     text: '{\n  "$schema": "https://opencode.ai/config.json"\n}\n',
@@ -138,67 +125,168 @@ async function configure() {
       max_ledger_bytes: 12_288,
       max_summary_bytes: 49_152,
     }
-  if (previousSource) await verifyExistingPluginIdentity(previousSource, target.file)
-  const expectations = await preflight(source, options, merged)
+  if (previousSource && !samePluginSource(previousSource, source)) {
+    await verifyExistingPluginIdentity(previousSource, target.file, "server")
+  }
+  const expectations = await preflight(source, serverSource, options, merged)
+  await verifyTuiEntrypoint(source, tuiEntryInput ?? path.join(managedSource, "tui.js"))
   await writeVerificationConfig(source, options, expectations)
   const output = previousSource
-    ? replacePluginModel(replacePluginSource(target.text, previousSource, source), source, selectedModel)
+    ? replacePluginModel(
+        samePluginSource(previousSource, source)
+          ? target.text
+          : replacePluginSource(target.text, previousSource, source),
+        samePluginSource(previousSource, source) ? previousSource : source,
+        selectedModel,
+      )
     : addPlugin(target.text, target.value, [source, options])
-  await writeConfiguredFile(target.file, target.text, output)
-  console.log(previousSource ? `Migrated ${previousSource} to ${source}` : `Configured ${target.file}`)
+
+  const tuiExisting = await readConfigs(["tui.json", "tui.jsonc"])
+  for (const config of tuiExisting) {
+    if (config.value.plugin !== undefined && !Array.isArray(config.value.plugin)) {
+      throw new TypeError(`OpenCode TUI "plugin" configuration must be an array: ${config.file}`)
+    }
+  }
+  const installedTui = tuiExisting
+    .flatMap((config) => pluginSpecs(config.value).map((spec) => ({ config, spec })))
+    .filter((item) =>
+      isSafeCompaction(item.spec) ||
+      samePluginSource(pluginSource(item.spec), source) ||
+      samePluginSource(pluginSource(item.spec), managedSource)
+    )
+  if (installedTui.length > 1) {
+    throw new Error("The safe-compaction TUI plugin is configured more than once; keep one entry and rerun")
+  }
+  const currentTui = installedTui[0]
+  if (preserveSource && !currentTui) {
+    throw new Error("The live compaction-model selector could not find the installed TUI tuple")
+  }
+  const tuiTarget = currentTui?.config ?? tuiExisting.at(-1) ?? {
+    file: path.join(configDir, "tui.jsonc"),
+    text: "{\n}\n",
+    value: {},
+  }
+  const previousTuiSource = currentTui ? pluginSource(currentTui.spec) : undefined
+  const tuiOptions = currentTui
+    ? { ...tupleOptions(currentTui.spec, tuiTarget.file), model: selectedModel }
+    : { model: selectedModel }
+  if (previousTuiSource && !samePluginSource(previousTuiSource, source)) {
+    if (preserveSource) throw new Error("The server and TUI plugin entries use different sources")
+    await verifyExistingPluginIdentity(previousTuiSource, tuiTarget.file, "tui")
+  }
+  const tuiOutput = previousTuiSource
+    ? replacePluginModel(
+        samePluginSource(previousTuiSource, source)
+          ? tuiTarget.text
+          : replacePluginSource(tuiTarget.text, previousTuiSource, source),
+        samePluginSource(previousTuiSource, source) ? previousTuiSource : source,
+        selectedModel,
+      )
+    : addPlugin(tuiTarget.text, tuiTarget.value, [source, tuiOptions])
+
+  await writeConfiguredFiles([
+    { file: target.file, original: target.text, output },
+    { file: tuiTarget.file, original: tuiTarget.text, output: tuiOutput },
+  ])
+  if (previousSource && !samePluginSource(previousSource, source)) {
+    console.log(`Migrated ${previousSource} to ${source}`)
+    return
+  }
+  if (currentOptions?.model !== selectedModel) {
+    console.log(`Updated the safe-compaction model to ${selectedModel}`)
+    return
+  }
+  if (!previousSource) {
+    console.log(`Configured ${target.file}`)
+    return
+  }
+  console.log(`Configuration already contains ${source}`)
 }
 
-async function writeConfiguredFile(file: string, original: string, output: string) {
-  const existed = await Bun.file(file).exists()
-  const backup = existed ? `${file}.safe-compaction-backup-${Date.now()}-${process.pid}` : undefined
-  const originalMode = existed ? (await stat(file)).mode & 0o777 : undefined
-  const mode = 0o600
-  const originalDigest = existed ? sha256(original) : undefined
-  if (backup) {
-    await copyFile(file, backup)
-    await chmod(backup, 0o600)
-  }
+async function readConfigs(names: string[]) {
+  return (
+    await Promise.all(
+      names.map(async (name) => {
+        const file = path.join(configDir, name)
+        if (!(await Bun.file(file).exists())) return
+        const text = await Bun.file(file).text()
+        return { file, text, value: parseConfig(text, file) }
+      }),
+    )
+  ).filter((item) => item !== undefined)
+}
+
+async function writeConfiguredFiles(edits: ConfigEdit[]) {
+  const changed = edits.filter((edit) => edit.original !== edit.output)
+  if (!changed.length) return
+  const stamp = `${Date.now()}-${process.pid}`
+  const targets = await Promise.all(
+    changed.map(async (edit) => {
+      const existed = await Bun.file(edit.file).exists()
+      const originalMode = existed ? (await stat(edit.file)).mode & 0o777 : undefined
+      return {
+        target: edit.file,
+        ...(existed ? { backup: `${edit.file}.safe-compaction-backup-${stamp}` } : {}),
+        existed,
+        ...(existed ? { originalDigest: sha256(edit.original) } : {}),
+        ...(originalMode === undefined ? {} : { originalMode }),
+        appliedDigest: sha256(edit.output),
+        output: edit.output,
+      }
+    }),
+  )
   try {
-    await atomicWrite(file, output, mode)
+    for (const target of targets) {
+      if (!target.backup) continue
+      await copyFile(target.target, target.backup)
+      await chmod(target.backup, 0o600)
+    }
     if (stateFile) {
       await atomicWrite(
         stateFile,
         JSON.stringify({
-          version: 1,
-          target: file,
-          ...(backup ? { backup } : {}),
-          existed,
-          ...(originalDigest ? { originalDigest } : {}),
-          ...(originalMode === undefined ? {} : { originalMode }),
-          appliedDigest: sha256(output),
+          version: 2,
+          targets: targets.map(({ output: _, ...target }) => target),
         } satisfies TransactionState),
         0o600,
       )
     }
+    for (const target of targets) await atomicWrite(target.target, target.output, 0o600)
   } catch (error) {
-    if (existed && backup) await atomicRestore(backup, file, originalMode ?? mode)
-    if (!existed) await rm(file, { force: true })
-    if (backup) await rm(backup, { force: true })
+    for (const target of targets.toReversed()) {
+      if (target.existed && target.backup && (await Bun.file(target.backup).exists())) {
+        await atomicRestore(target.backup, target.target, target.originalMode ?? 0o600)
+      }
+      if (!target.existed) await rm(target.target, { force: true })
+    }
+    await Promise.all(targets.flatMap((target) => target.backup ? [rm(target.backup, { force: true })] : []))
     if (stateFile) await rm(stateFile, { force: true })
     throw error
   }
 
-  if (backup) console.log(`Backup: ${backup}`)
+  for (const target of targets) {
+    if (target.backup) console.log(`Backup: ${target.backup}`)
+  }
 }
 
-async function verifyExistingPluginIdentity(source: string, file: string) {
+async function verifyExistingPluginIdentity(source: string, file: string, kind: "server" | "tui") {
   try {
-    const url = source.startsWith("file:")
+    const sourceUrl = source.startsWith("file:")
       ? new URL(source)
       : path.isAbsolute(source)
         ? pathToFileURL(source)
         : undefined
-    if (!url || url.protocol !== "file:") throw new TypeError("source is not an absolute local path")
+    if (!sourceUrl || sourceUrl.protocol !== "file:") throw new TypeError("source is not an absolute local path")
+    const sourcePath = fileURLToPath(sourceUrl)
+    const url = pathToFileURL((await stat(sourcePath)).isDirectory() ? path.join(sourcePath, `${kind}.js`) : sourcePath)
     url.searchParams.set("installer-migration", `${Date.now()}-${process.pid}`)
     const module: unknown = await import(url.href)
     const imported = isRecord(module) ? module : undefined
     const plugin = isRecord(imported?.default) ? imported.default : undefined
-    if (plugin?.id !== "opencode-safe-compaction" || typeof plugin.server !== "function") {
+    const valid = kind === "server"
+      ? plugin?.id === "opencode-safe-compaction" && typeof plugin.server === "function"
+      : plugin?.id === "opencode-safe-compaction-settings" && typeof plugin.tui === "function"
+    if (!valid) {
       throw new TypeError("module does not export the expected plugin identity")
     }
   } catch (error) {
@@ -220,14 +308,20 @@ async function writeVerificationConfig(
     }, null, 2)}\n`,
     0o600,
   )
+  await atomicWrite(
+    path.join(verificationDir, "tui.jsonc"),
+    `${JSON.stringify({ plugin: [[source, { model: options.model }]] }, null, 2)}\n`,
+    0o600,
+  )
   await atomicWrite(path.join(verificationDir, "expectations.json"), `${JSON.stringify(expectations, null, 2)}\n`, 0o600)
+  await atomicWrite(path.join(verificationDir, "model"), `${String(options.model)}\n`, 0o600)
 }
 
 async function verifyResolvedConfig() {
   const text = await Bun.stdin.text()
   const value: unknown = JSON.parse(text)
   if (!isRecord(value)) throw new TypeError("OpenCode debug config did not return an object")
-  const source = path.join(installDir, "src/index.ts")
+  const source = path.join(installDir, "runtime")
   if (!pluginSpecs(value).some((spec) => samePluginSource(pluginSource(spec), source))) {
     throw new Error(`OpenCode did not report the installed plugin path: ${source}`)
   }
@@ -258,14 +352,24 @@ async function verifyResolvedConfig() {
   console.log(`Verified ${source}`)
 }
 
-type TransactionState = {
-  version: 1
+type ConfigEdit = {
+  file: string
+  original: string
+  output: string
+}
+
+type TransactionTarget = {
   target: string
   backup?: string
   existed: boolean
   originalDigest?: string
   originalMode?: number
   appliedDigest: string
+}
+
+type TransactionState = {
+  version: 2
+  targets: TransactionTarget[]
 }
 
 type ExpectedConfig = {
@@ -287,33 +391,53 @@ async function rollbackTransaction(file: string) {
   if (!(await Bun.file(file).exists())) return
   const value: unknown = JSON.parse(await Bun.file(file).text())
   if (!isTransactionState(value)) throw new TypeError(`Invalid installer transaction state: ${file}`)
-  if (path.dirname(value.target) !== configDir || (value.backup && path.dirname(value.backup) !== configDir)) {
-    throw new Error("Installer transaction targets escape the configured directory")
-  }
-  const currentExists = await Bun.file(value.target).exists()
-  const currentDigest = currentExists ? sha256(await Bun.file(value.target).text()) : undefined
-  const unchanged = value.existed
-    ? currentDigest === value.originalDigest
-    : !currentExists
-  if (!unchanged && currentDigest !== value.appliedDigest) {
-    throw new Error(`Refusing to overwrite a concurrently modified configuration: ${value.target}`)
-  }
-  if (!unchanged && value.existed) {
-    if (!value.backup || !(await Bun.file(value.backup).exists())) {
-      throw new Error(`Configuration backup is missing: ${value.backup ?? "unknown"}`)
+  for (const target of value.targets) {
+    if (path.dirname(target.target) !== configDir || (target.backup && path.dirname(target.backup) !== configDir)) {
+      throw new Error("Installer transaction targets escape the configured directory")
     }
-    await atomicRestore(value.backup, value.target, value.originalMode ?? 0o600)
   }
-  if (!unchanged && !value.existed) await rm(value.target, { force: true })
-  if (value.backup) await rm(value.backup, { force: true })
+  const statuses = await Promise.all(
+    value.targets.map(async (target) => {
+      const currentExists = await Bun.file(target.target).exists()
+      const currentDigest = currentExists ? sha256(await Bun.file(target.target).text()) : undefined
+      return {
+        target,
+        unchanged: target.existed ? currentDigest === target.originalDigest : !currentExists,
+        currentDigest,
+      }
+    }),
+  )
+  for (const status of statuses) {
+    if (!status.unchanged && status.currentDigest !== status.target.appliedDigest) {
+      throw new Error(`Refusing to overwrite a concurrently modified configuration: ${status.target.target}`)
+    }
+    if (
+      !status.unchanged &&
+      status.target.existed &&
+      (!status.target.backup || !(await Bun.file(status.target.backup).exists()))
+    ) {
+      throw new Error(`Configuration backup is missing: ${status.target.backup ?? "unknown"}`)
+    }
+  }
+  for (const status of statuses.toReversed()) {
+    if (!status.unchanged && status.target.existed && status.target.backup) {
+      await atomicRestore(status.target.backup, status.target.target, status.target.originalMode ?? 0o600)
+    }
+    if (!status.unchanged && !status.target.existed) await rm(status.target.target, { force: true })
+    if (status.target.backup) await rm(status.target.backup, { force: true })
+  }
   await rm(file, { force: true })
-  console.log(`Rolled back ${value.target}`)
+  console.log(`Rolled back ${value.targets.map((target) => target.target).join(", ")}`)
 }
 
 function isTransactionState(value: unknown): value is TransactionState {
   if (!isRecord(value)) return false
+  return value.version === 2 && Array.isArray(value.targets) && value.targets.length > 0 && value.targets.every(isTransactionTarget)
+}
+
+function isTransactionTarget(value: unknown): value is TransactionTarget {
+  if (!isRecord(value)) return false
   return (
-    value.version === 1 &&
     typeof value.target === "string" &&
     path.isAbsolute(value.target) &&
     typeof value.existed === "boolean" &&
@@ -328,10 +452,32 @@ function isTransactionState(value: unknown): value is TransactionState {
   )
 }
 
-async function preflight(source: string, options: Record<string, unknown>, currentConfig: Record<string, unknown>) {
+async function verifyTuiEntrypoint(source: string, tuiSource: string) {
+  try {
+    const module: unknown = await import(
+      `${pathToFileURL(tuiSource).href}?installer-preflight=${Date.now()}-${process.pid}`,
+    )
+    const imported = isRecord(module) ? module : undefined
+    const plugin = isRecord(imported?.default) ? imported.default : undefined
+    if (plugin?.id !== "opencode-safe-compaction-settings" || typeof plugin.tui !== "function") {
+      throw new TypeError(`Plugin module does not export the expected TUI settings entry: ${source}`)
+    }
+  } catch (error) {
+    throw new Error(`Plugin TUI preflight failed for ${source}: ${errorText(error)}`)
+  }
+}
+
+async function preflight(
+  source: string,
+  serverSource: string,
+  options: Record<string, unknown>,
+  currentConfig: Record<string, unknown>,
+) {
   let hooks: Record<string, unknown> | undefined
   try {
-    const module: unknown = await import(`${pathToFileURL(source).href}?installer-preflight=${Date.now()}-${process.pid}`)
+    const module: unknown = await import(
+      `${pathToFileURL(serverSource).href}?installer-preflight=${Date.now()}-${process.pid}`,
+    )
     const imported = isRecord(module) ? module : undefined
     const plugin = isRecord(imported?.default) ? imported.default : undefined
     if (plugin?.id !== "opencode-safe-compaction" || typeof plugin.server !== "function") {
@@ -558,7 +704,14 @@ function pluginSource(spec: unknown) {
 }
 
 function samePluginSource(value: string | undefined, source: string) {
-  return value === source || value === pathToFileURL(source).href
+  if (value === source) return true
+  if (value?.startsWith("file:") && path.isAbsolute(source)) {
+    return path.resolve(fileURLToPath(value)) === path.resolve(source)
+  }
+  if (source.startsWith("file:") && value && path.isAbsolute(value)) {
+    return path.resolve(value) === path.resolve(fileURLToPath(source))
+  }
+  return false
 }
 
 function isSafeCompaction(spec: unknown) {

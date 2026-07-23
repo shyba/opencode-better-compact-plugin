@@ -37,9 +37,12 @@ describe("installer", () => {
     expect(value.theme).toBe("system")
     expect(value.plugin[0]).toBe("file:///opt/safe-compaction-tools/existing-plugin.ts")
     expect(value.plugin[1]).toEqual([
-      path.join(install, "src/index.ts"),
+      managedSource(install),
       expect.objectContaining({ model: "opencode-go/glm-5.2", max_summary_bytes: 49_152 }),
     ])
+    expect(Bun.JSONC.parse(await Bun.file(path.join(config, "tui.jsonc")).text())).toEqual({
+      plugin: [[managedSource(install), { model: "opencode-go/glm-5.2" }]],
+    })
     const backups = await Array.fromAsync(new Bun.Glob("*.safe-compaction-backup-*").scan(config))
     expect(backups).toHaveLength(1)
     expect((await stat(path.join(config, "opencode.jsonc"))).mode & 0o777).toBe(0o600)
@@ -62,7 +65,7 @@ describe("installer", () => {
       `{
   "plugin": [
     [
-      ${JSON.stringify(pathToFileURL(path.join(install, "src/index.ts")).href)},
+      ${JSON.stringify(pathToFileURL(managedSource(install)).href)},
       {
         // Keep this option comment.
         "model": "opencode-go/glm-5.2",
@@ -80,7 +83,7 @@ describe("installer", () => {
     const text = await Bun.file(file).text()
     expect(text).toContain("// Keep this option comment.")
     const value = Bun.JSONC.parse(text) as { plugin: [[string, { model: string; tail_turns: number }]] }
-    expect(value.plugin[0][0]).toBe(pathToFileURL(path.join(install, "src/index.ts")).href)
+    expect(value.plugin[0][0]).toBe(pathToFileURL(managedSource(install)).href)
     expect(value.plugin[0][1]).toEqual({ model: "selected", tail_turns: 7 })
     expect(await Array.fromAsync(new Bun.Glob("*.safe-compaction-backup-*").scan(config))).toHaveLength(1)
 
@@ -89,6 +92,45 @@ describe("installer", () => {
     expect(repeat.stdout).toContain("Configuration already contains")
     expect(await Bun.file(file).text()).toBe(text)
     expect(await Array.fromAsync(new Bun.Glob("*.safe-compaction-backup-*").scan(config))).toHaveLength(1)
+  })
+
+  test("preserves TUI JSONC while installing and synchronizing the native selector", async () => {
+    const root = await directory()
+    const config = path.join(root, "config")
+    const install = path.join(root, "install")
+    await prepareInstall(install)
+    const file = path.join(config, "tui.jsonc")
+    await Bun.write(
+      file,
+      `{
+  // Keep unrelated TUI settings and plugins.
+  "theme": "system",
+  "plugin": ["file:///opt/existing-tui-plugin.ts"]
+}
+`,
+    )
+
+    expect((await configure(config, install)).exitCode).toBe(0)
+    const initial = await Bun.file(file).text()
+    expect(initial).toContain("// Keep unrelated TUI settings and plugins.")
+    expect(Bun.JSONC.parse(initial)).toEqual({
+      theme: "system",
+      plugin: [
+        "file:///opt/existing-tui-plugin.ts",
+        [managedSource(install), { model: "opencode-go/glm-5.2" }],
+      ],
+    })
+
+    expect((await configure(config, install, "selected")).exitCode).toBe(0)
+    const selected = await Bun.file(file).text()
+    expect(selected).toContain("// Keep unrelated TUI settings and plugins.")
+    expect(Bun.JSONC.parse(selected)).toEqual({
+      theme: "system",
+      plugin: [
+        "file:///opt/existing-tui-plugin.ts",
+        [managedSource(install), { model: "selected" }],
+      ],
+    })
   })
 
   test("refuses the stale provider limit override without changing the file", async () => {
@@ -124,7 +166,7 @@ describe("installer", () => {
     const install = path.join(root, "install")
     await prepareInstall(install)
     const file = path.join(config, "opencode.jsonc")
-    const original = JSON.stringify({ plugin: [[path.join(install, "src/index.ts"), options]] }, null, 2)
+    const original = JSON.stringify({ plugin: [[managedSource(install), options]] }, null, 2)
     await Bun.write(file, original)
 
     const result = await configure(config, install)
@@ -166,7 +208,7 @@ describe("installer", () => {
     const result = await configure(config, install)
 
     expect(result.exitCode).toBe(0)
-    expect(result.stdout).toContain(`Migrated ${previousSource} to ${path.join(install, "src/index.ts")}`)
+    expect(result.stdout).toContain(`Migrated ${previousSource} to ${managedSource(install)}`)
     const text = await Bun.file(file).text()
     const value = Bun.JSONC.parse(text) as { theme: string; plugin: Array<unknown> }
     expect(text).toContain("Preserve this comment and the existing options during migration.")
@@ -175,7 +217,7 @@ describe("installer", () => {
     expect(value.plugin).toEqual([
       "file:///opt/existing-plugin.ts",
       [
-        path.join(install, "src/index.ts"),
+        managedSource(install),
         {
           model: "opencode-go/glm-5.2",
           tail_turns: 7,
@@ -191,6 +233,31 @@ describe("installer", () => {
     expect(repeat.stdout).toContain("Configuration already contains")
     expect(await Bun.file(file).text()).toBe(text)
     expect(await Array.fromAsync(new Bun.Glob("*.safe-compaction-backup-*").scan(config))).toHaveLength(1)
+  })
+
+  test("migrates a verified runtime-directory installation", async () => {
+    const root = await directory()
+    const config = path.join(root, "config")
+    const install = path.join(root, "managed-install")
+    const previousInstall = path.join(root, "previous", "safe-compaction")
+    await prepareInstall(install)
+    await prepareInstall(previousInstall)
+    const file = path.join(config, "opencode.jsonc")
+    const previousSource = managedSource(previousInstall)
+    await Bun.write(
+      file,
+      JSON.stringify({
+        plugin: [[previousSource, { model: "selected", tail_turns: 6 }]],
+      }, null, 2),
+    )
+
+    const result = await configure(config, install, "opencode-go/glm-5.2", false)
+
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout).toContain(`Migrated ${previousSource} to ${managedSource(install)}`)
+    expect(Bun.JSONC.parse(await Bun.file(file).text())).toEqual({
+      plugin: [[managedSource(install), { model: "selected", tail_turns: 6 }]],
+    })
   })
 
   test("refuses to migrate a path-shaped plugin that does not export the expected identity", async () => {
@@ -253,6 +320,7 @@ describe("installer", () => {
     const install = path.join(root, "install")
     await mkdir(path.join(install, "src"), { recursive: true })
     await Bun.write(path.join(install, "src/index.ts"), source)
+    await cp(path.join(process.cwd(), "runtime"), path.join(install, "runtime"), { recursive: true })
 
     const result = await configure(config, install)
     expect(result.exitCode).not.toBe(0)
@@ -437,6 +505,7 @@ exit 1
     expect(result.stderr).toContain("OpenCode could not load the isolated plugin configuration")
     expect(await Bun.file(file).text()).toBe(original)
     expect((await stat(file)).mode & 0o777).toBe(0o644)
+    expect(await Bun.file(path.join(config, "tui.jsonc")).exists()).toBe(false)
     expect(await Bun.file(install).exists()).toBe(false)
     expect(await Array.fromAsync(new Bun.Glob("*.safe-compaction-backup-*").scan(config))).toHaveLength(0)
   })
@@ -481,6 +550,7 @@ exit 1
     expect(result.exitCode).not.toBe(0)
     expect(result.stderr).toContain("OpenCode could not load the isolated plugin configuration")
     expect(await Bun.file(file).text()).toBe(original)
+    expect(await Bun.file(path.join(config, "tui.jsonc")).exists()).toBe(false)
     expect(await Bun.file(install).exists()).toBe(false)
     expect(await Bun.file(path.join(legacy, "src/index.ts")).exists()).toBe(true)
     expect(await Array.fromAsync(new Bun.Glob("*.safe-compaction-backup-*").scan(config))).toHaveLength(0)
@@ -544,7 +614,7 @@ if [ "$1" = "debug" ] && [ "$2" = "config" ]; then
     printf '\\n ' >> "$TARGET_CONFIG_DIR/opencode.jsonc"
     exit 41
   fi
-  printf '{"plugin":[["%s/src/index.ts",{"model":"%s"}]],"agent":{"compaction":{"model":"%s","temperature":0}},"compaction":{"auto":true,"prune":false,"tail_turns":4,"preserve_recent_tokens":16000,"reserved":32000}}\\n' \
+  printf '{"plugin":[["%s/runtime",{"model":"%s"}]],"agent":{"compaction":{"model":"%s","temperature":0}},"compaction":{"auto":true,"prune":false,"tail_turns":4,"preserve_recent_tokens":16000,"reserved":32000}}\\n' \
     "$OPENCODE_SAFE_COMPACTION_DIR" "$OPENCODE_SAFE_COMPACTION_MODEL" "$OPENCODE_SAFE_COMPACTION_MODEL"
   exit 0
 fi
@@ -672,7 +742,7 @@ exit 1
     await Bun.write(path.join(config, "opencode.json"), JSON.stringify({ compaction: { prune: true, tail_turns: 8 } }))
     await Bun.write(
       path.join(config, "opencode.jsonc"),
-      JSON.stringify({ plugin: [[path.join(install, "src/index.ts"), { model: "opencode-go/glm-5.2" }]] }),
+      JSON.stringify({ plugin: [[managedSource(install), { model: "opencode-go/glm-5.2" }]] }),
     )
 
     const result = await command(["sh", "install.sh"], {
@@ -814,6 +884,8 @@ exit 1
     expect((await command(["git", "clone", "--quiet", process.cwd(), origin])).exitCode).toBe(0)
     await rm(path.join(origin, "src"), { recursive: true, force: true })
     await cp(path.join(process.cwd(), "src"), path.join(origin, "src"), { recursive: true })
+    await rm(path.join(origin, "runtime"), { recursive: true, force: true })
+    await cp(path.join(process.cwd(), "runtime"), path.join(origin, "runtime"), { recursive: true })
     await mkdir(path.join(origin, "scripts"), { recursive: true })
     await Bun.write(path.join(origin, "install.sh"), Bun.file(path.join(process.cwd(), "install.sh")))
     await Bun.write(
@@ -824,7 +896,7 @@ exit 1
     expect(
       (
         await command(
-          ["git", "add", "install.sh", "scripts/configure.ts", "src", "INSTALLER-FIXTURE"],
+          ["git", "add", "install.sh", "scripts/configure.ts", "src", "runtime", "INSTALLER-FIXTURE"],
           process.env,
           origin,
         )
@@ -851,7 +923,7 @@ if [ "$1" = "debug" ] && [ "$2" = "config" ]; then
   if [ "$OPENCODE_SAFE_COMPACTION_MODEL" != "selected" ]; then
     agent_model='"model":"'"$OPENCODE_SAFE_COMPACTION_MODEL"'",'
   fi
-  printf '{"plugin":[["%s/src/index.ts",{"model":"%s"}]],"agent":{"compaction":{%s"temperature":0}},"compaction":{"auto":true,"prune":false,"tail_turns":4,"preserve_recent_tokens":16000,"reserved":32000}}\n' \
+  printf '{"plugin":[["%s/runtime",{"model":"%s"}]],"agent":{"compaction":{%s"temperature":0}},"compaction":{"auto":true,"prune":false,"tail_turns":4,"preserve_recent_tokens":16000,"reserved":32000}}\n' \
     "$OPENCODE_SAFE_COMPACTION_DIR" "$OPENCODE_SAFE_COMPACTION_MODEL" "$agent_model"
   exit 0
 fi
@@ -893,24 +965,29 @@ exit 1
       plugin: [[string, { model: string }]]
     }
     expect(value.plugin).toHaveLength(1)
-    expect(value.plugin[0]?.[0]).toBe(path.join(install, "src/index.ts"))
+    expect(value.plugin[0]?.[0]).toBe(managedSource(install))
     expect(value.plugin[0]?.[1].model).toBe("opencode-go/glm-5.2")
+    expect(Bun.JSONC.parse(await Bun.file(path.join(config, "tui.jsonc")).text())).toEqual({
+      plugin: [[managedSource(install), { model: "opencode-go/glm-5.2" }]],
+    })
 
-    const selected = await command(["sh", "install.sh", "--model", "selected"], environment)
+    const selected = await configure(config, install, "selected")
     expect(selected.exitCode).toBe(0)
-    expect(selected.stdout).toContain("Updated the safe-compaction model to selected")
     const selectedValue = Bun.JSONC.parse(await Bun.file(path.join(config, "opencode.jsonc")).text()) as {
       plugin: [[string, { model: string }]]
     }
     expect(selectedValue.plugin[0]?.[1].model).toBe("selected")
+    expect(Bun.JSONC.parse(await Bun.file(path.join(config, "tui.jsonc")).text())).toEqual({
+      plugin: [[managedSource(install), { model: "selected" }]],
+    })
 
-    const fixed = await command(["sh", "install.sh", "--model=example/compact"], environment)
-    expect(fixed.exitCode).toBe(0)
-    expect(fixed.stdout).toContain("Updated the safe-compaction model to example/compact")
-    const fixedValue = Bun.JSONC.parse(await Bun.file(path.join(config, "opencode.jsonc")).text()) as {
+    const third = await command(["sh", "install.sh"], environment)
+    expect(third.exitCode).toBe(0)
+    expect(third.stdout).toContain("Configuration already contains")
+    const preservedValue = Bun.JSONC.parse(await Bun.file(path.join(config, "opencode.jsonc")).text()) as {
       plugin: [[string, { model: string }]]
     }
-    expect(fixedValue.plugin[0]?.[1].model).toBe("example/compact")
+    expect(preservedValue.plugin[0]?.[1].model).toBe("selected")
   })
 })
 
@@ -918,6 +995,10 @@ async function directory() {
   const value = await mkdtemp(path.join(tmpdir(), "safe-compaction-install-"))
   temporary.push(value)
   return value
+}
+
+function managedSource(install: string) {
+  return path.join(install, "runtime")
 }
 
 async function configure(
@@ -950,6 +1031,7 @@ function configureEnvironment(
 async function prepareInstall(install: string) {
   await mkdir(install, { recursive: true })
   await cp(path.join(process.cwd(), "src"), path.join(install, "src"), { recursive: true })
+  await cp(path.join(process.cwd(), "runtime"), path.join(install, "runtime"), { recursive: true })
 }
 
 async function installerOrigin(root: string) {
@@ -957,10 +1039,15 @@ async function installerOrigin(root: string) {
   expect((await command(["git", "clone", "--quiet", process.cwd(), origin])).exitCode).toBe(0)
   await rm(path.join(origin, "src"), { recursive: true, force: true })
   await cp(path.join(process.cwd(), "src"), path.join(origin, "src"), { recursive: true })
+  await rm(path.join(origin, "runtime"), { recursive: true, force: true })
+  await cp(path.join(process.cwd(), "runtime"), path.join(origin, "runtime"), { recursive: true })
   await mkdir(path.join(origin, "scripts"), { recursive: true })
   await Bun.write(path.join(origin, "install.sh"), Bun.file(path.join(process.cwd(), "install.sh")))
   await Bun.write(path.join(origin, "scripts/configure.ts"), Bun.file(path.join(process.cwd(), "scripts/configure.ts")))
-  expect((await command(["git", "add", "install.sh", "scripts/configure.ts", "src"], process.env, origin)).exitCode).toBe(0)
+  expect(
+    (await command(["git", "add", "install.sh", "scripts/configure.ts", "src", "runtime"], process.env, origin))
+      .exitCode,
+  ).toBe(0)
   const changed = await command(["git", "diff", "--cached", "--quiet"], process.env, origin)
   if (changed.exitCode !== 0) {
     expect(
@@ -1032,7 +1119,7 @@ if [ "$1" = "debug" ] && [ "$2" = "config" ]; then
   if [ "$OPENCODE_SAFE_COMPACTION_MODEL" != "selected" ]; then
     agent_model='"model":"'"$OPENCODE_SAFE_COMPACTION_MODEL"'",'
   fi
-  printf '{"plugin":[["%s/src/index.ts",{"model":"%s"}]],"agent":{"compaction":{%s"temperature":0}},"compaction":{"auto":%s,"prune":%s,"tail_turns":%s,"preserve_recent_tokens":%s,"reserved":%s}}\n' \
+  printf '{"plugin":[["%s/runtime",{"model":"%s"}]],"agent":{"compaction":{%s"temperature":0}},"compaction":{"auto":%s,"prune":%s,"tail_turns":%s,"preserve_recent_tokens":%s,"reserved":%s}}\n' \
     "$OPENCODE_SAFE_COMPACTION_DIR" "$OPENCODE_SAFE_COMPACTION_MODEL" "$agent_model" \
     "$auto" "$prune" "$tail_turns" "$preserve_recent_tokens" "$reserved"
   exit 0
