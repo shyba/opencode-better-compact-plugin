@@ -541,6 +541,25 @@ describe("model-visible history sanitization", () => {
     expect((fixture.messages[0]?.parts[0] as { text: string }).text).toBe("preserve durable input")
   })
 
+  test("preserves selected-model history during the initial compaction for prompt-cache reuse", async () => {
+    const sessionID = "cache-preserving"
+    const fixture = {
+      messages: [storedMessage("history", sessionID, "assistant", [
+        textPart("history", sessionID, "H" + "x".repeat(1_000) + "T"),
+      ])],
+      todos: [],
+    }
+    const mock = state([sessionID, fixture])
+    const hooks = await server(pluginInput(mock), { ...TEST_OPTIONS, model: "selected" })
+    await compact(hooks, sessionID)
+    const providerHistory = structuredClone(fixture.messages)
+    const before = structuredClone(providerHistory)
+
+    await hooks["experimental.chat.messages.transform"]?.({}, transformOutput(providerHistory))
+
+    expect(providerHistory).toEqual(before)
+  })
+
   test("reconstructs overflow replay sanitization after session.compacted cleans active state", async () => {
     const sessionID = "overflow-after-cleanup"
     const overflowText = "H" + "x".repeat(1_000) + "T"

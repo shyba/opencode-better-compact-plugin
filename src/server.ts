@@ -189,10 +189,16 @@ export async function server(input: PluginInput, rawOptions?: OpenCodePluginOpti
             text: recoveryContext(attempt.ledger),
           }
           : undefined
-        sanitizeHistory(
-          recoveryUser && !overflowRecovery ? output.messages.filter((message) => message !== recoveryUser) : output.messages,
-          options,
-        )
+        // Preserve the initial selected-model history so providers can reuse an existing
+        // prompt-cache prefix. Recovery, overflow replay, and dedicated-model compaction
+        // still use the bounded transformed history.
+        const cachePreservingInitialCompaction = options.model === SELECTED_MODEL && !invalid && !recoveryUser
+        if (!cachePreservingInitialCompaction) {
+          sanitizeHistory(
+            recoveryUser && !overflowRecovery ? output.messages.filter((message) => message !== recoveryUser) : output.messages,
+            options,
+          )
+        }
         if (!recoveryUser || !recoveryPart) return
         recoveryUser.parts = [...recoveryUser.parts, recoveryPart]
         attempt.recoveryUserID = recoveryUser.info.id

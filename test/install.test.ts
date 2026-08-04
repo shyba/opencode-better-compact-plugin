@@ -630,6 +630,7 @@ exit 1
       OPENCODE_SAFE_COMPACTION_CONFIG_DIR: config,
       OPENCODE_SAFE_COMPACTION_BUN: process.execPath,
       OPENCODE_SAFE_COMPACTION_OPENCODE: fakeOpenCode,
+      OPENCODE_SAFE_COMPACTION_MODEL: "opencode-go/glm-5.2",
       TARGET_CONFIG_DIR: config,
     })
 
@@ -793,6 +794,7 @@ exit 1
       OPENCODE_SAFE_COMPACTION_CONFIG_DIR: config,
       OPENCODE_SAFE_COMPACTION_BUN: process.execPath,
       OPENCODE_SAFE_COMPACTION_OPENCODE: fakeOpenCode,
+      OPENCODE_SAFE_COMPACTION_MODEL: "opencode-go/glm-5.2",
     }
 
     const results = await Promise.all([
@@ -966,9 +968,9 @@ exit 1
     }
     expect(value.plugin).toHaveLength(1)
     expect(value.plugin[0]?.[0]).toBe(managedSource(install))
-    expect(value.plugin[0]?.[1].model).toBe("opencode-go/glm-5.2")
+    expect(value.plugin[0]?.[1].model).toBe("selected")
     expect(Bun.JSONC.parse(await Bun.file(path.join(config, "tui.jsonc")).text())).toEqual({
-      plugin: [[managedSource(install), { model: "opencode-go/glm-5.2" }]],
+      plugin: [[managedSource(install), { model: "selected" }]],
     })
 
     const selected = await configure(config, install, "selected")

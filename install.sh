@@ -10,7 +10,7 @@ if [ "${OPENCODE_SAFE_COMPACTION_MODEL+x}" = x ]; then
   model=$OPENCODE_SAFE_COMPACTION_MODEL
   model_explicit=1
 else
-  model=opencode-go/glm-5.2
+  model=selected
   model_explicit=0
 fi
 unset OPENCODE_SAFE_COMPACTION_PRESERVE_SOURCE
