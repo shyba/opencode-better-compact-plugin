@@ -21,7 +21,6 @@ export const LEDGER_LIMITS = {
   legacy_context: 2,
   compact_source_bytes: 65_536,
   tool_output_source_bytes: 65_536,
-  tool_input_nodes: 1_024,
 } as const
 
 export type MessageRecord = {
@@ -163,7 +162,6 @@ export function buildRecoveryLedger(input: {
   const legacyContext: string[] = []
   let userPartsScanned = 0
   let historyPartsScanned = 0
-  let toolInputNodes = 0
 
   for (let messageIndex = input.messages.length - 1; messageIndex >= firstMessage; messageIndex--) {
     const message = input.messages[messageIndex]
@@ -240,11 +238,6 @@ export function buildRecoveryLedger(input: {
         if (typeof state.title === "string" && state.title.trim()) status.title = compact(state.title, 180)
         toolStatuses.push(status)
       }
-      toolInputNodes += forEachPath(
-        state.input,
-        LEDGER_LIMITS.tool_input_nodes - toolInputNodes,
-        (path) => addBoundedPath(touchedPaths, path),
-      )
       if (state.status === "error" && typeof state.error === "string" && errors.length < LEDGER_LIMITS.errors) {
         pushReverseUnique(
           errors,
@@ -398,41 +391,6 @@ function compact(value: string, maxBytes: number) {
 
 function unique(values: string[]) {
   return [...new Set(values)]
-}
-
-function forEachPath(value: unknown, maxNodes: number, visit: (path: string) => void) {
-  const pending: unknown[] = [value]
-  let nodes = 0
-  while (pending.length && nodes < maxNodes) {
-    const current = pending.pop()
-    nodes++
-    if (typeof current === "string") {
-      const text = redact(boundedSource(current, LEDGER_LIMITS.compact_source_bytes))
-      for (const match of text.matchAll(/(?:^|[\s"'=])((?:\.\.?\/|\/)[A-Za-z0-9_@.+-][A-Za-z0-9_@./+-]*)/g)) {
-        if (match[1]) visit(match[1])
-      }
-      continue
-    }
-    if (Array.isArray(current)) {
-      const remaining = maxNodes - nodes
-      for (let index = Math.min(current.length, remaining) - 1; index >= 0; index--) pending.push(current[index])
-      continue
-    }
-    const data = record(current)
-    if (!data) continue
-    const remaining = maxNodes - nodes
-    const entries: Array<[string, unknown]> = []
-    for (const key in data) {
-      if (!Object.hasOwn(data, key)) continue
-      entries.push([key, data[key]])
-      if (entries.length >= remaining) break
-    }
-    for (let index = entries.length - 1; index >= 0; index--) {
-      const entry = entries[index]
-      if (entry) pending.push(entry[1], entry[0])
-    }
-  }
-  return nodes
 }
 
 function errorText(value: unknown) {

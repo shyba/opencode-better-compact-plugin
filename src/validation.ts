@@ -24,7 +24,7 @@ export const REQUIRED_SECTIONS = [
 const TERSE_ACKNOWLEDGEMENTS = new Set([
   "check", "yes", "no", "ok", "okay", "hm", "hmm", "eta", "status", "retry", "continue",
   "read", "resume", "stop", "start", "pause", "done", "finished", "?", "%", "%?", "?:",
-  "k", "yep", "nope", "true", "false",
+  "k", "yep", "nope", "true", "false", "save", "wait", "load", "next", "ping", "sure", "fine", "great",
 ])
 
 export function buildCompactionPrompt(ledger: RecoveryLedger, maxBytes: number) {
@@ -224,7 +224,7 @@ function resolveGoal(requests: string[]) {
     if (!value || isTerseAcknowledgement(value)) continue
     return value.split(/\s+/).slice(0, 30).join(" ")
   }
-  return (requests.at(-1) ?? "").trim()
+  return ""
 }
 
 function isTerseAcknowledgement(value: string) {

@@ -58,6 +58,23 @@ describe("authoritative summary", () => {
     expect(isAuthoritativeSummary(fallback, 16_384)).toBe(true)
   })
 
+  test("treats common one-word imperatives as acknowledgements", () => {
+    const ledger = canonicalLedger({
+      ...EMPTY_DATA,
+      recent_requests: ["Wire the new exporter", "save", "wait", "great"],
+    })
+    const fallback = buildAuthoritativeSummary({ ledger, maxBytes: 16_384 })
+
+    expect(fallback).toContain("## Goal\n- Wire the new exporter")
+  })
+
+  test("uses an honest placeholder when every recovered request is terse", () => {
+    const ledger = canonicalLedger({ ...EMPTY_DATA, recent_requests: ["save", "wait", "great"] })
+    const fallback = buildAuthoritativeSummary({ ledger, maxBytes: 16_384 })
+
+    expect(fallback).toContain("## Goal\n- No recoverable user request was recorded.")
+  })
+
   test("preserves tool transitions while collapsing repeated status noise", () => {
     const statusLedger = canonicalLedger({
       ...EMPTY_DATA,

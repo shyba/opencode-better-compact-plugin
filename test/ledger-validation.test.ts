@@ -133,7 +133,7 @@ describe("recovery ledger", () => {
     expect(first).toEqual(second)
     expect(first.digest).toBe(sha256(first.body))
     expect(first.data.todos.map((todo) => todo.id)).toEqual(["todo-a", "todo-b"])
-    expect(first.data.touched_paths).toEqual(["/repo/source.ts", "/repo/zeta.ts", "alpha.ts", "beta.ts", "zeta.ts"])
+    expect(first.data.touched_paths).toEqual(["/repo/zeta.ts", "alpha.ts", "beta.ts", "zeta.ts"])
     expect(first.data.recent_requests).toEqual([
       "Must preserve the schema. token=[REDACTED]",
       "Only update the parser. Next, run tests.",
@@ -230,10 +230,11 @@ describe("recovery ledger", () => {
     expect(ledger.data.next_actions.some((action) => action.startsWith("Continue the newest request:"))).toBe(false)
   })
 
-  test("normalizes path suffixes and rejects short path fragments", () => {
+  test("uses explicit file artifacts and ignores arbitrary tool-input paths", () => {
     const ledger = buildRecoveryLedger({
       messages: [message("user", sessionID, "user", [{ type: "text", text: "Inspect the files" }]), message("tools", sessionID, "assistant", [
-        { type: "tool", tool: "shell", state: { status: "completed", input: { command: "cat /repo/src/index.ts /api/ /g /very-long-path-name" } } },
+        { type: "file", filename: "/repo/src/index.ts", source: { path: "/repo/src/index.ts" } },
+        { type: "tool", tool: "shell", state: { status: "completed", input: { command: "cat /api/ /g /very-long-path-name" } } },
       ])],
       todos: [],
       tailTurns: 1,
@@ -241,7 +242,7 @@ describe("recovery ledger", () => {
     })
 
     expect(ledger.data.touched_paths).toContain("/repo/src/index.ts")
-    expect(ledger.data.touched_paths).toContain("/very-long-path-name")
+    expect(ledger.data.touched_paths).not.toContain("/very-long-path-name")
     expect(ledger.data.touched_paths).not.toContain("/api")
     expect(ledger.data.touched_paths).not.toContain("/g")
   })
@@ -285,7 +286,7 @@ describe("recovery ledger", () => {
     ].sort((left, right) => left.id.localeCompare(right.id)))
   })
 
-  test("enforces collection bounds without inspecting omitted history, parts, or tool input", () => {
+  test("enforces collection bounds without inspecting omitted history or parts", () => {
     const omitted = {
       get info(): MessageRecord["info"] {
         throw new Error("inspected message outside the bounded window")
@@ -338,9 +339,7 @@ describe("recovery ledger", () => {
     expect(ledger.data.tool_statuses).toHaveLength(LEDGER_LIMITS.tool_statuses)
     expect(ledger.data.tool_statuses[0]?.tool).toBe("tool-09952")
     expect(ledger.data.tool_statuses.at(-1)?.tool).toBe("tool-09999")
-    expect(ledger.data.touched_paths).toHaveLength(LEDGER_LIMITS.touched_paths)
-    expect(ledger.data.touched_paths[0]).toBe("/repo/file-00000")
-    expect(ledger.data.touched_paths.at(-1)).toBe("/repo/file-00063")
+    expect(ledger.data.touched_paths).toEqual([])
   })
 
   test("summarizes a large tool result without copying it into the ledger", () => {
