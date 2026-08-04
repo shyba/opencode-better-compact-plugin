@@ -21,6 +21,12 @@ export const REQUIRED_SECTIONS = [
   "Next actions",
 ] as const
 
+const TERSE_ACKNOWLEDGEMENTS = new Set([
+  "check", "yes", "no", "ok", "okay", "hm", "hmm", "eta", "status", "retry", "continue",
+  "read", "resume", "stop", "start", "pause", "done", "finished", "?", "%", "%?", "?:",
+  "k", "yep", "nope", "true", "false",
+])
+
 export function buildCompactionPrompt(ledger: RecoveryLedger, maxBytes: number) {
   return `Return exactly the Markdown below, byte-for-byte, in one response. Do not add commentary or code fences around it.
 
@@ -86,8 +92,9 @@ export function buildFallback(input: {
 }) {
   const list = (values: string[], empty: string) =>
     values.length ? values.map((value) => `- ${safeMarkdown(value)}`).join("\n") : `- ${empty}`
+  const goal = resolveGoal(input.ledger.data.recent_requests)
   const text = `## Goal
-${list(input.ledger.data.recent_requests.slice(-1), "No recoverable user request was recorded.")}
+${goal ? `- ${safeMarkdown(goal)}` : "- No recoverable user request was recorded."}
 
 ## Constraints
 ${list(input.ledger.data.constraints, "No explicit constraints were recovered.")}
@@ -96,7 +103,7 @@ ${list(input.ledger.data.constraints, "No explicit constraints were recovered.")
 - No decisions were inferred outside the canonical ledger.
 
 ## Current state
-${list(input.ledger.data.tool_statuses.map((item) => `${item.tool}: ${item.status}`), "Recovery summary generated from bounded durable history.")}
+${list(toolStatusLines(input.ledger.data.tool_statuses), "Recovery summary generated from bounded durable history.")}
 
 ## Files
 ${list(input.ledger.data.touched_paths, "No touched paths were recovered.")}
@@ -207,6 +214,44 @@ function safeMarkdown(value: string) {
     .replace(/^#{1,6}\s+/gm, "heading: ")
     .replaceAll(LEDGER_START, "[ledger marker]")
     .replaceAll(LEDGER_END, "[ledger marker]")
+}
+
+function resolveGoal(requests: string[]) {
+  for (let index = requests.length - 1; index >= 0; index--) {
+    const value = (requests[index] ?? "").trim()
+    if (!value || isTerseAcknowledgement(value)) continue
+    return value.split(/\s+/).slice(0, 30).join(" ")
+  }
+  return (requests.at(-1) ?? "").trim()
+}
+
+function isTerseAcknowledgement(value: string) {
+  const normalized = value.toLowerCase().replace(/？/g, "?").replace(/[.,!;:]+$/g, "").trim()
+  if (!normalized) return true
+  const words = normalized.split(/\s+/).filter(Boolean)
+  return words.length <= 3 && words.every((word) => TERSE_ACKNOWLEDGEMENTS.has(word))
+}
+
+function toolStatusLines(statuses: RecoveryLedgerData["tool_statuses"]) {
+  const lines: string[] = []
+  let previous: string | undefined
+  let count = 0
+  const flush = () => {
+    if (!previous) return
+    lines.push(count > 1 ? `${previous} (x${count})` : previous)
+  }
+  for (const item of statuses) {
+    const line = `${item.tool}: ${item.status}${item.title ? ` — ${item.title}` : ""}`
+    if (line === previous) {
+      count++
+      continue
+    }
+    flush()
+    previous = line
+    count = 1
+  }
+  flush()
+  return lines
 }
 
 function markerLines(value: string, marker: string) {

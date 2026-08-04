@@ -226,7 +226,24 @@ describe("recovery ledger", () => {
 
     expect(ledger.data.todos).toHaveLength(LEDGER_LIMITS.todos)
     expect(ledger.data.next_actions).toHaveLength(LEDGER_LIMITS.next_actions)
-    expect(ledger.data.next_actions[0]).toBe("Continue the newest request: Fix the recovery race")
+    expect(ledger.data.next_actions[0]).toBe("Pending action 0")
+    expect(ledger.data.next_actions.some((action) => action.startsWith("Continue the newest request:"))).toBe(false)
+  })
+
+  test("normalizes path suffixes and rejects short path fragments", () => {
+    const ledger = buildRecoveryLedger({
+      messages: [message("user", sessionID, "user", [{ type: "text", text: "Inspect the files" }]), message("tools", sessionID, "assistant", [
+        { type: "tool", tool: "shell", state: { status: "completed", input: { command: "cat /repo/src/index.ts /api/ /g /very-long-path-name" } } },
+      ])],
+      todos: [],
+      tailTurns: 1,
+      maxBytes: 16_384,
+    })
+
+    expect(ledger.data.touched_paths).toContain("/repo/src/index.ts")
+    expect(ledger.data.touched_paths).toContain("/very-long-path-name")
+    expect(ledger.data.touched_paths).not.toContain("/api")
+    expect(ledger.data.touched_paths).not.toContain("/g")
   })
 
   test("normalizes V1 todos that omit IDs and optional metadata", () => {

@@ -44,4 +44,32 @@ describe("authoritative summary", () => {
     expect(isAuthoritativeSummary(provider, 16_384)).toBe(false)
     expect(buildAuthoritativeSummary({ ledger, maxBytes: 16_384 })).not.toContain("provider-secret")
   })
+
+  test("uses the latest substantive request when the newest turn is only an acknowledgement", () => {
+    const acked = canonicalLedger({
+      ...EMPTY_DATA,
+      recent_requests: ["Wire the new exporter", "check", "yes", "continue"],
+    })
+    const fallback = buildAuthoritativeSummary({ ledger: acked, maxBytes: 16_384 })
+
+    expect(fallback).toContain("## Goal\n- Wire the new exporter")
+    expect(fallback).not.toContain("## Goal\n- continue")
+    expect(isAuthoritativeSummary(fallback, 16_384)).toBe(true)
+  })
+
+  test("preserves tool transitions while collapsing repeated status noise", () => {
+    const statusLedger = canonicalLedger({
+      ...EMPTY_DATA,
+      tool_statuses: [
+        { tool: "bash", status: "completed", title: "Run tests" },
+        { tool: "bash", status: "completed", title: "Run tests" },
+        { tool: "edit", status: "completed", title: "Update source" },
+      ],
+    })
+    const fallback = buildAuthoritativeSummary({ ledger: statusLedger, maxBytes: 16_384 })
+
+    expect(fallback).toContain("bash: completed — Run tests (x2)")
+    expect(fallback).toContain("edit: completed — Update source")
+    expect(isAuthoritativeSummary(fallback, 16_384)).toBe(true)
+  })
 })

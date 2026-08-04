@@ -335,11 +335,11 @@ export function buildRecoveryLedger(input: {
     LEDGER_LIMITS.legacy_context,
     180,
   )
-  const newestRequest = recentRequests.at(-1)
   const nextActions = unique([
-    ...(newestRequest ? [`Continue the newest request: ${newestRequest}`] : []),
     ...mergedTodos.filter((todo) => todo.status !== "completed" && todo.status !== "cancelled").map((todo) => todo.content),
-    ...(prior?.next_actions ?? []).map((value) => compact(value, 360)),
+    ...(prior?.next_actions ?? [])
+      .map((value) => compact(value, 360))
+      .filter((value) => !value.startsWith("Continue the newest request:")),
   ]).slice(0, LEDGER_LIMITS.next_actions)
   const data: RecoveryLedgerData = {
     recent_requests: recentRequests,
@@ -536,8 +536,8 @@ function pushReverseUnique(values: string[], seen: Set<string>, value: string, l
 }
 
 function addBoundedPath(paths: Set<string>, value: string) {
-  const path = compact(value, 300)
-  if (!path || paths.has(path)) return
+  const path = compact(value.replace(/\/+$/, "") || value, 300)
+  if (!isRealPath(path) || paths.has(path)) return
   paths.add(path)
   if (paths.size <= LEDGER_LIMITS.touched_paths) return
   let largest: string | undefined
@@ -545,6 +545,14 @@ function addBoundedPath(paths: Set<string>, value: string) {
     if (largest === undefined || compareText(existing, largest) > 0) largest = existing
   }
   if (largest) paths.delete(largest)
+}
+
+function isRealPath(path: string) {
+  if (path.length < 4) return false
+  const segment = path.slice(path.lastIndexOf("/") + 1)
+  if (segment.includes(".")) return true
+  const innerSlashes = (path.slice(1).match(/\//g) ?? []).length
+  return innerSlashes >= 1 || path.length >= 16
 }
 
 function insertSortedBounded<T>(values: T[], value: T, limit: number, compare: (left: T, right: T) => number) {
