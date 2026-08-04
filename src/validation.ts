@@ -157,6 +157,8 @@ The canonical recovery ledger below is authoritative. legacy_context records onl
 
 No provider-authored compaction prose is trusted by opencode-safe-compaction.
 
+Review pending and in-progress todos against recent_requests before acting. If a todo no longer matches the active request thread, treat it as possibly stale: mention its ID and ask the user before completing, deleting, or rewriting it. Do not infer abandonment from age alone.
+
 ${ledger.block}`
 }
 

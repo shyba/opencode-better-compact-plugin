@@ -164,6 +164,7 @@ This plugin mitigates compaction failures; it cannot make OpenCode's core cutove
 - V1 pagination bounds message count, not serialized response bytes. The plugin validates page size, distinct and non-overlapping message identities, cursor reuse, the total page budget, and Session identity, but a single historical message with enormous parts can still make one host API response large; a strict response-byte cap requires a core/API change.
 - OpenCode core owns the automatic-compaction trigger threshold; the plugin applies the configured `auto`/`prune` policy and safe history budgets but cannot force a lower trigger cadence through the V1 plugin hooks.
 - Pending todos remain in the canonical ledger across task switches because V1 exposes no authoritative task-abandonment signal. The summary bounds and orders them, but the plugin does not guess that an unfinished todo is safe to discard.
+- During recovery, the model is explicitly asked to compare pending todos with the recent request thread and flag possible zombies by ID. That review is advisory only; the plugin never marks, deletes, or rewrites a todo from model judgment alone.
 - Attempt state is process-local. This plugin does not implement clustered compaction ownership or crash-safe provider retries.
 
 ## Development and packaging

@@ -5,6 +5,7 @@ import {
   buildAuthoritativeSummary,
   isAuthoritativeSummary,
   isPluginValidSummary,
+  recoveryContext,
 } from "../src/validation.js"
 
 const EMPTY_DATA: RecoveryLedgerData = {
@@ -71,5 +72,19 @@ describe("authoritative summary", () => {
     expect(fallback).toContain("bash: completed — Run tests (x2)")
     expect(fallback).toContain("edit: completed — Update source")
     expect(isAuthoritativeSummary(fallback, 16_384)).toBe(true)
+  })
+
+  test("asks the recovery model to review possible zombie todos without mutating them", () => {
+    const ledger = canonicalLedger({
+      ...EMPTY_DATA,
+      recent_requests: ["Fix the exporter"],
+      todos: [{ id: "todo-old", status: "pending", priority: "low", content: "Migrate the old scraper" }],
+    })
+    const context = recoveryContext(ledger)
+
+    expect(context).toContain("mention its ID")
+    expect(context).toContain("possibly stale")
+    expect(context).toContain("ask the user")
+    expect(context).toContain('"todo-old"')
   })
 })
