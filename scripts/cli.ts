@@ -13,6 +13,10 @@ import { openSyncState } from "../src/sync-state.js"
 const installDir = path.resolve(process.env.OPENCODE_SAFE_COMPACTION_DIR ?? path.join(process.env.HOME ?? ".", ".local/share/opencode/plugins/safe-compaction"))
 const configDir = path.resolve(process.env.OPENCODE_SAFE_COMPACTION_CONFIG_DIR ?? process.env.OPENCODE_CONFIG_DIR ?? path.join(process.env.XDG_CONFIG_HOME ?? path.join(process.env.HOME ?? ".", ".config"), "opencode"))
 const databasePath = path.resolve(process.env.OPENCODE_DB ?? path.join(process.env.XDG_DATA_HOME ?? path.join(process.env.HOME ?? ".", ".local/share"), "opencode", "opencode.db"))
+const configFlag = flagValue("--config")
+const stateFlag = flagValue("--state")
+if (configFlag) process.env.BETTER_COMPACT_CONFIG = path.resolve(configFlag)
+if (stateFlag) process.env.BETTER_COMPACT_STATE = path.resolve(stateFlag)
 const paths = configPaths()
 
 const command = process.argv[2] ?? "help"
@@ -38,7 +42,7 @@ if (command === "installation") {
 }
 if (command === "sync") {
   const action = process.argv[3]
-  if (action === "run") process.exit(await syncRun(process.argv[4] === "--once"))
+  if (action === "run") process.exit(await syncRun(process.argv.includes("--once")))
   if (action === "status") process.exit(await syncStatus())
   if (action === "install") process.exit(await syncInstall())
   if (action === "uninstall") process.exit(await syncUninstall())
@@ -56,7 +60,7 @@ Usage:
   better-compact install  Activate the plugin using the selected installation mode
   better-compact update   Update the managed checkout and verify configuration
   better-compact doctor   Check installation, OpenCode, configuration, and SQLite access
-  better-compact sync run [--once] Discover sources and deliver redacted records
+  better-compact sync run [--once] [--config FILE] [--state FILE] Discover sources and deliver redacted records
   better-compact sync status Show local outbox status
   better-compact sync install|uninstall Manage a systemd user service
   better-compact installation reset|adopt --yes  Explicitly recover or replace sync identity
@@ -70,6 +74,11 @@ Environment overrides:
   OPENCODE_DB
   BETTER_COMPACT_CONFIG
   BETTER_COMPACT_STATE`)
+}
+
+function flagValue(flag: string) {
+  const index = process.argv.indexOf(flag)
+  return index >= 0 ? process.argv[index + 1] : undefined
 }
 
 async function update() {
