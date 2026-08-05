@@ -64,6 +64,11 @@ export class SyncState {
       on conflict(id) do update set last_seen_at=excluded.last_seen_at, fingerprint=excluded.fingerprint`).run(source.id, source.installationID, source.kind, source.schemaVersion, source.locator, source.fingerprint ?? null, source.incarnation, Date.now(), Date.now())
   }
 
+  sourceIncarnation(sourceID: string, fallback = randomUUID()) {
+    const row = this.db.query("select incarnation from source where id=?").get(sourceID) as { incarnation: string } | null
+    return row?.incarnation ?? fallback
+  }
+
   nextRevision(sourceID: string) {
     const row = this.db.query("select coalesce(max(record_revision), 0) as value from normalized_record where source_id=?").get(sourceID) as { value: number }
     return Number(row.value)
