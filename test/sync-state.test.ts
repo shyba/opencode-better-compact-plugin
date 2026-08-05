@@ -51,4 +51,18 @@ describe("portable better-compact state", () => {
     expect(rows.map((row) => row.recordRevision).sort()).toEqual([1, 2])
     state.close()
   })
+
+  test("creates tombstones only for a completed snapshot", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "better-compact-state-"))
+    temporary.push(directory)
+    const state = await openSyncState(path.join(directory, "state.sqlite"))
+    state.ensureInstallation("install-1", "incarnation-1")
+    state.upsertSource({ id: "source-1", installationID: "install-1", kind: "fixture", schemaVersion: 1, locator: "fixture://one", incarnation: "source-inc-1" })
+    const record = { sourceID: "source-1", recordKind: "message", naturalKey: "m1", payloadJSON: "present", payloadSHA256: "present", recordRevision: 1, observedAt: 1 }
+    state.enqueue([record], "source-1", "messages", { cursor: "1" })
+    state.enqueue([], "source-1", "messages", { cursor: "2" }, "postgres", { complete: true, recordKinds: ["message"] })
+    const rows = state.claim("postgres", 10, 3)
+    expect(rows.some((row) => row.operation === "delete" && row.naturalKey === "m1")).toBe(true)
+    state.close()
+  })
 })

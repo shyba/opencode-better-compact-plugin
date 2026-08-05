@@ -4,7 +4,7 @@ import { redact, utf8Bytes } from "./ledger.js"
 import type { NormalizedRecord } from "./sync-state.js"
 
 const REQUIRED_COLUMNS = {
-  session: ["id", "time_created", "time_updated", "data"],
+  session: ["id", "time_created", "time_updated", "title", "directory", "metadata"],
   message: ["id", "session_id", "time_created", "time_updated", "data"],
   part: ["id", "message_id", "session_id", "time_created", "time_updated", "data"],
   todo: ["session_id", "position", "time_created", "time_updated", "content", "status", "priority"],
@@ -45,12 +45,12 @@ export function discoverOpenCodeV1(filename: string, sourceID: string, revisionS
   const db = new Database(filename, { readonly: true })
   try {
     db.exec("begin")
-    const sessions = db.query("select id, time_created, time_updated, data from session order by time_created, id").all() as Array<Record<string, unknown>>
+    const sessions = db.query("select id, time_created, time_updated, title, directory, metadata from session order by time_created, id").all() as Array<Record<string, unknown>>
     const records: NormalizedRecord[] = []
     let revision = revisionStart
     for (const session of sessions) {
       const sessionID = String(session.id)
-      const sessionPayload = allowlistedPayload({ session: parseJSON(session.data), source_schema_version: inspection.schemaVersion })
+      const sessionPayload = allowlistedPayload({ session: { title: session.title, directory: session.directory, metadata: parseJSON(session.metadata) }, source_schema_version: inspection.schemaVersion })
       revision++
       records.push(record(sourceID, "session", sessionID, sessionPayload, revision, Number(session.time_updated ?? session.time_created)))
       const messages = db.query("select id, session_id, time_created, time_updated, data from message where session_id=? order by time_created, id").all(sessionID) as Array<Record<string, unknown>>
@@ -82,8 +82,10 @@ export function discoverOpenCodeV1(filename: string, sourceID: string, revisionS
 }
 
 function record(sourceID: string, recordKind: string, naturalKey: string, payload: Record<string, unknown>, recordRevision: number, observedAt: number): NormalizedRecord {
-  const payloadJSON = JSON.stringify(payload)
-  if (utf8Bytes(payloadJSON) > 131_072) throw new Error(`OpenCode ${recordKind} payload exceeds the sync bound`)
+  const rawJSON = JSON.stringify(payload)
+  const payloadJSON = utf8Bytes(rawJSON) > 131_072
+    ? JSON.stringify({ omitted: true, reason: "payload-bound", sha256: createHash("sha256").update(rawJSON).digest("hex"), bytes: utf8Bytes(rawJSON) })
+    : rawJSON
   return { sourceID, recordKind, naturalKey, payloadJSON, payloadSHA256: createHash("sha256").update(payloadJSON).digest("hex"), recordRevision, observedAt }
 }
 

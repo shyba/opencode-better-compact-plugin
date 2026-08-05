@@ -4,7 +4,8 @@ import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
 import path from "node:path"
 import { configPaths, loadConfig } from "../src/config.js"
-import { discoverOpenCodeV1 } from "../src/opencode-v1.js"
+import { discoverOpenCodeV1, inspectOpenCodeV1 } from "../src/opencode-v1.js"
+import { ensureRemoteSource, openPostgres, uploadFenced } from "../src/postgres.js"
 import { openSyncState } from "../src/sync-state.js"
 
 const installDir = path.resolve(process.env.OPENCODE_SAFE_COMPACTION_DIR ?? path.join(process.env.HOME ?? ".", ".local/share/opencode/plugins/safe-compaction"))
@@ -17,7 +18,7 @@ if (command === "help" || command === "--help" || command === "-h") {
   printHelp()
   process.exit(0)
 }
-if (command === "update") {
+if (command === "update" || command === "install") {
   await update()
   process.exit(0)
 }
@@ -39,6 +40,7 @@ function printHelp() {
   console.log(`better-compact - OpenCode safe-compaction maintenance
 
 Usage:
+  better-compact install  Activate the plugin using the selected installation mode
   better-compact update   Update the managed checkout and verify configuration
   better-compact doctor   Check installation, OpenCode, configuration, and SQLite access
   better-compact sync run Discover configured sources and stage redacted records locally
@@ -99,11 +101,25 @@ async function syncRun() {
       if (source.kind !== "opencode-v1-sqlite") throw new Error(`unsupported source adapter: ${source.kind}`)
       const filename = path.resolve(source.database.replace(/^~(?=\/|$)/, process.env.HOME ?? "."))
       const sourceID = createHash("sha256").update(`${source.kind}\n${filename}`).digest("hex").slice(0, 32)
-      const inspection = await import("../src/opencode-v1.js").then((module) => module.inspectOpenCodeV1(filename))
+      const inspection = inspectOpenCodeV1(filename)
       state.upsertSource({ id: sourceID, installationID: installation.id, kind: source.kind, schemaVersion: inspection.schemaVersion, locator: filename, fingerprint: inspection.layoutFingerprint, incarnation: installation.incarnation })
       const result = discoverOpenCodeV1(filename, sourceID, state.nextRevision(sourceID), config.sync.include_parts)
-      state.enqueue(result.records, sourceID, "messages", result.checkpoint)
+      state.enqueue(result.records, sourceID, "messages", result.checkpoint, "postgres", { complete: true, recordKinds: ["session", "message", "part", "todo"] })
       console.log(`staged ${result.records.length} records from ${filename}`)
+      const databaseURL = process.env[config.sync.database_url_env]
+      if (databaseURL) {
+        const client = openPostgres(databaseURL)
+        try {
+          await ensureRemoteSource(client, { installationID: installation.id, sourceID, incarnation: installation.incarnation, expectedRevision: state.remoteRevision(sourceID) }, source.kind, inspection.schemaVersion, inspection.layoutFingerprint)
+          const rows = state.claim("postgres", config.sync.batch_size, Date.now(), 60_000, sourceID)
+          const revision = await uploadFenced(client, { installationID: installation.id, sourceID, incarnation: installation.incarnation, expectedRevision: state.remoteRevision(sourceID) }, rows)
+          state.setRemoteRevision(sourceID, revision)
+          state.acknowledge(rows.map((row) => row.id))
+          console.log(`uploaded ${rows.length} records from ${filename}`)
+        } finally {
+          await client.close()
+        }
+      }
     }
   } finally {
     state.close()

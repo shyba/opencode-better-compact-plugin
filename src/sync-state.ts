@@ -69,9 +69,20 @@ export class SyncState {
     return Number(row.value)
   }
 
-  enqueue(records: NormalizedRecord[], sourceID: string, stream: string, checkpoint: unknown, destinationID = "postgres") {
+  remoteRevision(sourceID: string) {
+    const row = this.db.query("select coalesce(remote_revision_high_water, 0) as value from source where id=?").get(sourceID) as { value: number } | null
+    return Number(row?.value ?? 0)
+  }
+
+  setRemoteRevision(sourceID: string, revision: number) {
+    this.db.query("update source set remote_revision_high_water=? where id=?").run(revision, sourceID)
+  }
+
+  enqueue(records: NormalizedRecord[], sourceID: string, stream: string, checkpoint: unknown, destinationID = "postgres", snapshot?: { complete: boolean; recordKinds: string[] }) {
     const transaction = this.db.transaction(() => {
+      let nextRevision = this.nextRevision(sourceID)
       for (const record of records) {
+        nextRevision = Math.max(nextRevision, record.recordRevision)
         this.db.query(`insert into normalized_record(source_id, record_kind, natural_key, source_version, payload_json, payload_sha256, record_revision, deleted_at, observed_at)
           values (?, ?, ?, ?, ?, ?, ?, ?, ?)
           on conflict(source_id, record_kind, natural_key) do update set source_version=excluded.source_version, payload_json=excluded.payload_json, payload_sha256=excluded.payload_sha256, record_revision=excluded.record_revision, deleted_at=excluded.deleted_at, observed_at=excluded.observed_at
@@ -80,16 +91,35 @@ export class SyncState {
           values (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
           on conflict(destination_id, source_id, record_kind, natural_key, record_revision) do nothing`).run(destinationID, record.sourceID, record.recordKind, record.naturalKey, record.payloadJSON ?? null, record.payloadSHA256, record.recordRevision, record.deletedAt === undefined ? "upsert" : "delete", Date.now(), Date.now())
       }
+      if (snapshot?.complete) {
+        const seen = new Set(records.filter((record) => snapshot.recordKinds.includes(record.recordKind)).map((record) => `${record.recordKind}\u0000${record.naturalKey}`))
+        const placeholders = snapshot.recordKinds.map(() => "?").join(",")
+        const existing = this.db.query(`select record_kind, natural_key from normalized_record where source_id=? and record_kind in (${placeholders}) and deleted_at is null`).all(sourceID, ...snapshot.recordKinds) as Array<{ record_kind: string; natural_key: string }>
+        for (const row of existing) {
+          if (seen.has(`${row.record_kind}\u0000${row.natural_key}`)) continue
+          nextRevision++
+          const deletedAt = Date.now()
+          this.db.query(`insert into normalized_record(source_id, record_kind, natural_key, payload_json, payload_sha256, record_revision, deleted_at, observed_at)
+            values (?, ?, ?, null, '', ?, ?, ?)
+            on conflict(source_id, record_kind, natural_key) do update set payload_json=null, payload_sha256='', record_revision=excluded.record_revision, deleted_at=excluded.deleted_at, observed_at=excluded.observed_at
+            where excluded.record_revision > normalized_record.record_revision`).run(sourceID, row.record_kind, row.natural_key, nextRevision, deletedAt, deletedAt)
+          this.db.query(`insert into outbox(destination_id, source_id, record_kind, natural_key, payload_json, payload_sha256, record_revision, operation, state, next_attempt_at, created_at)
+            values (?, ?, ?, ?, null, '', ?, 'delete', 'pending', ?, ?)
+            on conflict(destination_id, source_id, record_kind, natural_key, record_revision) do nothing`).run(destinationID, sourceID, row.record_kind, row.natural_key, nextRevision, Date.now(), Date.now())
+        }
+      }
       this.db.query("insert into source_cursor(source_id, stream, checkpoint_json, updated_at) values (?, ?, ?, ?) on conflict(source_id, stream) do update set checkpoint_json=excluded.checkpoint_json, updated_at=excluded.updated_at").run(sourceID, stream, JSON.stringify(checkpoint), Date.now())
     })
     transaction()
   }
 
-  claim(destinationID: string, limit: number, now = Date.now(), leaseMs = 60_000): OutboxRow[] {
-    const rows = this.db.query(`select * from outbox where destination_id=? and (state='pending' or (state='leased' and lease_until<?) or (state='failed' and next_attempt_at<=?)) order by id limit ?`).all(destinationID, now, now, limit) as Array<Record<string, unknown>>
+  claim(destinationID: string, limit: number, now = Date.now(), leaseMs = 60_000, sourceID?: string): OutboxRow[] {
+    const filter = sourceID ? " and source_id=?" : ""
+    const args = sourceID ? [destinationID, now, now, sourceID, limit] : [destinationID, now, now, limit]
+    const rows = this.db.query(`select * from outbox where destination_id=? and (state='pending' or (state='leased' and lease_until<?) or (state='failed' and next_attempt_at<=?))${filter} order by id limit ?`).all(...args) as Array<Record<string, unknown>>
     const leaseUntil = now + leaseMs
     for (const row of rows) this.db.query("update outbox set state='leased', lease_until=?, attempts=attempts+1 where id=?").run(leaseUntil, Number(row.id))
-    return rows.map((row) => ({ ...row, id: Number(row.id), sourceID: String(row.source_id), recordKind: String(row.record_kind), naturalKey: String(row.natural_key), payloadSHA256: String(row.payload_sha256), recordRevision: Number(row.record_revision), attempts: Number(row.attempts) + 1, destinationID: String(row.destination_id), operation: row.operation as "upsert" | "delete" })) as OutboxRow[]
+    return rows.map((row) => ({ ...row, id: Number(row.id), sourceID: String(row.source_id), recordKind: String(row.record_kind), naturalKey: String(row.natural_key), payloadJSON: typeof row.payload_json === "string" ? row.payload_json : undefined, payloadSHA256: String(row.payload_sha256), recordRevision: Number(row.record_revision), attempts: Number(row.attempts) + 1, destinationID: String(row.destination_id), operation: row.operation as "upsert" | "delete" })) as OutboxRow[]
   }
 
   acknowledge(ids: number[]) {

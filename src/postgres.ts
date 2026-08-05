@@ -18,8 +18,20 @@ export function openPostgres(url: string) {
   return new constructor(url)
 }
 
+export async function ensureRemoteSource(client: SQLClient, source: PostgresSource, kind: string, schemaVersion: number, fingerprint: string) {
+  await client.unsafe(`insert into opencode.installation(installation_id, incarnation, label)
+    values ($1,$2,$3)
+    on conflict (installation_id) do update set last_seen_at=now()
+    where opencode.installation.incarnation=$2`, [source.installationID, source.incarnation, source.installationID])
+  await client.unsafe(`insert into opencode.source(installation_id, source_id, incarnation, kind, schema_version, locator_fingerprint)
+    values ($1,$2,$3,$4,$5,$6)
+    on conflict (installation_id, source_id) do update set last_seen_at=now()
+    where opencode.source.incarnation=$3`, [source.installationID, source.sourceID, source.incarnation, kind, schemaVersion, fingerprint])
+}
+
 export async function uploadFenced(client: SQLClient, source: PostgresSource, rows: OutboxRow[]) {
-  if (!rows.length) return
+  if (!rows.length) return source.expectedRevision
+  let uploadedHighWater = source.expectedRevision
   await client.begin(async (transaction) => {
     const sourceRows = await transaction.unsafe<Array<{ incarnation: string; remote_revision_high_water: number }>>(
       "select incarnation, remote_revision_high_water from opencode.source where installation_id=$1 and source_id=$2 for update",
@@ -40,7 +52,9 @@ export async function uploadFenced(client: SQLClient, source: PostgresSource, ro
       "update opencode.source set remote_revision_high_water=$1, last_seen_at=now() where installation_id=$2 and source_id=$3 and incarnation=$4 and remote_revision_high_water=$5",
       [highWater, source.installationID, source.sourceID, source.incarnation, source.expectedRevision],
     )
+    uploadedHighWater = highWater
   })
+  return uploadedHighWater
 }
 
 async function upsertRecord(client: SQLClient, source: PostgresSource, row: OutboxRow, payload: Record<string, unknown>) {
