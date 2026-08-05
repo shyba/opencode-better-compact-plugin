@@ -329,6 +329,17 @@ async function installationAdopt(confirmed: boolean) {
   const installation = state.ensureDefaultInstallation()
   const client = openPostgres(databaseURL)
   try {
+    const remoteInstallations = await client.unsafe<Array<{ incarnation: string }>>(
+      "select incarnation from opencode.installation where installation_id=$1",
+      [installation.id],
+    )
+    const remoteInstallation = remoteInstallations[0]
+    if (!remoteInstallation) {
+      console.error(`no remote installation exists for ${installation.id}; run sync once before adopting`)
+      return 2
+    }
+    state.adoptInstallationIncarnation(remoteInstallation.incarnation)
+    const adoptedInstallation = state.ensureDefaultInstallation()
     for (const source of config.sources) {
       if (source.kind !== "opencode-v1-sqlite") continue
       const filename = path.resolve(source.database.replace(/^~(?=\/|$)/, process.env.HOME ?? "."))
@@ -336,7 +347,7 @@ async function installationAdopt(confirmed: boolean) {
       const inspection = inspectOpenCodeV1(filename)
       const sourceIncarnation = state.sourceIncarnation(sourceID)
       state.upsertSource({ id: sourceID, installationID: installation.id, kind: source.kind, schemaVersion: inspection.schemaVersion, locator: filename, fingerprint: inspection.layoutFingerprint, incarnation: sourceIncarnation })
-      const fence = await readRemoteFence(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, ownerToken: workerToken, expectedRevision: state.remoteRevision(sourceID) }, true)
+      const fence = await readRemoteFence(client, { installationID: adoptedInstallation.id, installationIncarnation: remoteInstallation.incarnation, sourceID, incarnation: sourceIncarnation, ownerToken: workerToken, expectedRevision: state.remoteRevision(sourceID) }, true)
       state.adoptSourceIncarnation(sourceID, fence.incarnation)
       state.setRemoteRevision(sourceID, fence.revision)
       state.adoptThrough(sourceID, fence.revision)

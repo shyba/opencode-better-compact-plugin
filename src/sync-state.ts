@@ -71,6 +71,10 @@ export class SyncState {
     return value
   }
 
+  adoptInstallationIncarnation(incarnation: string) {
+    this.db.query("update installation set incarnation=?, adopted_at=?").run(incarnation, Date.now())
+  }
+
   upsertSource(source: { id: string; installationID: string; kind: string; schemaVersion: number; locator: string; fingerprint?: string; incarnation: string }) {
     const existing = this.db.query("select fingerprint, schema_version, installation_id from source where id=?").get(source.id) as { fingerprint?: string; schema_version: number; installation_id: string } | null
     if (existing?.fingerprint && source.fingerprint && existing.fingerprint !== source.fingerprint && source.schemaVersion <= existing.schema_version) throw new Error(`source layout fingerprint changed without a recognized migration for ${source.id}`)

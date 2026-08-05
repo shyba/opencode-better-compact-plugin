@@ -122,4 +122,14 @@ describe("portable better-compact state", () => {
     expect(reopened.claim("postgres", 1, 20, 10, "source-1", 0)).toHaveLength(1)
     reopened.close()
   })
+
+  test("adopts the remote installation incarnation", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "better-compact-state-"))
+    temporary.push(directory)
+    const state = await openSyncState(path.join(directory, "state.sqlite"))
+    const installation = state.ensureDefaultInstallation()
+    state.adoptInstallationIncarnation("remote-incarnation")
+    expect(state.ensureDefaultInstallation()).toEqual({ id: installation.id, incarnation: "remote-incarnation" })
+    state.close()
+  })
 })
