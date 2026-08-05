@@ -163,7 +163,7 @@ export class SyncState {
   }
 
   acknowledge(ids: number[]) { if (ids.length) this.db.query(`delete from outbox where id in (${ids.map(() => "?").join(",")})`).run(...ids) }
-  adoptThrough(sourceID: string, revision: number, destinationID = "postgres") { this.db.query("delete from outbox where source_id=? and destination_id=? and record_revision<=? and state!='leased'").run(sourceID, destinationID, revision) }
+  adoptThrough(sourceID: string, revision: number, destinationID = "postgres") { this.db.query("delete from outbox where source_id=? and destination_id=? and record_revision<=?").run(sourceID, destinationID, revision) }
   fail(ids: number[], error: string, nextAttemptAt = Date.now() + 30_000) { if (ids.length) this.db.query(`update outbox set state='failed', lease_until=null, last_error=?, next_attempt_at=? where id in (${ids.map(() => "?").join(",")})`).run(error.slice(0, 1000), nextAttemptAt, ...ids) }
   pendingCount(destinationID = "postgres") { const row = this.db.query("select count(*) as value from outbox where destination_id=?").get(destinationID) as { value: number }; return Number(row.value) }
   purgePayloads(retentionMs: number) { this.db.query("update normalized_record set payload_json=null where observed_at<? and not exists (select 1 from outbox where outbox.source_id=normalized_record.source_id and outbox.record_kind=normalized_record.record_kind and outbox.natural_key=normalized_record.natural_key)").run(Date.now() - retentionMs) }

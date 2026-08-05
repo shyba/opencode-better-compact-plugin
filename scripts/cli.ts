@@ -271,6 +271,10 @@ async function installationReset(confirmed: boolean) {
     console.error(`This removes local sync identity, cursors, and outbox at ${paths.state}. Re-run with --yes.`)
     return 2
   }
+  const lockPID = await readFile(`${paths.state}.lock/pid`, "utf8").catch(() => "")
+  if (/^\d+$/.test(lockPID.trim())) {
+    try { process.kill(Number(lockPID.trim()), 0); console.error("sync is running; stop it before resetting installation state"); return 2 } catch {}
+  }
   await rm(paths.state, { force: true })
   await rm(`${paths.state}-wal`, { force: true })
   await rm(`${paths.state}-shm`, { force: true })
