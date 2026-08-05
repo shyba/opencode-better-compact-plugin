@@ -13,6 +13,9 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "bin": {
+    "better-compact": "./dist/cli.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -30,13 +33,14 @@
   "files": [
     "dist",
     "scripts/configure.ts",
+    "scripts/cli.ts",
     "LICENSE",
     "README.md"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit && tsc -p tsconfig.scripts.json",
     "test": "bun test",
-    "build:js": "bun build src/index.ts src/tui.ts --outdir dist --target bun --format esm",
+    "build:js": "bun build src/index.ts src/tui.ts scripts/cli.ts --outdir dist --target bun --format esm",
     "build:types": "tsc --emitDeclarationOnly",
     "build": "bun run build:js && bun run build:types",
     "eval": "bun test eval",

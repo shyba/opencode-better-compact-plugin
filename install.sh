@@ -488,5 +488,28 @@ OPENCODE_SAFE_COMPACTION_MODEL_EXPLICIT=$model_explicit \
   "$bun_bin" "$install_dir/scripts/configure.ts"
 transaction_active=0
 
+install_cli_wrapper() {
+  persistent_bun=$(command -v "$bun_command" 2>/dev/null || true)
+  [ -n "$persistent_bun" ] || return 0
+  cli_bin_dir=${OPENCODE_SAFE_COMPACTION_BIN_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}
+  case "$cli_bin_dir" in /*) ;; *) say "skipping CLI wrapper; bin directory is not absolute: $cli_bin_dir"; return 0 ;; esac
+  if ! mkdir -p "$cli_bin_dir" 2>/dev/null; then
+    say "skipping CLI wrapper; bin directory is not writable: $cli_bin_dir"
+    return 0
+  fi
+  if [ ! -w "$cli_bin_dir" ]; then
+    say "skipping CLI wrapper; bin directory is not writable: $cli_bin_dir"
+    return 0
+  fi
+  cli_wrapper=$cli_bin_dir/better-compact
+  cli_temp=$cli_wrapper.tmp.$$
+  printf '%s\n' '#!/bin/sh' "exec \"$persistent_bun\" \"$install_dir/scripts/cli.ts\" \"\$@\"" > "$cli_temp"
+  chmod 755 "$cli_temp"
+  mv -f "$cli_temp" "$cli_wrapper"
+  say "installed CLI at $cli_wrapper"
+}
+
+install_cli_wrapper
+
 say "installed successfully"
 say "restart any running OpenCode server before using the plugin"
