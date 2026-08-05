@@ -39,8 +39,7 @@ export class SyncState {
       create table if not exists outbox (id integer primary key, destination_id text not null references destination(id) on delete cascade, source_id text not null references source(id) on delete cascade, record_kind text not null, natural_key text not null, routing_json text, payload_json text, payload_sha256 text not null, record_revision integer not null, operation text not null check(operation in ('upsert', 'delete')), state text not null check(state in ('pending', 'leased', 'failed')), attempts integer not null default 0, next_attempt_at integer not null, lease_until integer, last_error text, created_at integer not null, unique(destination_id, source_id, record_kind, natural_key, record_revision));
       create index if not exists outbox_ready_idx on outbox(destination_id, state, next_attempt_at, record_revision);
     `)
-    try { this.db.exec("alter table normalized_record add column routing_json text") } catch {}
-    try { this.db.exec("alter table outbox add column routing_json text") } catch {}
+    this.db.query("insert or ignore into schema_migration(version, applied_at) values (1, ?)").run(Date.now())
   }
 
   close() { this.db.close() }
@@ -120,9 +119,11 @@ export class SyncState {
     const next = this.db.query(`select min(record_revision) as value from outbox where destination_id=? and (state='pending' or (state='leased' and lease_until<?) or (state='failed' and next_attempt_at<=?))${filter} and record_revision>?`).get(...nextArgs) as { value: number | null }
     if (next.value === null || Number(next.value) !== afterRevision + 1) return []
     const rows = this.db.query(`select * from outbox where destination_id=? and (state='pending' or (state='leased' and lease_until<?) or (state='failed' and next_attempt_at<=?))${filter} and record_revision>? order by record_revision limit ?`).all(...args) as Array<Record<string, unknown>>
+    const contiguous = rows.filter((row, index) => Number(row.record_revision) === afterRevision + index + 1)
+    if (!contiguous.length) return []
     const leaseUntil = now + leaseMs
     const claimed: Array<Record<string, unknown>> = []
-    const transaction = this.db.transaction(() => rows.forEach((row) => {
+    const transaction = this.db.transaction(() => contiguous.forEach((row) => {
       const result = this.db.query("update outbox set state='leased', lease_until=?, attempts=attempts+1 where id=? and (state='pending' or state='failed' or lease_until<?)").run(leaseUntil, Number(row.id), now) as { changes?: number }
       if (result.changes !== 0) claimed.push(row)
     }))
@@ -131,9 +132,10 @@ export class SyncState {
   }
 
   acknowledge(ids: number[]) { if (ids.length) this.db.query(`delete from outbox where id in (${ids.map(() => "?").join(",")})`).run(...ids) }
-  acknowledgeThrough(sourceID: string, revision: number, destinationID = "postgres") { this.db.query("delete from outbox where source_id=? and destination_id=? and record_revision<=?").run(sourceID, destinationID, revision) }
+  fail(ids: number[], error: string, nextAttemptAt = Date.now() + 30_000) { if (ids.length) this.db.query(`update outbox set state='failed', lease_until=null, last_error=?, next_attempt_at=? where id in (${ids.map(() => "?").join(",")})`).run(error.slice(0, 1000), nextAttemptAt, ...ids) }
   pendingCount(destinationID = "postgres") { const row = this.db.query("select count(*) as value from outbox where destination_id=?").get(destinationID) as { value: number }; return Number(row.value) }
-  outboxBytes(destinationID = "postgres") { const row = this.db.query("select coalesce(sum(length(coalesce(payload_json, '')) + length(coalesce(routing_json, ''))), 0) as value from outbox where destination_id=?").get(destinationID) as { value: number }; return Number(row.value) }
+  purgePayloads(retentionMs: number) { this.db.query("update normalized_record set payload_json=null where observed_at<? and not exists (select 1 from outbox where outbox.source_id=normalized_record.source_id and outbox.record_kind=normalized_record.record_kind and outbox.natural_key=normalized_record.natural_key)").run(Date.now() - retentionMs) }
+  outboxBytes(destinationID = "postgres") { const rows = this.db.query("select payload_json, routing_json from outbox where destination_id=?").all(destinationID) as Array<{ payload_json?: string; routing_json?: string }>; return rows.reduce((total, row) => total + new TextEncoder().encode(`${row.payload_json ?? ""}${row.routing_json ?? ""}`).byteLength, 0) }
 }
 
 export async function openSyncState(filename: string) {

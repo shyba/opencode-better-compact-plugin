@@ -81,7 +81,8 @@ async function installationMode() {
 async function doctor() {
   const checks: Array<[string, boolean, string]> = []
   const config = await loadConfig(paths)
-  checks.push(["managed checkout", await exists(path.join(installDir, ".git")), installDir])
+  const mode = await installationMode()
+  checks.push(["installation", mode !== "npx", `${mode}: ${process.argv[1] ?? installDir}`])
   checks.push(["better-compact config", await exists(paths.config), paths.config])
   checks.push(["better-compact state parent", await exists(path.dirname(paths.state)), path.dirname(paths.state)])
   checks.push(["configuration directory", await exists(configDir), configDir])
@@ -130,7 +131,12 @@ async function syncRun(once: boolean) {
   await writeFile(path.join(lock, "pid"), `${process.pid}\n`, { mode: 0o600 })
   try {
     do {
-      await syncPass(config)
+      try {
+        await syncPass(config)
+      } catch (error) {
+        console.error(`warning: sync pass failed: ${error instanceof Error ? error.message : String(error)}`)
+        if (once) return 1
+      }
       if (once) return 0
       await new Promise((resolve) => setTimeout(resolve, config.sync.poll_interval_ms))
     } while (true)
@@ -142,6 +148,7 @@ async function syncRun(once: boolean) {
 async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>) {
   const state = await openSyncState(paths.state)
   try {
+    state.purgePayloads(config.sync.retention_days * 24 * 60 * 60 * 1000)
     const installation = state.ensureDefaultInstallation()
     for (const source of config.sources) {
       if (source.kind !== "opencode-v1-sqlite") throw new Error(`unsupported source adapter: ${source.kind}`)
@@ -154,14 +161,12 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>) {
       console.log(`staged ${result.records.length} records from ${filename}`)
       const databaseURL = process.env[config.sync.database_url_env]
       if (databaseURL) {
+        assertPostgresTLS(databaseURL)
         const client = openPostgres(databaseURL)
         try {
           await ensureRemoteSource(client, { installationID: installation.id, sourceID, incarnation: installation.incarnation, expectedRevision: state.remoteRevision(sourceID) }, source.kind, inspection.schemaVersion, inspection.layoutFingerprint)
           const fence = await readRemoteFence(client, { installationID: installation.id, sourceID, incarnation: installation.incarnation, expectedRevision: state.remoteRevision(sourceID) })
-          if (fence.revision > state.remoteRevision(sourceID)) {
-            state.setRemoteRevision(sourceID, fence.revision)
-            state.acknowledgeThrough(sourceID, fence.revision)
-          }
+          if (fence.revision > state.remoteRevision(sourceID)) throw new Error(`remote revision ${fence.revision} is ahead of local ${state.remoteRevision(sourceID)}; run an explicit reset/adopt workflow`)
           const rows = state.claim("postgres", config.sync.batch_size, Date.now(), 60_000, sourceID, fence.revision)
           const revision = await uploadFenced(client, { installationID: installation.id, sourceID, incarnation: installation.incarnation, expectedRevision: fence.revision }, rows)
           state.setRemoteRevision(sourceID, revision)
@@ -173,6 +178,14 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>) {
       }
     }
   } finally { state.close() }
+}
+
+function assertPostgresTLS(url: string) {
+  const parsed = new URL(url)
+  const local = parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1" || parsed.hostname === "::1"
+  const sslmode = parsed.searchParams.get("sslmode")
+  if (!local && sslmode !== "require" && sslmode !== "verify-full") throw new Error("refusing non-local Postgres without sslmode=require or verify-full")
+  if (!local && sslmode === "disable") throw new Error("refusing sslmode=disable for non-local Postgres")
 }
 
 async function syncStatus() {
@@ -188,8 +201,8 @@ async function syncStatus() {
 
 async function syncInstall() {
   const mode = await installationMode()
-  if (mode === "npx") {
-    console.error("refusing to install a persistent service from an ephemeral npx path; materialize the package first")
+  if (mode !== "git" && mode !== "npm") {
+    console.error("refusing to install a persistent service from an ephemeral package path; materialize the package first")
     return 2
   }
   if (process.platform !== "linux") {
@@ -199,6 +212,10 @@ async function syncInstall() {
   const serviceDirectory = path.join(process.env.XDG_CONFIG_HOME ?? path.join(process.env.HOME ?? ".", ".config"), "systemd", "user")
   const service = path.join(serviceDirectory, "better-compact-sync.service")
   const executable = process.env.BETTER_COMPACT_EXECUTABLE ?? `${process.execPath} ${process.argv[1]}`
+  if (!path.isAbsolute(executable.split(/\s+/)[0] ?? "")) {
+    console.error("BETTER_COMPACT_EXECUTABLE must start with an absolute executable path")
+    return 2
+  }
   await mkdir(serviceDirectory, { recursive: true, mode: 0o700 })
   await writeFile(`${service}.tmp-${process.pid}`, `[Unit]\nDescription=Better Compact session sync\nAfter=default.target\n\n[Service]\nExecStart=${executable} sync run\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n`, { mode: 0o644 })
   await rename(`${service}.tmp-${process.pid}`, service)

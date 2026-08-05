@@ -54,7 +54,7 @@ export async function uploadFenced(client: SQLClient, source: PostgresSource, ro
     }
     let highWater = source.expectedRevision
     for (const row of rows) {
-      if (row.recordRevision <= highWater) continue
+      if (row.recordRevision !== highWater + 1) throw new Error(`non-contiguous outbox delivery at revision ${row.recordRevision}; expected ${highWater + 1}`)
       const payload = row.payloadJSON ? JSON.parse(row.payloadJSON) as Record<string, unknown> : {}
       const routing = row.routingJSON ? JSON.parse(row.routingJSON) as Record<string, unknown> : {}
       await upsertRecord(transaction, source, row, { ...routing, ...payload })

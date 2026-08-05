@@ -49,6 +49,7 @@ export function discoverOpenCodeV1(filename: string, sourceID: string, _revision
   const inspection = inspectOpenCodeV1(filename)
   const db = new Database(filename, { readonly: true })
   try {
+    db.exec("PRAGMA query_only=ON; PRAGMA busy_timeout=1000;")
     db.exec("begin")
     const sessions = db.query("select id, time_created, time_updated, title, directory, metadata from session order by time_created, id").all() as Array<Record<string, unknown>>
     const records: NormalizedRecord[] = []
@@ -106,18 +107,21 @@ function allowlistedPayload(value: Record<string, unknown>): Record<string, unkn
 function normalizeMessageData(value: unknown, includeToolOutput: boolean) {
   const data = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
   const allowed = ["id", "role", "parentID", "mode", "agent", "summary", "model", "path", "time", "tokens", "cost", "finish"]
-  return Object.fromEntries(Object.entries(data).filter(([key]) => includeToolOutput || allowed.includes(key)).map(([key, item]) => [key, sanitizeValue(item)]))
+  const toolFields = ["output", "result", "error"]
+  return Object.fromEntries(Object.entries(data).filter(([key]) => allowed.includes(key) || (includeToolOutput && toolFields.includes(key))).map(([key, item]) => [key, sanitizeValue(item, key)]))
 }
 
 function normalizePartData(value: unknown, includeToolOutput: boolean) {
   const data = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
   const allowed = ["id", "type", "text", "synthetic", "messageID", "sessionID", "time", "hash"]
-  return Object.fromEntries(Object.entries(data).filter(([key]) => includeToolOutput || allowed.includes(key)).map(([key, item]) => [key, sanitizeValue(item)]))
+  const toolFields = ["output", "result", "error"]
+  return Object.fromEntries(Object.entries(data).filter(([key]) => allowed.includes(key) || (includeToolOutput && toolFields.includes(key))).map(([key, item]) => [key, sanitizeValue(item, key)]))
 }
 
-function sanitizeValue(value: unknown): unknown {
+function sanitizeValue(value: unknown, key = ""): unknown {
+  if (/(password|secret|token|api[-_]?key|authorization|cookie|credential)/i.test(key)) return "[REDACTED]"
   if (typeof value === "string") return redact(value).slice(0, 65_536)
-  if (Array.isArray(value)) return value.slice(0, 128).map(sanitizeValue)
-  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).slice(0, 128).map(([key, item]) => [key, sanitizeValue(item)]))
+  if (Array.isArray(value)) return value.slice(0, 128).map((item) => sanitizeValue(item))
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).slice(0, 128).map(([childKey, item]) => [childKey, sanitizeValue(item, childKey)]))
   return value
 }
