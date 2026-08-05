@@ -22,6 +22,8 @@ create table if not exists opencode.source (
   schema_version integer not null,
   locator_fingerprint text not null,
   remote_revision_high_water bigint not null default 0,
+  lease_owner text,
+  lease_until timestamptz,
   created_at timestamptz not null default now(),
   last_seen_at timestamptz not null default now(),
   primary key (installation_id, source_id)
@@ -109,4 +111,6 @@ create index if not exists message_chronology_idx on opencode.message(installati
 create index if not exists part_message_idx on opencode.part(installation_id, source_id, session_id, message_id);
 create index if not exists sync_observation_lag_idx on opencode.sync_observation(observed_at, lag_ms);
 
+alter table opencode.source add column if not exists lease_owner text;
+alter table opencode.source add column if not exists lease_until timestamptz;
 insert into opencode.schema_migration(version) values (1) on conflict (version) do nothing;

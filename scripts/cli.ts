@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { access, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
 import { spawn } from "node:child_process"
-import { createHash } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import path from "node:path"
 import { configPaths, loadConfig } from "../src/config.js"
 import { Database } from "bun:sqlite"
@@ -18,6 +18,7 @@ const stateFlag = flagValue("--state")
 if (configFlag) process.env.BETTER_COMPACT_CONFIG = path.resolve(configFlag)
 if (stateFlag) process.env.BETTER_COMPACT_STATE = path.resolve(stateFlag)
 const paths = configPaths()
+const workerToken = randomUUID()
 
 const command = process.argv[2] ?? "help"
 if (command === "help" || command === "--help" || command === "-h") {
@@ -123,7 +124,11 @@ async function installationMode() {
 
 async function doctor() {
   const checks: Array<[string, boolean, string]> = []
-  const config = await loadConfig(paths)
+  let config: Awaited<ReturnType<typeof loadConfig>>
+  try { config = await loadConfig(paths) } catch (error) {
+    console.log(`FAIL better-compact config: ${error instanceof Error ? error.message : String(error)}`)
+    return 1
+  }
   const mode = await installationMode()
   checks.push(["installation", mode !== "npx", `${mode}: ${process.argv[1] ?? installDir}`])
   checks.push(["better-compact config", await exists(paths.config), paths.config])
@@ -238,11 +243,11 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>) {
         let rows: ReturnType<typeof state.claim> = []
         try {
           await applyRemoteMigration(client, await readFile(path.resolve(path.dirname(process.argv[1] ?? "."), "..", "db/migrations/001_init.sql"), "utf8"))
-          await ensureRemoteSource(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, expectedRevision: state.remoteRevision(sourceID) }, source.kind, inspection.schemaVersion, inspection.layoutFingerprint)
-          const fence = await readRemoteFence(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, expectedRevision: state.remoteRevision(sourceID) })
+          await ensureRemoteSource(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, ownerToken: workerToken, expectedRevision: state.remoteRevision(sourceID) }, source.kind, inspection.schemaVersion, inspection.layoutFingerprint)
+          const fence = await readRemoteFence(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, ownerToken: workerToken, expectedRevision: state.remoteRevision(sourceID) })
           if (fence.revision > state.remoteRevision(sourceID) && !state.reconcileCommitted(sourceID, fence.revision)) throw new Error(`remote revision ${fence.revision} is ahead of local ${state.remoteRevision(sourceID)}; run an explicit reset/adopt workflow`)
           rows = state.claim("postgres", config.sync.batch_size, Date.now(), 60_000, sourceID, fence.revision)
-          const revision = await uploadFenced(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, expectedRevision: fence.revision }, rows)
+          const revision = await uploadFenced(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, ownerToken: workerToken, expectedRevision: fence.revision }, rows)
           state.setRemoteRevision(sourceID, revision)
           state.acknowledge(rows.map((row) => row.id))
           console.log(`uploaded ${rows.length} records from ${filename}`)
@@ -261,7 +266,7 @@ function assertPostgresTLS(url: string) {
   const parsed = new URL(url)
   const local = parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1" || parsed.hostname === "::1"
   const sslmode = parsed.searchParams.get("sslmode")
-  if (!local && sslmode !== "require" && sslmode !== "verify-full") throw new Error("refusing non-local Postgres without sslmode=require or verify-full")
+  if (!local && sslmode !== "verify-full") throw new Error("refusing non-local Postgres without sslmode=verify-full")
   if (!local && sslmode === "disable") throw new Error("refusing sslmode=disable for non-local Postgres")
 }
 
@@ -315,7 +320,7 @@ async function installationAdopt(confirmed: boolean) {
       const inspection = inspectOpenCodeV1(filename)
       const sourceIncarnation = state.sourceIncarnation(sourceID)
       state.upsertSource({ id: sourceID, installationID: installation.id, kind: source.kind, schemaVersion: inspection.schemaVersion, locator: filename, fingerprint: inspection.layoutFingerprint, incarnation: sourceIncarnation })
-      const fence = await readRemoteFence(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, expectedRevision: state.remoteRevision(sourceID) }, true)
+      const fence = await readRemoteFence(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, ownerToken: workerToken, expectedRevision: state.remoteRevision(sourceID) }, true)
       state.adoptSourceIncarnation(sourceID, fence.incarnation)
       state.setRemoteRevision(sourceID, fence.revision)
       state.adoptThrough(sourceID, fence.revision)

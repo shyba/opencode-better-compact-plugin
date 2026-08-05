@@ -8,7 +8,7 @@ function fakeClient(remoteRevision = 0) {
     calls,
     unsafe: async <T>(query: string): Promise<T> => {
       calls.push(query)
-      if (query.includes("for update")) return [{ incarnation: "source-inc", remote_revision_high_water: remoteRevision }] as T
+      if (query.includes("for update")) return [{ incarnation: "source-inc", remote_revision_high_water: remoteRevision, lease_owner: "owner" }] as T
       return [] as T
     },
     begin: async <T>(callback: (transaction: typeof client) => Promise<T>) => callback(client),
@@ -17,7 +17,7 @@ function fakeClient(remoteRevision = 0) {
   return client
 }
 
-const source = { installationID: "install", installationIncarnation: "install-inc", sourceID: "source", incarnation: "source-inc", expectedRevision: 0 }
+const source = { installationID: "install", installationIncarnation: "install-inc", sourceID: "source", incarnation: "source-inc", ownerToken: "owner", expectedRevision: 0 }
 const row = (recordRevision: number): OutboxRow => ({ id: recordRevision, destinationID: "postgres", sourceID: "source", recordKind: "session", naturalKey: `s${recordRevision}`, payloadJSON: JSON.stringify({ title: "safe" }), routingJSON: "{}", payloadSHA256: "hash", recordRevision, operation: "upsert", attempts: 1, observedAt: 1 })
 
 describe("Postgres delivery fences", () => {

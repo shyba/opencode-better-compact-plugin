@@ -11,6 +11,7 @@ export type PostgresSource = {
   installationIncarnation: string
   sourceID: string
   incarnation: string
+  ownerToken: string
   expectedRevision: number
 }
 
@@ -36,6 +37,9 @@ export async function ensureRemoteSource(client: SQLClient, source: PostgresSour
     where opencode.source.incarnation=$3`, [source.installationID, source.sourceID, source.incarnation, kind, schemaVersion, fingerprint])
   const sources = await client.unsafe<Array<{ incarnation: string }>>("select incarnation from opencode.source where installation_id=$1 and source_id=$2", [source.installationID, source.sourceID])
   if (sources[0]?.incarnation !== source.incarnation) throw new Error("Postgres source incarnation fence failed; run installation reset or adopt")
+  const lease = await client.unsafe<Array<{ source_id: string }>>(`update opencode.source set lease_owner=$3, lease_until=now() + interval '30 seconds', last_seen_at=now()
+    where installation_id=$1 and source_id=$2 and incarnation=$4 and (lease_owner is null or lease_until < now() or lease_owner=$3) returning source_id`, [source.installationID, source.sourceID, source.ownerToken, source.incarnation])
+  if (!lease.length) throw new Error("another sync worker owns this source lease; use installation reset or adopt only after confirming it is stopped")
 }
 
 export async function readRemoteFence(client: SQLClient, source: PostgresSource, acceptDifferentIncarnation = false) {
@@ -53,12 +57,12 @@ export async function uploadFenced(client: SQLClient, source: PostgresSource, ro
   if (!rows.length) return source.expectedRevision
   let uploadedHighWater = source.expectedRevision
   await client.begin(async (transaction) => {
-    const sourceRows = await transaction.unsafe<Array<{ incarnation: string; remote_revision_high_water: number }>>(
-      "select incarnation, remote_revision_high_water from opencode.source where installation_id=$1 and source_id=$2 for update",
+    const sourceRows = await transaction.unsafe<Array<{ incarnation: string; remote_revision_high_water: number; lease_owner: string }>>(
+      "select incarnation, remote_revision_high_water, lease_owner from opencode.source where installation_id=$1 and source_id=$2 for update",
       [source.installationID, source.sourceID],
     )
     const remote = sourceRows[0]
-    if (!remote || remote.incarnation !== source.incarnation || Number(remote.remote_revision_high_water) !== source.expectedRevision) {
+    if (!remote || remote.incarnation !== source.incarnation || remote.lease_owner !== source.ownerToken || Number(remote.remote_revision_high_water) !== source.expectedRevision) {
       throw new Error("Postgres source incarnation or revision fence failed; run installation reset or adopt")
     }
     let highWater = source.expectedRevision
@@ -70,8 +74,8 @@ export async function uploadFenced(client: SQLClient, source: PostgresSource, ro
       highWater = row.recordRevision
     }
     await transaction.unsafe(
-      "update opencode.source set remote_revision_high_water=$1, last_seen_at=now() where installation_id=$2 and source_id=$3 and incarnation=$4 and remote_revision_high_water=$5",
-      [highWater, source.installationID, source.sourceID, source.incarnation, source.expectedRevision],
+      "update opencode.source set remote_revision_high_water=$1, lease_until=now() + interval '30 seconds', last_seen_at=now() where installation_id=$2 and source_id=$3 and incarnation=$4 and remote_revision_high_water=$5 and lease_owner=$6",
+      [highWater, source.installationID, source.sourceID, source.incarnation, source.expectedRevision, source.ownerToken],
     )
     uploadedHighWater = highWater
   })

@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises"
+import { mkdir, readFile, rename, writeFile, rm } from "node:fs/promises"
 import path from "node:path"
 
 export type SyncConfig = {
@@ -69,9 +69,13 @@ export async function loadConfig(paths = configPaths()): Promise<BetterCompactCo
 export async function saveConfig(config: BetterCompactConfig, paths = configPaths()) {
   validateConfig(config)
   await mkdir(path.dirname(paths.config), { recursive: true, mode: 0o700 })
-  const temporary = `${paths.config}.tmp-${process.pid}`
-  await writeFile(temporary, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 })
-  await rename(temporary, paths.config)
+  const lock = `${paths.config}.lock`
+  try { await mkdir(lock, { recursive: false, mode: 0o700 }) } catch { throw new Error(`configuration is busy: ${paths.config}`) }
+  try {
+    const temporary = `${paths.config}.tmp-${process.pid}`
+    await writeFile(temporary, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 })
+    await rename(temporary, paths.config)
+  } finally { await rm(lock, { recursive: true, force: true }) }
 }
 
 export function validateConfig(value: unknown): BetterCompactConfig {
@@ -91,6 +95,7 @@ export function validateConfig(value: unknown): BetterCompactConfig {
     sources: object.sources.map((source) => {
       if (!source || typeof source !== "object" || Array.isArray(source)) throw new TypeError("config.sources entries must be objects")
       const entry = source as Record<string, unknown>
+      if (Object.keys(entry).some((key) => key !== "kind" && key !== "database")) throw new TypeError("source contains an unknown key")
       if (typeof entry.kind !== "string" || typeof entry.database !== "string") throw new TypeError("source requires kind and database")
       return { kind: entry.kind, database: entry.database }
     }),

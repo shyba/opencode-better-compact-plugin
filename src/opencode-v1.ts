@@ -23,6 +23,7 @@ export type OpenCodeV1Checkpoint = {
   sessionCreatedAt: number
   sessionID: string
   reconcileBefore: number
+  sessionWatermarks?: Record<string, number>
 }
 
 export function inspectOpenCodeV1(filename: string): OpenCodeV1Inspection {
@@ -63,19 +64,37 @@ export function discoverOpenCodeV1(filename: string, sourceID: string, checkpoin
     const prior = typeof checkpointOrRevision === "number" ? undefined : checkpointOrRevision
     const sourceUpdatedAt = Number((db.query("select max(value) as value from (select coalesce(max(time_updated),0) value from session union all select coalesce(max(time_updated),0) from message union all select coalesce(max(time_updated),0) from part union all select coalesce(max(time_updated),0) from todo)").get() as { value: number | null }).value ?? 0)
     const now = Date.now()
-    if (prior && sourceUpdatedAt <= prior.sourceUpdatedAt && now < prior.reconcileBefore) {
+    const fullReconcile = !prior || now >= prior.reconcileBefore
+    const changedSessionIDs = fullReconcile ? undefined : new Set([
+      ...(db.query("select id from session where time_updated>? or time_created>? order by id").all(prior.sourceUpdatedAt, prior.sourceUpdatedAt) as Array<{ id: string }>).map((row) => String(row.id)),
+      ...(db.query("select distinct session_id as id from message where time_updated>? or time_created>? order by session_id").all(prior.sourceUpdatedAt, prior.sourceUpdatedAt) as Array<{ id: string }>).map((row) => String(row.id)),
+      ...(db.query("select distinct session_id as id from part where time_updated>? or time_created>? order by session_id").all(prior.sourceUpdatedAt, prior.sourceUpdatedAt) as Array<{ id: string }>).map((row) => String(row.id)),
+      ...(db.query("select distinct session_id as id from todo where time_updated>? or time_created>? order by session_id").all(prior.sourceUpdatedAt, prior.sourceUpdatedAt) as Array<{ id: string }>).map((row) => String(row.id)),
+    ])
+    if (prior && !fullReconcile && !changedSessionIDs?.size) {
       db.exec("commit")
       return { records: [], checkpoint: { ...prior, sourceUpdatedAt }, complete: false }
     }
-    const sessions = db.query("select id, time_created, time_updated, title, directory, metadata from session order by time_created, id").all() as Array<Record<string, unknown>>
-    const messages = db.query("select id, session_id, time_created, time_updated, data from message order by session_id, time_created, id").all() as Array<Record<string, unknown>>
-    const parts = includeParts ? db.query("select id, message_id, session_id, time_created, time_updated, data from part order by message_id, id").all() as Array<Record<string, unknown>> : []
-    const todos = db.query("select session_id, position, time_created, time_updated, content, status, priority from todo order by session_id, position").all() as Array<Record<string, unknown>>
-    const messagesBySession = groupBy(messages, (value) => String(value.session_id))
-    const partsByMessage = groupBy(parts, (value) => String(value.message_id))
-    const todosBySession = groupBy(todos, (value) => String(value.session_id))
+    const ids = changedSessionIDs ? [...changedSessionIDs] : []
+    const placeholders = ids.map(() => "?").join(",")
+    const sessions = fullReconcile
+      ? db.query("select id, time_created, time_updated, title, directory, metadata from session order by time_created, id").all()
+      : db.query(`select id, time_created, time_updated, title, directory, metadata from session where id in (${placeholders}) order by time_created, id`).all(...ids)
+    const messages = fullReconcile
+      ? db.query("select id, session_id, time_created, time_updated, data from message order by session_id, time_created, id").all()
+      : db.query(`select id, session_id, time_created, time_updated, data from message where session_id in (${placeholders}) order by session_id, time_created, id`).all(...ids)
+    const parts = includeParts
+      ? (fullReconcile ? db.query("select id, message_id, session_id, time_created, time_updated, data from part order by message_id, id").all() : db.query(`select id, message_id, session_id, time_created, time_updated, data from part where session_id in (${placeholders}) order by message_id, id`).all(...ids))
+      : []
+    const todos = fullReconcile
+      ? db.query("select session_id, position, time_created, time_updated, content, status, priority from todo order by session_id, position").all()
+      : db.query(`select session_id, position, time_created, time_updated, content, status, priority from todo where session_id in (${placeholders}) order by session_id, position`).all(...ids)
+    const sessionRows = sessions as Array<Record<string, unknown>>
+    const messagesBySession = groupBy(messages as Array<Record<string, unknown>>, (value) => String(value.session_id))
+    const partsByMessage = groupBy(parts as Array<Record<string, unknown>>, (value) => String(value.message_id))
+    const todosBySession = groupBy(todos as Array<Record<string, unknown>>, (value) => String(value.session_id))
     const records: NormalizedRecord[] = []
-    for (const session of sessions) {
+    for (const session of sessionRows) {
       const sessionID = String(session.id)
       const sourceCreatedAt = Number(session.time_created ?? 0)
       const sourceUpdatedAt = Number(session.time_updated ?? sourceCreatedAt)
@@ -97,8 +116,10 @@ export function discoverOpenCodeV1(filename: string, sourceID: string, checkpoin
       }
     }
     db.exec("commit")
-    const last = sessions.at(-1)
-    return { records, checkpoint: { sourceUpdatedAt, sessionCreatedAt: Number(last?.time_created ?? 0), sessionID: String(last?.id ?? ""), reconcileBefore: now + 15 * 60_000 }, complete: true }
+    const priorWatermarks = fullReconcile ? {} : { ...(prior?.sessionWatermarks ?? {}) }
+    for (const session of sessionRows) priorWatermarks[String(session.id)] = Number(session.time_updated ?? session.time_created ?? 0)
+    const last = sessionRows.at(-1)
+    return { records, checkpoint: { sourceUpdatedAt, sessionCreatedAt: Number(last?.time_created ?? 0), sessionID: String(last?.id ?? ""), reconcileBefore: now + 15 * 60_000, sessionWatermarks: priorWatermarks }, complete: fullReconcile }
   } catch (error) {
     try { db.exec("rollback") } catch {}
     throw error
