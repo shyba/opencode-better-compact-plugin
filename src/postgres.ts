@@ -30,8 +30,8 @@ export async function recordObservation(client: SQLClient, source: PostgresSourc
     on conflict (installation_id, source_id) do update set observed_at=now(), lag_ms=excluded.lag_ms, records_staged=opencode.sync_observation.records_staged + excluded.records_staged, records_uploaded=opencode.sync_observation.records_uploaded + excluded.records_uploaded`, [source.installationID, source.sourceID, lagMs, staged, uploaded])
 }
 
-export async function purgeRemoteTombstones(client: SQLClient, retentionDays: number) {
-  for (const table of ["session", "message", "part", "todo"]) await client.unsafe(`delete from opencode.${table} where deleted_at is not null and deleted_at < now() - ($1 * interval '1 day')`, [retentionDays])
+export async function purgeRemoteTombstones(client: SQLClient, source: PostgresSource, retentionDays: number) {
+  for (const table of ["session", "message", "part", "todo"]) await client.unsafe(`delete from opencode.${table} where installation_id=$2 and source_id=$3 and deleted_at is not null and deleted_at < now() - ($1 * interval '1 day')`, [retentionDays, source.installationID, source.sourceID])
 }
 
 export async function ensureRemoteSource(client: SQLClient, source: PostgresSource, kind: string, schemaVersion: number, fingerprint: string) {

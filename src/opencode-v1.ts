@@ -24,6 +24,7 @@ export type OpenCodeV1Checkpoint = {
   sessionID: string
   reconcileBefore: number
   sessionWatermarks?: Record<string, number>
+  messageCursors?: Record<string, { timeCreated: number; id: string }>
 }
 
 export function inspectOpenCodeV1(filename: string): OpenCodeV1Inspection {
@@ -66,9 +67,16 @@ export function discoverOpenCodeV1(filename: string, sourceID: string, checkpoin
     const now = Date.now()
     const fullReconcile = !prior || now >= prior.reconcileBefore
     const priorWatermarks = prior?.sessionWatermarks ?? {}
+    const priorMessageCursors = prior?.messageCursors ?? {}
+    const messageMarkers = db.query("select session_id, id, time_created, time_updated from message order by session_id, time_created, id").all() as Array<{ session_id: string; id: string; time_created: number; time_updated: number }>
+    const changedByMessages = messageMarkers.filter((row) => {
+      const cursor = priorMessageCursors[String(row.session_id)]
+      const watermark = Number(priorWatermarks[String(row.session_id)] ?? -1)
+      return !cursor || Number(row.time_created) > cursor.timeCreated || (Number(row.time_created) === cursor.timeCreated && String(row.id) > cursor.id) || Number(row.time_updated ?? row.time_created) > watermark
+    }).map((row) => String(row.session_id))
     const changedSessionIDs = fullReconcile ? undefined : new Set([
       ...(db.query("select id, max(time_updated, time_created) as observed_at from session order by id").all() as Array<{ id: string; observed_at: number }>).filter((row) => Number(row.observed_at) > Number(priorWatermarks[row.id] ?? -1)).map((row) => String(row.id)),
-      ...(db.query("select session_id as id, max(max(time_updated, time_created)) as observed_at from message group by session_id order by session_id").all() as Array<{ id: string; observed_at: number }>).filter((row) => Number(row.observed_at) > Number(priorWatermarks[row.id] ?? -1)).map((row) => String(row.id)),
+      ...changedByMessages,
       ...(db.query("select session_id as id, max(max(time_updated, time_created)) as observed_at from part group by session_id order by session_id").all() as Array<{ id: string; observed_at: number }>).filter((row) => Number(row.observed_at) > Number(priorWatermarks[row.id] ?? -1)).map((row) => String(row.id)),
       ...(db.query("select session_id as id, max(max(time_updated, time_created)) as observed_at from todo group by session_id order by session_id").all() as Array<{ id: string; observed_at: number }>).filter((row) => Number(row.observed_at) > Number(priorWatermarks[row.id] ?? -1)).map((row) => String(row.id)),
     ])
@@ -118,6 +126,12 @@ export function discoverOpenCodeV1(filename: string, sourceID: string, checkpoin
     }
     db.exec("commit")
     const nextWatermarks = fullReconcile ? {} : { ...priorWatermarks }
+    const nextMessageCursors = fullReconcile ? {} : { ...priorMessageCursors }
+    for (const row of messageMarkers) {
+      const key = String(row.session_id)
+      const priorCursor = nextMessageCursors[key]
+      if (!priorCursor || Number(row.time_created) > priorCursor.timeCreated || (Number(row.time_created) === priorCursor.timeCreated && String(row.id) > priorCursor.id)) nextMessageCursors[key] = { timeCreated: Number(row.time_created), id: String(row.id) }
+    }
     for (const session of sessionRows) {
       const sessionID = String(session.id)
       const values = [Number(session.time_updated ?? session.time_created ?? 0)]
@@ -127,7 +141,7 @@ export function discoverOpenCodeV1(filename: string, sourceID: string, checkpoin
       nextWatermarks[sessionID] = Math.max(...values)
     }
     const last = sessionRows.at(-1)
-    return { records, checkpoint: { sourceUpdatedAt, sessionCreatedAt: Number(last?.time_created ?? 0), sessionID: String(last?.id ?? ""), reconcileBefore: now + 15 * 60_000, sessionWatermarks: nextWatermarks }, complete: fullReconcile }
+    return { records, checkpoint: { sourceUpdatedAt, sessionCreatedAt: Number(last?.time_created ?? 0), sessionID: String(last?.id ?? ""), reconcileBefore: now + 15 * 60_000, sessionWatermarks: nextWatermarks, messageCursors: nextMessageCursors }, complete: fullReconcile }
   } catch (error) {
     try { db.exec("rollback") } catch {}
     throw error

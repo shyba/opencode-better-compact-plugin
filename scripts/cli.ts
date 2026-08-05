@@ -264,7 +264,7 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>) {
           state.acknowledge(rows.map((row) => row.id))
           try {
             await recordObservation(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, ownerToken: workerToken, expectedRevision: revision }, result.records.length, rows.length, result.checkpoint.sourceUpdatedAt ? Math.max(0, Date.now() - result.checkpoint.sourceUpdatedAt) : null)
-            await purgeRemoteTombstones(client, config.sync.retention_days)
+            await purgeRemoteTombstones(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, ownerToken: workerToken, expectedRevision: revision }, config.sync.retention_days)
           } catch { console.error("warning: remote observation maintenance failed") }
           console.log(`uploaded ${rows.length} records from ${filename}`)
         } catch (error) {

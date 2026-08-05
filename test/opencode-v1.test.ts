@@ -41,6 +41,11 @@ test("OpenCode V1 adapter validates the migration journal and emits bounded norm
     const changed = discoverOpenCodeV1(filename, "source-1", result.checkpoint)
     expect(changed.complete).toBe(false)
     expect(changed.records.some((record) => record.recordKind === "message" && record.payloadJSON?.includes("assistant"))).toBe(true)
+    const equalTimestampDB = new Database(filename)
+    equalTimestampDB.query("insert into message values (?, ?, ?, ?, ?)").run("msg-2", "ses-1", 3, 3, JSON.stringify({ role: "user" }))
+    equalTimestampDB.close()
+    const equalTimestamp = discoverOpenCodeV1(filename, "source-1", changed.checkpoint)
+    expect(equalTimestamp.records.some((record) => record.naturalKey === "msg-2")).toBe(true)
   } finally {
     await rm(directory, { recursive: true, force: true })
   }
