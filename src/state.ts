@@ -9,7 +9,7 @@ export type Attempt = {
   ledger: RecoveryLedger
   summaryMessageID?: string
   textPartID?: string
-  validation: "pending" | "fallback" | "invalid"
+  validation: "pending" | "provider" | "fallback" | "invalid"
   recoveryUserID?: string
   recoveryComplete?: boolean
 }

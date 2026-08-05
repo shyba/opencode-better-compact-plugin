@@ -198,14 +198,26 @@ async function complete(
   text: string,
   target?: StoredMessage,
 ) {
-  const output = { text }
+  const output = await completeOutput(hooks, sessionID, messageID, partID, text, target)
+  return output.text
+}
+
+async function completeOutput(
+  hooks: Hooks,
+  sessionID: string,
+  messageID: string,
+  partID: string,
+  text: string,
+  target?: StoredMessage,
+) {
+  const output: { text: string; retry?: boolean } = { text }
   await hooks["experimental.text.complete"]?.({ sessionID, messageID, partID }, output)
   const part = target?.parts.find((item) => {
     const value = item as { id?: string; type?: string }
     return value.id === partID && value.type === "text"
   }) as { text?: string } | undefined
   if (part) part.text = output.text
-  return output.text
+  return output
 }
 
 async function autocontinue(
@@ -583,7 +595,7 @@ describe("model-visible history sanitization", () => {
     await hooks["experimental.chat.messages.transform"]?.({}, transformOutput(providerHistory))
     expect((providerHistory.at(-1)?.parts[0] as { text: string }).text).toContain("historical text omitted")
     expect((fixture.messages.at(-1)?.parts[0] as { text: string }).text).toBe(overflowText)
-    expect(mock.messageLimits).toEqual([10_000, 10_000, 256])
+    expect(mock.messageLimits).toEqual([10_000, 256])
   })
 
   test("paginates only until two durable pre-compaction requests prove an overflow replay", async () => {
@@ -609,8 +621,8 @@ describe("model-visible history sanitization", () => {
 
     expect((providerHistory.at(-1)?.parts[0] as { text: string }).text).toContain("historical text omitted")
     expect((fixture.messages.at(-1)?.parts[0] as { text: string }).text).toBe(overflowText)
-    expect(mock.messageLimits).toEqual([10_000, 256, 256])
-    expect(mock.messageCursors).toEqual([undefined, undefined, "cursor-1"])
+    expect(mock.messageLimits).toEqual([10_000])
+    expect(mock.messageCursors).toEqual([undefined])
   })
 
   test("targets the durable overflow replay without truncating a later admitted user request", async () => {
@@ -799,7 +811,7 @@ describe("model-visible history sanitization", () => {
 })
 
 describe("real hook compaction flows", () => {
-  test("manual compaction installs the deterministic single-response prompt", async () => {
+  test("manual compaction installs the model-led single-response prompt", async () => {
     const sessionID = "manual"
     const fixture = { messages: [user("manual-user", sessionID, "Must finish the manual request")], todos: [] }
     const mock = state([sessionID, fixture])
@@ -807,8 +819,8 @@ describe("real hook compaction flows", () => {
     const output = await compact(hooks, sessionID)
     const ledger = expectedLedger(fixture)
 
-    expect(output.prompt).toStartWith("Return exactly the Markdown below")
-    expect(output.prompt).toContain("Do not add commentary or code fences around it")
+    expect(output.prompt).toStartWith("Compact the bounded recovery ledger below")
+    expect(output.prompt).toContain("Choose Goal from the substantive recent_requests")
     for (const section of REQUIRED_SECTIONS) expect(output.prompt).toContain(`## ${section}`)
     expect(output.prompt).toEndWith(ledger.block)
     expect(mock.messageLimits).toEqual([10_000])
@@ -984,7 +996,7 @@ describe("real hook compaction flows", () => {
     expect(mock.messageCursors.at(-1)).toBe("cursor-255")
   })
 
-  test("replaces structurally valid provider prose with the deterministic authoritative summary", async () => {
+  test("accepts a structurally valid model-authored summary with the current ledger", async () => {
     const sessionID = "valid"
     const fixture = { messages: [user("valid-user", sessionID, "Must retain this request")], todos: [] }
     const mock = state([sessionID, fixture])
@@ -993,13 +1005,10 @@ describe("real hook compaction flows", () => {
     const exchange = compactionExchange(sessionID, "")
     fixture.messages.push(exchange.request, exchange.summary)
     const ledger = expectedLedger(fixture, exchange.summary.info.id)
-    const original = summaryFor(ledger, "password=provider-secret unsupported deployment completed")
-    const authoritative = buildAuthoritativeSummary({ ledger, maxBytes: Number(TEST_OPTIONS.max_summary_bytes) })
+    const original = summaryFor(ledger, "The active request remains in progress")
 
-    expect(await complete(hooks, sessionID, exchange.summary.info.id, exchange.partIDs[0]!, original, exchange.summary)).toBe(authoritative)
-    expect(authoritative).not.toContain("provider-secret")
-    expect(authoritative).not.toContain("unsupported deployment completed")
-    expect(isAuthoritativeSummary(authoritative, Number(TEST_OPTIONS.max_summary_bytes))).toBe(true)
+    expect(await complete(hooks, sessionID, exchange.summary.info.id, exchange.partIDs[0]!, original, exchange.summary)).toBe(original)
+    expect(isPluginValidSummary(original, Number(TEST_OPTIONS.max_summary_bytes))).toBe(true)
     expect(await autocontinue(hooks, sessionID)).toBe(true)
   })
 
@@ -1026,11 +1035,13 @@ describe("real hook compaction flows", () => {
       await compact(hooks, sessionID)
       const exchange = compactionExchange(sessionID, "")
       fixture.messages.push(exchange.request, exchange.summary)
-      const fallback = await complete(hooks, sessionID, exchange.summary.info.id, exchange.partIDs[0]!, providerText, exchange.summary)
+      const fallbackOutput = await completeOutput(hooks, sessionID, exchange.summary.info.id, exchange.partIDs[0]!, providerText, exchange.summary)
+      const fallback = fallbackOutput.text
 
       expect(fallback).not.toContain(providerText)
       expect(isPluginValidSummary(fallback, Number(TEST_OPTIONS.max_summary_bytes))).toBe(true)
       expect(isAuthoritativeSummary(fallback, Number(TEST_OPTIONS.max_summary_bytes))).toBe(true)
+      expect(fallbackOutput.retry).toBe(true)
       expect(parsePluginLedger(fallback)?.data.recent_requests).toEqual(["Do not lose this fact"])
       expect(await autocontinue(hooks, sessionID)).toBe(true)
     },
@@ -1068,7 +1079,7 @@ describe("real hook compaction flows", () => {
     const first = await complete(hooks, sessionID, exchange.summary.info.id, "part-one", providerFirstPart, exchange.summary)
     const second = await complete(hooks, sessionID, exchange.summary.info.id, "part-two", "extra response text", exchange.summary)
 
-    expect(first).not.toBe(providerFirstPart)
+    expect(first).toBe(providerFirstPart)
     expect(isPluginValidSummary(first, Number(TEST_OPTIONS.max_summary_bytes))).toBe(true)
     expect(second).toBe("")
     expect(await autocontinue(hooks, sessionID)).toBe(true)

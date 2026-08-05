@@ -6,7 +6,6 @@ import { AttemptStore, type Attempt } from "./state.js"
 import {
   buildAuthoritativeSummary,
   buildCompactionPrompt,
-  isAuthoritativeSummary,
   isPluginValidSummary,
   parsePluginLedger,
   recoveryContext,
@@ -269,15 +268,26 @@ export async function server(input: PluginInput, rawOptions?: OpenCodePluginOpti
         }
         attempt.textPartID = hookInput.partID
         attempt.summaryMessageID = hookInput.messageID
-        const text = buildAuthoritativeSummary({
+        const candidate = output.text.trimEnd()
+        const candidateLedger = parsePluginLedger(candidate)
+        if (
+          targetTextParts >= 1 &&
+          candidateLedger?.block === attempt.ledger.block &&
+          isPluginValidSummary(candidate, options.max_summary_bytes)
+        ) {
+          output.text = candidate
+          attempt.validation = "provider"
+          return
+        }
+        output.text = buildAuthoritativeSummary({
           ledger: attempt.ledger,
           maxBytes: options.max_summary_bytes,
         })
-        const validation = targetTextParts >= 1 && isAuthoritativeSummary(text, options.max_summary_bytes)
-          ? "fallback"
-          : "invalid"
-        output.text = text
-        attempt.validation = validation
+        attempt.validation = "fallback"
+        // Newer V1 hosts can discard this provisional response and retry the model.
+        // The current host ignores unknown output fields and safely retains the bounded fallback.
+        const retryOutput = output as typeof output & { retry?: boolean }
+        retryOutput.retry = true
       }, () => {
         const attempt = attempts.get(hookInput.sessionID)
         if (!attempt) return
@@ -300,7 +310,7 @@ export async function server(input: PluginInput, rawOptions?: OpenCodePluginOpti
           current &&
           !(active?.summaryMessageID === current.info.id && active.validation === "invalid") &&
           parsedLedger &&
-          isAuthoritativeSummary(text, options.max_summary_bytes)
+          isPluginValidSummary(text, options.max_summary_bytes)
         ) {
           const rebuilt = await rebuildAttempt(input, options, hookInput.sessionID, current.info.id, data)
           if (rebuilt.ledger.block === parsedLedger.block) {
@@ -637,7 +647,7 @@ function compactionSummaryForParent(messages: MessageRecord[], parentID: string)
 function invalidCompactionBeforeNewestUser(messages: MessageRecord[], maxSummaryBytes: number) {
   const ordered = chronological(messages)
   const summary = newestCompactionSummary(ordered)
-  if (!summary || (!summary.info.error && isAuthoritativeSummary(summaryText(summary, maxSummaryBytes), maxSummaryBytes))) return
+  if (!summary || (!summary.info.error && isPluginValidSummary(summaryText(summary, maxSummaryBytes), maxSummaryBytes))) return
   const summaryIndex = ordered.indexOf(summary)
   const laterUser = ordered
     .slice(summaryIndex + 1)
@@ -662,7 +672,7 @@ async function sanitizeOverflowReplay(
       (message) =>
         message.info.role === "assistant" &&
         record(message.info)?.summary === true &&
-        isAuthoritativeSummary(
+        isPluginValidSummary(
           summaryText(message as MessageRecord, options.max_summary_bytes),
           options.max_summary_bytes,
         ),

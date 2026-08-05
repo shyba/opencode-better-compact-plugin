@@ -28,9 +28,43 @@ const TERSE_ACKNOWLEDGEMENTS = new Set([
 ])
 
 export function buildCompactionPrompt(ledger: RecoveryLedger, maxBytes: number) {
-  return `Return exactly the Markdown below, byte-for-byte, in one response. Do not add commentary or code fences around it.
+  return `Compact the bounded recovery ledger below into the exact Markdown contract that follows. You are responsible for choosing the semantically active goal and the useful fields; do not mechanically copy every entry.
 
-${buildAuthoritativeSummary({ ledger, maxBytes })}`
+Before answering, silently check:
+- Choose Goal from the substantive recent_requests, ignoring terse acknowledgements such as "check", "continue", or "save" unless no substantive request exists.
+- Keep only constraints, todos, paths, evidence, errors, and next actions relevant to resuming the active work.
+- Treat possible stale todos as questions to surface, never as completed work.
+- Do not invent facts, files, decisions, evidence, blockers, or actions outside the ledger.
+- Preserve the recovery-ledger block byte-for-byte, including its SHA-256 digest.
+- Keep the complete response within ${maxBytes} UTF-8 bytes.
+
+Return only the Markdown summary, with no commentary or code fences around the response. Keep every heading in this order:
+
+## Goal
+- [the active user goal]
+
+## Constraints
+- [relevant ledger-backed constraints, or a truthful placeholder]
+
+## Decisions
+- [ledger-backed decisions only, or a truthful placeholder]
+
+## Current state
+- [concise ledger-backed state]
+
+## Files
+- [relevant explicit paths only, or a truthful placeholder]
+
+## Evidence
+- [bounded ledger-backed evidence only, or a truthful placeholder]
+
+## Blockers/questions
+- [ledger-backed blockers and unresolved questions, or a truthful placeholder]
+
+## Next actions
+- [concrete ledger-grounded next actions]
+
+${ledger.block}`
 }
 
 export function validateSummary(text: string, expected: RecoveryLedger, maxBytes: number) {

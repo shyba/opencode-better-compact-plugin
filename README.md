@@ -1,6 +1,6 @@
 # opencode-safe-compaction
 
-`opencode-safe-compaction` is a global OpenCode V1 plugin that builds a bounded recovery ledger and replaces every nonempty compaction response with an exact deterministic ledger projection. Provider-authored prose is never authoritative. Its separate TUI entrypoint provides a native compaction-model selector. It is an independent MIT-licensed repository and makes no OpenCode core changes.
+`opencode-safe-compaction` is a global OpenCode V1 plugin that builds a bounded recovery ledger and asks the compaction model to choose the semantically active recovery fields. A structurally valid model-authored summary is accepted only when it preserves the current canonical ledger block and digest. Its separate TUI entrypoint provides a native compaction-model selector. It is an independent MIT-licensed repository and makes no OpenCode core changes.
 
 The package is private at version `0.1.0`. Git/source-path installation is the supported installation path for now; the package metadata and exports are ready for a later npm release.
 
@@ -54,6 +54,8 @@ curl -fsSL https://raw.githubusercontent.com/shyba/opencode-better-compact-plugi
 Other supported overrides are `OPENCODE_SAFE_COMPACTION_DIR`, `OPENCODE_SAFE_COMPACTION_CONFIG_DIR`, `OPENCODE_SAFE_COMPACTION_REPO`, and `OPENCODE_SAFE_COMPACTION_REF` (an alternate branch or exact lowercase 40-character commit). Exact commits are fetched and checked out detached. All directory overrides must be absolute. The installer respects an existing `OPENCODE_CONFIG_DIR`. It refuses insecure `http://` and `git://` repository URLs, including an insecure existing origin that would otherwise normalize to the requested HTTPS GitHub repository. It also refuses a dirty checkout, a mismatched remote or branch, duplicate or unverifiable plugin entries, and configurations containing the stale `deepseek-v4-flash-free` limit override. It never rewrites provider catalogs.
 
 The source plugin has no runtime package dependencies, so the installer does not populate `node_modules`. OpenCode may manage its standard plugin SDK in the configuration directory when it first loads a TUI plugin. A bootstrapped Bun is temporary and is not installed into the user account or retained by the plugin; the in-app selector uses OpenCode's own Bun runtime. Restart a running OpenCode server after installation.
+
+During compaction, the model receives the bounded ledger and a single-response Markdown contract. It may summarize relevant goals, constraints, decisions, state, files, evidence, blockers, and actions instead of copying every ledger entry. The plugin rejects missing sections, invented ledger digests, oversized output, refusals, and split/empty responses. On current V1, those failures are replaced with a bounded ledger-grounded summary so the host remains usable; the hook also marks that provisional result with an optimistic `retry` signal, which a retry-capable future host can use to discard it and retry the model before cutover. Current V1 ignores unknown output fields, so no OpenCode fork is required.
 
 ## Manual Git installation
 
