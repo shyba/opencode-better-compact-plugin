@@ -19,7 +19,7 @@ const stateFlag = flagValue("--state")
 if (configFlag) process.env.BETTER_COMPACT_CONFIG = path.resolve(configFlag)
 if (stateFlag) process.env.BETTER_COMPACT_STATE = path.resolve(stateFlag)
 const paths = configPaths()
-const workerToken = machineWorkerToken()
+const workerToken = machineWorkerToken(paths.state)
 
 const command = process.argv[2] ?? "help"
 if (command === "help" || command === "--help" || command === "-h") {
@@ -83,8 +83,8 @@ function flagValue(flag: string) {
   return index >= 0 ? process.argv[index + 1] : undefined
 }
 
-function machineWorkerToken() {
-  try { return createHash("sha256").update(readFileSync("/etc/machine-id", "utf8")).digest("hex") }
+function machineWorkerToken(statePath: string) {
+  try { return createHash("sha256").update(`${readFileSync("/etc/machine-id", "utf8")}\n${statePath}`).digest("hex") }
   catch { return randomUUID() }
 }
 
