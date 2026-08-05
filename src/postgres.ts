@@ -18,6 +18,10 @@ export function openPostgres(url: string) {
   return new constructor(url)
 }
 
+export async function applyRemoteMigration(client: SQLClient, sql: string) {
+  await client.unsafe(sql)
+}
+
 export async function ensureRemoteSource(client: SQLClient, source: PostgresSource, kind: string, schemaVersion: number, fingerprint: string) {
   await client.unsafe(`insert into opencode.installation(installation_id, incarnation, label)
     values ($1,$2,$3)
@@ -29,14 +33,14 @@ export async function ensureRemoteSource(client: SQLClient, source: PostgresSour
     where opencode.source.incarnation=$3`, [source.installationID, source.sourceID, source.incarnation, kind, schemaVersion, fingerprint])
 }
 
-export async function readRemoteFence(client: SQLClient, source: PostgresSource) {
+export async function readRemoteFence(client: SQLClient, source: PostgresSource, acceptDifferentIncarnation = false) {
   const rows = await client.unsafe<Array<{ incarnation: string; remote_revision_high_water: number }>>(
     "select incarnation, remote_revision_high_water from opencode.source where installation_id=$1 and source_id=$2",
     [source.installationID, source.sourceID],
   )
   const row = rows[0]
   if (!row) return { incarnation: source.incarnation, revision: 0 }
-  if (row.incarnation !== source.incarnation) throw new Error("Postgres source incarnation fence failed; run installation reset or adopt")
+  if (row.incarnation !== source.incarnation && !acceptDifferentIncarnation) throw new Error("Postgres source incarnation fence failed; run installation reset or adopt")
   return { incarnation: row.incarnation, revision: Number(row.remote_revision_high_water) }
 }
 
@@ -74,33 +78,33 @@ async function upsertRecord(client: SQLClient, source: PostgresSource, row: Outb
   if (!table) throw new Error(`unsupported remote record kind: ${row.recordKind}`)
   const deleted = row.operation === "delete" ? new Date() : null
   if (table === "session") {
-    await client.unsafe(`insert into opencode.session(installation_id, source_id, session_id, title, metadata, record_revision, deleted_at)
-      values ($1,$2,$3,$4,$5,$6,$7)
-      on conflict (installation_id, source_id, session_id) do update set title=excluded.title, metadata=excluded.metadata, record_revision=excluded.record_revision, deleted_at=excluded.deleted_at, synced_at=now()
-      where excluded.record_revision > opencode.session.record_revision`, [source.installationID, source.sourceID, row.naturalKey, stringValue(payload.title), payload, row.recordRevision, deleted])
+    await client.unsafe(`insert into opencode.session(installation_id, source_id, session_id, parent_session_id, directory, title, model, metadata, source_created_at, source_updated_at, record_revision, deleted_at)
+      values ($1,$2,$3,$4,$5,$6,$7,$8,to_timestamp($9 / 1000.0),to_timestamp($10 / 1000.0),$11,$12)
+      on conflict (installation_id, source_id, session_id) do update set parent_session_id=excluded.parent_session_id, directory=excluded.directory, title=excluded.title, model=excluded.model, metadata=excluded.metadata, source_created_at=excluded.source_created_at, source_updated_at=excluded.source_updated_at, record_revision=excluded.record_revision, deleted_at=excluded.deleted_at, synced_at=now()
+      where excluded.record_revision > opencode.session.record_revision`, [source.installationID, source.sourceID, row.naturalKey, stringValue(payload.parent_session_id), stringValue(payload.directory), stringValue(payload.title), objectValue(payload.model), objectValue(payload.metadata), Number(payload.source_created_at ?? 0), Number(payload.source_updated_at ?? 0), row.recordRevision, deleted])
     return
   }
   if (table === "message") {
     const data = objectValue(payload.data)
-    await client.unsafe(`insert into opencode.message(installation_id, source_id, session_id, message_id, role, summary, data, record_revision, deleted_at)
-      values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-      on conflict (installation_id, source_id, session_id, message_id) do update set role=excluded.role, summary=excluded.summary, data=excluded.data, record_revision=excluded.record_revision, deleted_at=excluded.deleted_at, synced_at=now()
-      where excluded.record_revision > opencode.message.record_revision`, [source.installationID, source.sourceID, stringValue(payload.session_id), row.naturalKey, stringValue(data.role) ?? "unknown", data.summary === true, data, row.recordRevision, deleted])
+    await client.unsafe(`insert into opencode.message(installation_id, source_id, session_id, message_id, role, parent_id, summary, data, source_created_at, source_updated_at, record_revision, deleted_at)
+      values ($1,$2,$3,$4,$5,$6,$7,$8,to_timestamp($9 / 1000.0),to_timestamp($10 / 1000.0),$11,$12)
+      on conflict (installation_id, source_id, session_id, message_id) do update set role=excluded.role, parent_id=excluded.parent_id, summary=excluded.summary, data=excluded.data, source_created_at=excluded.source_created_at, source_updated_at=excluded.source_updated_at, record_revision=excluded.record_revision, deleted_at=excluded.deleted_at, synced_at=now()
+      where excluded.record_revision > opencode.message.record_revision`, [source.installationID, source.sourceID, stringValue(payload.session_id), row.naturalKey, stringValue(data.role) ?? "unknown", stringValue(data.parentID), data.summary === true, data, Number(payload.source_created_at ?? 0), Number(payload.source_updated_at ?? 0), row.recordRevision, deleted])
     return
   }
   if (table === "part") {
     const data = objectValue(payload.data)
-    await client.unsafe(`insert into opencode.part(installation_id, source_id, session_id, message_id, part_id, part_type, data, record_revision, deleted_at)
-      values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-      on conflict (installation_id, source_id, session_id, message_id, part_id) do update set part_type=excluded.part_type, data=excluded.data, record_revision=excluded.record_revision, deleted_at=excluded.deleted_at, synced_at=now()
-      where excluded.record_revision > opencode.part.record_revision`, [source.installationID, source.sourceID, stringValue(payload.session_id), stringValue(payload.message_id), row.naturalKey.split(":").at(-1), stringValue(data.type) ?? "unknown", data, row.recordRevision, deleted])
+    await client.unsafe(`insert into opencode.part(installation_id, source_id, session_id, message_id, part_id, part_type, data, source_created_at, source_updated_at, record_revision, deleted_at)
+      values ($1,$2,$3,$4,$5,$6,$7,to_timestamp($8 / 1000.0),to_timestamp($9 / 1000.0),$10,$11)
+      on conflict (installation_id, source_id, session_id, message_id, part_id) do update set part_type=excluded.part_type, data=excluded.data, source_created_at=excluded.source_created_at, source_updated_at=excluded.source_updated_at, record_revision=excluded.record_revision, deleted_at=excluded.deleted_at, synced_at=now()
+      where excluded.record_revision > opencode.part.record_revision`, [source.installationID, source.sourceID, stringValue(payload.session_id), stringValue(payload.message_id), row.naturalKey.split(":").at(-1), stringValue(data.type) ?? "unknown", data, Number(payload.source_created_at ?? 0), Number(payload.source_updated_at ?? 0), row.recordRevision, deleted])
     return
   }
   const data = payload
-  await client.unsafe(`insert into opencode.todo(installation_id, source_id, session_id, position, data, record_revision, deleted_at)
-    values ($1,$2,$3,$4,$5,$6,$7)
-    on conflict (installation_id, source_id, session_id, position) do update set data=excluded.data, record_revision=excluded.record_revision, deleted_at=excluded.deleted_at, synced_at=now()
-    where excluded.record_revision > opencode.todo.record_revision`, [source.installationID, source.sourceID, stringValue(data.session_id), Number(data.position), data, row.recordRevision, deleted])
+  await client.unsafe(`insert into opencode.todo(installation_id, source_id, session_id, position, data, source_updated_at, record_revision, deleted_at)
+    values ($1,$2,$3,$4,$5,to_timestamp($6 / 1000.0),$7,$8)
+    on conflict (installation_id, source_id, session_id, position) do update set data=excluded.data, source_updated_at=excluded.source_updated_at, record_revision=excluded.record_revision, deleted_at=excluded.deleted_at, synced_at=now()
+    where excluded.record_revision > opencode.todo.record_revision`, [source.installationID, source.sourceID, stringValue(data.session_id), Number(data.position), data, Number(data.source_updated_at ?? 0), row.recordRevision, deleted])
 }
 
 function objectValue(value: unknown) {

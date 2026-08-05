@@ -40,6 +40,19 @@ export class SyncState {
       create index if not exists outbox_ready_idx on outbox(destination_id, state, next_attempt_at, record_revision);
     `)
     this.db.query("insert or ignore into schema_migration(version, applied_at) values (1, ?)").run(Date.now())
+    this.applyLocalMigrations()
+  }
+
+  private applyLocalMigrations() {
+    const migrations = [
+      [2, "normalized_record", "routing_json"],
+      [3, "outbox", "routing_json"],
+    ] as const
+    for (const [version, table, column] of migrations) {
+      const exists = (this.db.query(`pragma table_info(${table})`).all() as Array<{ name: string }>).some((row) => row.name === column)
+      if (!exists) this.db.exec(`alter table ${table} add column ${column} text`)
+      this.db.query("insert or ignore into schema_migration(version, applied_at) values (?, ?)").run(version, Date.now())
+    }
   }
 
   close() { this.db.close() }
@@ -59,6 +72,9 @@ export class SyncState {
   }
 
   upsertSource(source: { id: string; installationID: string; kind: string; schemaVersion: number; locator: string; fingerprint?: string; incarnation: string }) {
+    const existing = this.db.query("select fingerprint, installation_id from source where id=?").get(source.id) as { fingerprint?: string; installation_id: string } | null
+    if (existing?.fingerprint && source.fingerprint && existing.fingerprint !== source.fingerprint) throw new Error(`source layout fingerprint changed for ${source.id}; inspect the migration before syncing`)
+    if (existing?.installation_id && existing.installation_id !== source.installationID) throw new Error(`source ${source.id} belongs to a different installation`)
     this.db.query(`insert into source(id, installation_id, kind, schema_version, canonical_locator, fingerprint, incarnation, created_at, last_seen_at)
       values (?, ?, ?, ?, ?, ?, ?, ?, ?)
       on conflict(id) do update set last_seen_at=excluded.last_seen_at, fingerprint=excluded.fingerprint`).run(source.id, source.installationID, source.kind, source.schemaVersion, source.locator, source.fingerprint ?? null, source.incarnation, Date.now(), Date.now())
@@ -67,6 +83,10 @@ export class SyncState {
   sourceIncarnation(sourceID: string, fallback = randomUUID()) {
     const row = this.db.query("select incarnation from source where id=?").get(sourceID) as { incarnation: string } | null
     return row?.incarnation ?? fallback
+  }
+
+  adoptSourceIncarnation(sourceID: string, incarnation: string) {
+    this.db.query("update source set incarnation=? where id=?").run(incarnation, sourceID)
   }
 
   nextRevision(sourceID: string) {
@@ -81,6 +101,12 @@ export class SyncState {
 
   setRemoteRevision(sourceID: string, revision: number) {
     this.db.query("update source set remote_revision_high_water=? where id=?").run(revision, sourceID)
+  }
+
+  checkpoint(sourceID: string, stream = "messages") {
+    const row = this.db.query("select checkpoint_json from source_cursor where source_id=? and stream=?").get(sourceID, stream) as { checkpoint_json: string } | null
+    if (!row) return undefined
+    try { return JSON.parse(row.checkpoint_json) as Record<string, unknown> } catch { return undefined }
   }
 
   enqueue(records: NormalizedRecord[], sourceID: string, stream: string, checkpoint: unknown, destinationID = "postgres", snapshot?: { complete: boolean; recordKinds: string[] }, maxOutboxBytes = Number.POSITIVE_INFINITY) {
@@ -137,6 +163,7 @@ export class SyncState {
   }
 
   acknowledge(ids: number[]) { if (ids.length) this.db.query(`delete from outbox where id in (${ids.map(() => "?").join(",")})`).run(...ids) }
+  adoptThrough(sourceID: string, revision: number, destinationID = "postgres") { this.db.query("delete from outbox where source_id=? and destination_id=? and record_revision<=? and state!='leased'").run(sourceID, destinationID, revision) }
   fail(ids: number[], error: string, nextAttemptAt = Date.now() + 30_000) { if (ids.length) this.db.query(`update outbox set state='failed', lease_until=null, last_error=?, next_attempt_at=? where id in (${ids.map(() => "?").join(",")})`).run(error.slice(0, 1000), nextAttemptAt, ...ids) }
   pendingCount(destinationID = "postgres") { const row = this.db.query("select count(*) as value from outbox where destination_id=?").get(destinationID) as { value: number }; return Number(row.value) }
   purgePayloads(retentionMs: number) { this.db.query("update normalized_record set payload_json=null where observed_at<? and not exists (select 1 from outbox where outbox.source_id=normalized_record.source_id and outbox.record_kind=normalized_record.record_kind and outbox.natural_key=normalized_record.natural_key)").run(Date.now() - retentionMs) }

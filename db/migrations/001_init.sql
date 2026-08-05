@@ -1,6 +1,11 @@
 -- better-compact remote schema v1
 create schema if not exists opencode;
 
+create table if not exists opencode.schema_migration (
+  version integer primary key,
+  applied_at timestamptz not null default now()
+);
+
 create table if not exists opencode.installation (
   installation_id uuid primary key,
   incarnation text not null,
@@ -103,3 +108,5 @@ create table if not exists opencode.sync_observation (
 create index if not exists message_chronology_idx on opencode.message(installation_id, source_id, session_id, source_created_at, message_id);
 create index if not exists part_message_idx on opencode.part(installation_id, source_id, session_id, message_id);
 create index if not exists sync_observation_lag_idx on opencode.sync_observation(observed_at, lag_ms);
+
+insert into opencode.schema_migration(version) values (1) on conflict (version) do nothing;

@@ -16,9 +16,9 @@ test("OpenCode V1 adapter validates the migration journal and emits bounded norm
     create table message (id text primary key, session_id text, time_created integer, time_updated integer, data text);
     create table part (id text primary key, message_id text, session_id text, time_created integer, time_updated integer, data text);
     create table todo (session_id text, position integer, time_created integer, time_updated integer, content text, status text, priority text);
-    insert into session values ('ses-1', 1, 2, 'Keep', '/tmp/project', '{"secret":"password=hidden"}');
+    insert into session values ('ses-1', 1, 2, 'Keep', '/tmp/project', '{"secret":"password=hidden","nested":{"apiKey":"still-hidden"}}');
     insert into message values ('msg-1', 'ses-1', 3, 4, '{"role":"user","text":"hello"}');
-    insert into part values ('part-1', 'msg-1', 'ses-1', 5, 6, '{"type":"text","text":"token=hidden","output":"tool secret"}');
+    insert into part values ('part-1', 'msg-1', 'ses-1', 5, 6, '{"type":"text","text":"token=hidden","output":"tool secret","attachment":"data:text/plain;base64,c2VjcmV0"}');
     insert into todo values ('ses-1', 0, 7, 8, 'check', 'pending', 'high');
   `)
   db.close()
@@ -29,7 +29,12 @@ test("OpenCode V1 adapter validates the migration journal and emits bounded norm
     expect(result.records.every((record) => !record.payloadJSON?.includes("password=hidden"))).toBe(true)
     expect(result.records.every((record) => !record.payloadJSON?.includes("token=hidden"))).toBe(true)
     expect(result.records.every((record) => !record.payloadJSON?.includes("tool secret"))).toBe(true)
+    expect(result.records.every((record) => !record.payloadJSON?.includes("still-hidden"))).toBe(true)
+    expect(result.records.every((record) => !record.payloadJSON?.includes("c2VjcmV0"))).toBe(true)
     expect(result.checkpoint.sessionID).toBe("ses-1")
+    const unchanged = discoverOpenCodeV1(filename, "source-1", result.checkpoint)
+    expect(unchanged.records).toHaveLength(0)
+    expect(unchanged.complete).toBe(false)
   } finally {
     await rm(directory, { recursive: true, force: true })
   }
