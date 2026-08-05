@@ -21,6 +21,7 @@ describe("portable better-compact state", () => {
   test("validates the versioned config and rejects unknown keys", () => {
     expect(validateConfig({ version: 1, sync: {}, sources: [], installation: { name: "server" } }).installation.name).toBe("server")
     expect(() => validateConfig({ version: 1, sync: { unknown: true }, sources: [] })).toThrow("unknown key")
+    expect(() => validateConfig({ version: 1, sync: {}, sources: [{ kind: "fixture", database: "db", extra: true }] })).toThrow("source contains an unknown key")
   })
 
   test("enqueues, leases, and acknowledges records transactionally", async () => {
@@ -105,5 +106,20 @@ describe("portable better-compact state", () => {
     expect(state.remoteRevision("source-1")).toBe(1)
     expect(state.pendingCount()).toBe(0)
     state.close()
+  })
+
+  test("replays an expired lease after reopening the state database", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "better-compact-state-"))
+    temporary.push(directory)
+    const filename = path.join(directory, "state.sqlite")
+    const first = await openSyncState(filename)
+    first.ensureInstallation("install-1", "incarnation-1")
+    first.upsertSource({ id: "source-1", installationID: "install-1", kind: "fixture", schemaVersion: 1, locator: "fixture://one", incarnation: "source-inc-1" })
+    first.enqueue([{ sourceID: "source-1", recordKind: "message", naturalKey: "m1", payloadJSON: "one", payloadSHA256: "one", observedAt: 1 }], "source-1", "messages", {})
+    first.claim("postgres", 1, 2, 10, "source-1", 0)
+    first.close()
+    const reopened = await openSyncState(filename)
+    expect(reopened.claim("postgres", 1, 20, 10, "source-1", 0)).toHaveLength(1)
+    reopened.close()
   })
 })

@@ -52,6 +52,22 @@ test("OpenCode V1 adapter validates the migration journal and emits bounded norm
 })
 
 describe("OpenCode V1 adapter safety", () => {
+  test("reads within the busy budget during an active writer transaction", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "better-compact-opencode-"))
+    const filename = path.join(directory, "opencode.db")
+    const writer = new Database(filename)
+    writer.exec("create table probe(value integer); insert into probe values (1); begin immediate")
+    const reader = new Database(filename, { readonly: true })
+    reader.exec("pragma query_only=on; pragma busy_timeout=1000")
+    const started = performance.now()
+    expect((reader.query("select count(*) as value from probe").get() as { value: number }).value).toBe(1)
+    expect(performance.now() - started).toBeLessThan(100)
+    reader.close()
+    writer.exec("rollback")
+    writer.close()
+    await rm(directory, { recursive: true, force: true })
+  })
+
   test("rejects a source without the migration journal", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "better-compact-opencode-"))
     const filename = path.join(directory, "opencode.db")
