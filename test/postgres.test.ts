@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { uploadFenced } from "../src/postgres.js"
+import { ensureRemoteSource, uploadFenced } from "../src/postgres.js"
 import type { OutboxRow } from "../src/sync-state.js"
 
 function fakeClient(remoteRevision = 0) {
@@ -21,6 +21,23 @@ const source = { installationID: "install", installationIncarnation: "install-in
 const row = (recordRevision: number): OutboxRow => ({ id: recordRevision, destinationID: "postgres", sourceID: "source", recordKind: "session", naturalKey: `s${recordRevision}`, payloadJSON: JSON.stringify({ title: "safe" }), routingJSON: "{}", payloadSHA256: "hash", recordRevision, operation: "upsert", attempts: 1, observedAt: 1 })
 
 describe("Postgres delivery fences", () => {
+  test("fences installation and source identities before leasing a worker", async () => {
+    const calls: string[] = []
+    const client = {
+      unsafe: async <T>(query: string): Promise<T> => {
+        calls.push(query)
+        if (query.includes("select incarnation from opencode.installation")) return [{ incarnation: "install-inc" }] as T
+        if (query.includes("select incarnation from opencode.source")) return [{ incarnation: "source-inc" }] as T
+        if (query.includes("returning source_id")) return [{ source_id: "source" }] as T
+        return [] as T
+      },
+      begin: async <T>(callback: (transaction: typeof client) => Promise<T>) => callback(client),
+      close: async () => {},
+    }
+    await ensureRemoteSource(client, source, "fixture", 1, "fingerprint")
+    expect(calls.some((query) => query.includes("lease_owner"))).toBe(true)
+  })
+
   test("applies a contiguous batch and advances its source fence", async () => {
     const client = fakeClient()
     const highWater = await uploadFenced(client, source, [row(1), row(2)])

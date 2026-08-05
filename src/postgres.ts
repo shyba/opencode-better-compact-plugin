@@ -24,6 +24,16 @@ export async function applyRemoteMigration(client: SQLClient, sql: string) {
   await client.unsafe(sql)
 }
 
+export async function recordObservation(client: SQLClient, source: PostgresSource, staged: number, uploaded: number, lagMs: number | null) {
+  await client.unsafe(`insert into opencode.sync_observation(installation_id, source_id, lag_ms, records_staged, records_uploaded)
+    values ($1,$2,$3,$4,$5)
+    on conflict (installation_id, source_id) do update set observed_at=now(), lag_ms=excluded.lag_ms, records_staged=opencode.sync_observation.records_staged + excluded.records_staged, records_uploaded=opencode.sync_observation.records_uploaded + excluded.records_uploaded`, [source.installationID, source.sourceID, lagMs, staged, uploaded])
+}
+
+export async function purgeRemoteTombstones(client: SQLClient, retentionDays: number) {
+  for (const table of ["session", "message", "part", "todo"]) await client.unsafe(`delete from opencode.${table} where deleted_at is not null and deleted_at < now() - ($1 * interval '1 day')`, [retentionDays])
+}
+
 export async function ensureRemoteSource(client: SQLClient, source: PostgresSource, kind: string, schemaVersion: number, fingerprint: string) {
   await client.unsafe(`insert into opencode.installation(installation_id, incarnation, label)
     values ($1,$2,$3)

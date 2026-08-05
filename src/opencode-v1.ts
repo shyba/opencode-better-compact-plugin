@@ -65,11 +65,12 @@ export function discoverOpenCodeV1(filename: string, sourceID: string, checkpoin
     const sourceUpdatedAt = Number((db.query("select max(value) as value from (select coalesce(max(time_updated),0) value from session union all select coalesce(max(time_updated),0) from message union all select coalesce(max(time_updated),0) from part union all select coalesce(max(time_updated),0) from todo)").get() as { value: number | null }).value ?? 0)
     const now = Date.now()
     const fullReconcile = !prior || now >= prior.reconcileBefore
+    const priorWatermarks = prior?.sessionWatermarks ?? {}
     const changedSessionIDs = fullReconcile ? undefined : new Set([
-      ...(db.query("select id from session where time_updated>? or time_created>? order by id").all(prior.sourceUpdatedAt, prior.sourceUpdatedAt) as Array<{ id: string }>).map((row) => String(row.id)),
-      ...(db.query("select distinct session_id as id from message where time_updated>? or time_created>? order by session_id").all(prior.sourceUpdatedAt, prior.sourceUpdatedAt) as Array<{ id: string }>).map((row) => String(row.id)),
-      ...(db.query("select distinct session_id as id from part where time_updated>? or time_created>? order by session_id").all(prior.sourceUpdatedAt, prior.sourceUpdatedAt) as Array<{ id: string }>).map((row) => String(row.id)),
-      ...(db.query("select distinct session_id as id from todo where time_updated>? or time_created>? order by session_id").all(prior.sourceUpdatedAt, prior.sourceUpdatedAt) as Array<{ id: string }>).map((row) => String(row.id)),
+      ...(db.query("select id, max(time_updated, time_created) as observed_at from session order by id").all() as Array<{ id: string; observed_at: number }>).filter((row) => Number(row.observed_at) > Number(priorWatermarks[row.id] ?? -1)).map((row) => String(row.id)),
+      ...(db.query("select session_id as id, max(max(time_updated, time_created)) as observed_at from message group by session_id order by session_id").all() as Array<{ id: string; observed_at: number }>).filter((row) => Number(row.observed_at) > Number(priorWatermarks[row.id] ?? -1)).map((row) => String(row.id)),
+      ...(db.query("select session_id as id, max(max(time_updated, time_created)) as observed_at from part group by session_id order by session_id").all() as Array<{ id: string; observed_at: number }>).filter((row) => Number(row.observed_at) > Number(priorWatermarks[row.id] ?? -1)).map((row) => String(row.id)),
+      ...(db.query("select session_id as id, max(max(time_updated, time_created)) as observed_at from todo group by session_id order by session_id").all() as Array<{ id: string; observed_at: number }>).filter((row) => Number(row.observed_at) > Number(priorWatermarks[row.id] ?? -1)).map((row) => String(row.id)),
     ])
     if (prior && !fullReconcile && !changedSessionIDs?.size) {
       db.exec("commit")
@@ -116,10 +117,17 @@ export function discoverOpenCodeV1(filename: string, sourceID: string, checkpoin
       }
     }
     db.exec("commit")
-    const priorWatermarks = fullReconcile ? {} : { ...(prior?.sessionWatermarks ?? {}) }
-    for (const session of sessionRows) priorWatermarks[String(session.id)] = Number(session.time_updated ?? session.time_created ?? 0)
+    const nextWatermarks = fullReconcile ? {} : { ...priorWatermarks }
+    for (const session of sessionRows) {
+      const sessionID = String(session.id)
+      const values = [Number(session.time_updated ?? session.time_created ?? 0)]
+      for (const message of messagesBySession.get(sessionID) ?? []) values.push(Number(message.time_updated ?? message.time_created ?? 0))
+      for (const todo of todosBySession.get(sessionID) ?? []) values.push(Number(todo.time_updated ?? todo.time_created ?? 0))
+      for (const message of messagesBySession.get(sessionID) ?? []) for (const part of partsByMessage.get(String(message.id)) ?? []) values.push(Number(part.time_updated ?? part.time_created ?? 0))
+      nextWatermarks[sessionID] = Math.max(...values)
+    }
     const last = sessionRows.at(-1)
-    return { records, checkpoint: { sourceUpdatedAt, sessionCreatedAt: Number(last?.time_created ?? 0), sessionID: String(last?.id ?? ""), reconcileBefore: now + 15 * 60_000, sessionWatermarks: priorWatermarks }, complete: fullReconcile }
+    return { records, checkpoint: { sourceUpdatedAt, sessionCreatedAt: Number(last?.time_created ?? 0), sessionID: String(last?.id ?? ""), reconcileBefore: now + 15 * 60_000, sessionWatermarks: nextWatermarks }, complete: fullReconcile }
   } catch (error) {
     try { db.exec("rollback") } catch {}
     throw error

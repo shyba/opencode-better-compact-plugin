@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { access, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
+import { readFileSync } from "node:fs"
 import { spawn } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
 import path from "node:path"
@@ -7,7 +8,7 @@ import { configPaths, loadConfig } from "../src/config.js"
 import { Database } from "bun:sqlite"
 import { discoverOpenCodeV1, inspectOpenCodeV1 } from "../src/opencode-v1.js"
 import type { OpenCodeV1Checkpoint } from "../src/opencode-v1.js"
-import { applyRemoteMigration, ensureRemoteSource, openPostgres, readRemoteFence, uploadFenced } from "../src/postgres.js"
+import { applyRemoteMigration, ensureRemoteSource, openPostgres, purgeRemoteTombstones, readRemoteFence, recordObservation, uploadFenced } from "../src/postgres.js"
 import { openSyncState } from "../src/sync-state.js"
 
 const installDir = path.resolve(process.env.OPENCODE_SAFE_COMPACTION_DIR ?? path.join(process.env.HOME ?? ".", ".local/share/opencode/plugins/safe-compaction"))
@@ -18,7 +19,7 @@ const stateFlag = flagValue("--state")
 if (configFlag) process.env.BETTER_COMPACT_CONFIG = path.resolve(configFlag)
 if (stateFlag) process.env.BETTER_COMPACT_STATE = path.resolve(stateFlag)
 const paths = configPaths()
-const workerToken = randomUUID()
+const workerToken = machineWorkerToken()
 
 const command = process.argv[2] ?? "help"
 if (command === "help" || command === "--help" || command === "-h") {
@@ -82,6 +83,11 @@ function flagValue(flag: string) {
   return index >= 0 ? process.argv[index + 1] : undefined
 }
 
+function machineWorkerToken() {
+  try { return createHash("sha256").update(readFileSync("/etc/machine-id", "utf8")).digest("hex") }
+  catch { return randomUUID() }
+}
+
 async function update() {
   const mode = await installationMode()
   if (mode !== "git") {
@@ -141,6 +147,12 @@ async function doctor() {
   checks.push(["SQLite database", await exists(databasePath), databasePath])
   checks.push(["OpenCode executable", await commandWorks(process.env.OPENCODE_SAFE_COMPACTION_OPENCODE ?? "opencode", ["--version"]), process.env.OPENCODE_SAFE_COMPACTION_OPENCODE ?? "opencode"])
   checks.push(["Bun executable", await commandWorks(process.env.OPENCODE_SAFE_COMPACTION_BUN ?? "bun", ["--version"]), process.env.OPENCODE_SAFE_COMPACTION_BUN ?? "bun"])
+  if (config.sync.enabled) {
+    const databaseURL = process.env[config.sync.database_url_env]
+    let remoteOK = Boolean(databaseURL)
+    if (databaseURL) { try { assertPostgresTLS(databaseURL) } catch { remoteOK = false } }
+    checks.push(["sync database URL", remoteOK, config.sync.database_url_env])
+  }
 
   for (const [name, ok, detail] of checks) console.log(`${ok ? "OK" : "FAIL"} ${name}: ${detail}`)
   if (!checks.every((check) => check[1])) return 1
@@ -250,6 +262,10 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>) {
           const revision = await uploadFenced(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, ownerToken: workerToken, expectedRevision: fence.revision }, rows)
           state.setRemoteRevision(sourceID, revision)
           state.acknowledge(rows.map((row) => row.id))
+          try {
+            await recordObservation(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, ownerToken: workerToken, expectedRevision: revision }, result.records.length, rows.length, result.checkpoint.sourceUpdatedAt ? Math.max(0, Date.now() - result.checkpoint.sourceUpdatedAt) : null)
+            await purgeRemoteTombstones(client, config.sync.retention_days)
+          } catch { console.error("warning: remote observation maintenance failed") }
           console.log(`uploaded ${rows.length} records from ${filename}`)
         } catch (error) {
           state.fail(rows.map((row) => row.id), error instanceof Error ? error.message : String(error))
