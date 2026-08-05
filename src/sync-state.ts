@@ -126,6 +126,11 @@ export class SyncState {
     if (!ids.length) return
     this.db.query(`delete from outbox where id in (${ids.map(() => "?").join(",")})`).run(...ids)
   }
+
+  pendingCount(destinationID = "postgres") {
+    const row = this.db.query("select count(*) as value from outbox where destination_id=?").get(destinationID) as { value: number }
+    return Number(row.value)
+  }
 }
 
 export async function openSyncState(filename: string) {

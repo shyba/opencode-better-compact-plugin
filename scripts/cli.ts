@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { access, readFile, stat } from "node:fs/promises"
+import { access, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
 import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
 import path from "node:path"
@@ -26,11 +26,13 @@ if (command === "doctor") {
   process.exit(await doctor())
 }
 if (command === "sync") {
-  if (process.argv[3] !== "run") {
-    console.error("Usage: better-compact sync run")
-    process.exit(2)
-  }
-  process.exit(await syncRun())
+  const action = process.argv[3]
+  if (action === "run") process.exit(await syncRun(process.argv[4] === "--once"))
+  if (action === "status") process.exit(await syncStatus())
+  if (action === "install") process.exit(await syncInstall())
+  if (action === "uninstall") process.exit(await syncUninstall())
+  console.error("Usage: better-compact sync run [--once] | status | install | uninstall")
+  process.exit(2)
 }
 console.error(`Unknown command: ${command}`)
 printHelp()
@@ -43,7 +45,9 @@ Usage:
   better-compact install  Activate the plugin using the selected installation mode
   better-compact update   Update the managed checkout and verify configuration
   better-compact doctor   Check installation, OpenCode, configuration, and SQLite access
-  better-compact sync run Discover configured sources and stage redacted records locally
+  better-compact sync run [--once] Discover sources and deliver redacted records
+  better-compact sync status Show local outbox status
+  better-compact sync install|uninstall Manage a systemd user service
   better-compact help     Show this help
 
 Environment overrides:
@@ -88,12 +92,20 @@ async function doctor() {
   return 0
 }
 
-async function syncRun() {
+async function syncRun(once: boolean) {
   const config = await loadConfig(paths)
   if (!config.sync.enabled) {
     console.log("sync disabled; set sync.enabled=true in the better-compact config")
     return 0
   }
+  do {
+    await syncPass(config)
+    if (once) return 0
+    await new Promise((resolve) => setTimeout(resolve, config.sync.poll_interval_ms))
+  } while (true)
+}
+
+async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>) {
   const state = await openSyncState(paths.state)
   try {
     const installation = state.ensureDefaultInstallation()
@@ -121,9 +133,44 @@ async function syncRun() {
         }
       }
     }
+  } finally { state.close() }
+}
+
+async function syncStatus() {
+  const state = await openSyncState(paths.state)
+  try {
+    console.log(`state: ${paths.state}`)
+    console.log(`pending outbox: ${state.pendingCount()}`)
+    return 0
   } finally {
     state.close()
   }
+}
+
+async function syncInstall() {
+  if (process.platform !== "linux") {
+    console.error("sync install currently supports systemd user services on Linux; use sync run for foreground mode")
+    return 2
+  }
+  const serviceDirectory = path.join(process.env.XDG_CONFIG_HOME ?? path.join(process.env.HOME ?? ".", ".config"), "systemd", "user")
+  const service = path.join(serviceDirectory, "better-compact-sync.service")
+  const executable = process.env.BETTER_COMPACT_EXECUTABLE ?? `${process.execPath} ${process.argv[1]}`
+  await mkdir(serviceDirectory, { recursive: true, mode: 0o700 })
+  await writeFile(`${service}.tmp-${process.pid}`, `[Unit]\nDescription=Better Compact session sync\nAfter=default.target\n\n[Service]\nExecStart=${executable} sync run\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n`, { mode: 0o644 })
+  await rename(`${service}.tmp-${process.pid}`, service)
+  const reload = await run("systemctl", ["--user", "daemon-reload"], process.env)
+  if (reload !== 0) return reload
+  const enabled = await run("systemctl", ["--user", "enable", "--now", "better-compact-sync.service"], process.env)
+  if (enabled === 0) console.log(`installed ${service}`)
+  return enabled
+}
+
+async function syncUninstall() {
+  const service = path.join(process.env.XDG_CONFIG_HOME ?? path.join(process.env.HOME ?? ".", ".config"), "systemd", "user", "better-compact-sync.service")
+  await run("systemctl", ["--user", "disable", "--now", "better-compact-sync.service"], process.env)
+  await rm(service, { force: true })
+  await run("systemctl", ["--user", "daemon-reload"], process.env)
+  console.log(`removed ${service}`)
   return 0
 }
 

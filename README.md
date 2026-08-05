@@ -61,9 +61,13 @@ The installer also creates `better-compact` in the user bin directory when a per
 better-compact help
 better-compact doctor
 better-compact update
+better-compact sync run --once
+better-compact sync status
 ```
 
 `doctor` checks the managed checkout, both OpenCode configuration surfaces, the OpenCode and Bun executables, and performs a read-only SQLite probe. `update` runs the same rollback-safe checkout/configuration transaction as the installer. If Bun was bootstrapped temporarily during installation, install Bun separately or invoke the CLI with `OPENCODE_SAFE_COMPACTION_BUN=/path/to/bun`.
+
+The sync runner reads configured OpenCode V1 SQLite sources read-only, stages redacted records in the stable local state database, and uploads bounded batches when the configured Postgres environment variable is present. `--once` performs one reconciliation pass; without it, the runner continues polling. Postgres failures leave leased outbox rows for retry and do not affect OpenCode.
 
 During compaction, the model receives the bounded ledger and a single-response Markdown contract. It may summarize relevant goals, constraints, decisions, state, files, evidence, blockers, and actions instead of copying every ledger entry. The plugin rejects missing sections, invented ledger digests, oversized output, refusals, and split/empty responses. On current V1, those failures are replaced with a bounded ledger-grounded summary so the host remains usable; the hook also marks that provisional result with an optimistic `retry` signal, which a retry-capable future host can use to discard it and retry the model before cutover. Current V1 ignores unknown output fields, so no OpenCode fork is required.
 
