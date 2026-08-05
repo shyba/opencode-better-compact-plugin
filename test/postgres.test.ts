@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { ensureRemoteSource, uploadFenced } from "../src/postgres.js"
+import { ensureRemoteSource, purgeRemoteTombstones, uploadFenced } from "../src/postgres.js"
 import type { OutboxRow } from "../src/sync-state.js"
 
 function fakeClient(remoteRevision = 0) {
@@ -47,5 +47,13 @@ describe("Postgres delivery fences", () => {
 
   test("rejects a revision gap before applying the later record", async () => {
     await expect(uploadFenced(fakeClient(), source, [row(1), row(3)])).rejects.toThrow("non-contiguous")
+  })
+
+  test("scopes remote tombstone retention to one source", async () => {
+    const queries: string[] = []
+    const client = { unsafe: async <T>(query: string) => { queries.push(query); return [] as T }, begin: async () => { throw new Error("unused") }, close: async () => {} }
+    await purgeRemoteTombstones(client, source, 90)
+    expect(queries).toHaveLength(4)
+    expect(queries.every((query) => query.includes("installation_id=$2 and source_id=$3"))).toBe(true)
   })
 })
