@@ -103,6 +103,13 @@ export class SyncState {
     this.db.query("update source set remote_revision_high_water=? where id=?").run(revision, sourceID)
   }
 
+  reconcileCommitted(sourceID: string, revision: number, destinationID = "postgres") {
+    if (this.nextRevision(sourceID) < revision) return false
+    this.setRemoteRevision(sourceID, revision)
+    this.db.query("delete from outbox where source_id=? and destination_id=? and record_revision<=?").run(sourceID, destinationID, revision)
+    return true
+  }
+
   checkpoint(sourceID: string, stream = "messages") {
     const row = this.db.query("select checkpoint_json from source_cursor where source_id=? and stream=?").get(sourceID, stream) as { checkpoint_json: string } | null
     if (!row) return undefined

@@ -118,6 +118,7 @@ async function doctor() {
   const mode = await installationMode()
   checks.push(["installation", mode !== "npx", `${mode}: ${process.argv[1] ?? installDir}`])
   checks.push(["better-compact config", await exists(paths.config), paths.config])
+  checks.push(["config permissions", await userOnly(paths.config), paths.config])
   checks.push(["better-compact state parent", await exists(path.dirname(paths.state)), path.dirname(paths.state)])
   checks.push(["state permissions", await userOnly(paths.state), paths.state])
   checks.push(["configuration directory", await exists(configDir), configDir])
@@ -228,11 +229,11 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>) {
         let rows: ReturnType<typeof state.claim> = []
         try {
           await applyRemoteMigration(client, await readFile(path.resolve(path.dirname(process.argv[1] ?? "."), "..", "db/migrations/001_init.sql"), "utf8"))
-          await ensureRemoteSource(client, { installationID: installation.id, sourceID, incarnation: sourceIncarnation, expectedRevision: state.remoteRevision(sourceID) }, source.kind, inspection.schemaVersion, inspection.layoutFingerprint)
-          const fence = await readRemoteFence(client, { installationID: installation.id, sourceID, incarnation: sourceIncarnation, expectedRevision: state.remoteRevision(sourceID) })
-          if (fence.revision > state.remoteRevision(sourceID)) throw new Error(`remote revision ${fence.revision} is ahead of local ${state.remoteRevision(sourceID)}; run an explicit reset/adopt workflow`)
+          await ensureRemoteSource(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, expectedRevision: state.remoteRevision(sourceID) }, source.kind, inspection.schemaVersion, inspection.layoutFingerprint)
+          const fence = await readRemoteFence(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, expectedRevision: state.remoteRevision(sourceID) })
+          if (fence.revision > state.remoteRevision(sourceID) && !state.reconcileCommitted(sourceID, fence.revision)) throw new Error(`remote revision ${fence.revision} is ahead of local ${state.remoteRevision(sourceID)}; run an explicit reset/adopt workflow`)
           rows = state.claim("postgres", config.sync.batch_size, Date.now(), 60_000, sourceID, fence.revision)
-          const revision = await uploadFenced(client, { installationID: installation.id, sourceID, incarnation: sourceIncarnation, expectedRevision: fence.revision }, rows)
+          const revision = await uploadFenced(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, expectedRevision: fence.revision }, rows)
           state.setRemoteRevision(sourceID, revision)
           state.acknowledge(rows.map((row) => row.id))
           console.log(`uploaded ${rows.length} records from ${filename}`)
@@ -260,6 +261,9 @@ async function syncStatus() {
   try {
     console.log(`state: ${paths.state}`)
     console.log(`pending outbox: ${state.pendingCount()}`)
+    console.log(`outbox bytes: ${state.outboxBytes()}`)
+    const sources = state.db.query("select id, remote_revision_high_water, last_seen_at from source order by id").all() as Array<{ id: string; remote_revision_high_water?: number; last_seen_at: number }>
+    for (const source of sources) console.log(`source ${source.id}: remote_revision=${Number(source.remote_revision_high_water ?? 0)} last_seen=${source.last_seen_at}`)
     return 0
   } finally {
     state.close()
@@ -302,7 +306,7 @@ async function installationAdopt(confirmed: boolean) {
       const inspection = inspectOpenCodeV1(filename)
       const sourceIncarnation = state.sourceIncarnation(sourceID)
       state.upsertSource({ id: sourceID, installationID: installation.id, kind: source.kind, schemaVersion: inspection.schemaVersion, locator: filename, fingerprint: inspection.layoutFingerprint, incarnation: sourceIncarnation })
-      const fence = await readRemoteFence(client, { installationID: installation.id, sourceID, incarnation: sourceIncarnation, expectedRevision: state.remoteRevision(sourceID) }, true)
+      const fence = await readRemoteFence(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, expectedRevision: state.remoteRevision(sourceID) }, true)
       state.adoptSourceIncarnation(sourceID, fence.incarnation)
       state.setRemoteRevision(sourceID, fence.revision)
       state.adoptThrough(sourceID, fence.revision)

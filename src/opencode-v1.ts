@@ -11,6 +11,7 @@ const REQUIRED_COLUMNS = {
 } as const
 
 export type OpenCodeV1Inspection = {
+  adapterEnvelopeVersion: 1
   schemaVersion: number
   layoutFingerprint: string
   migrations: string[]
@@ -40,13 +41,14 @@ export function inspectOpenCodeV1(filename: string): OpenCodeV1Inspection {
         : []
     if (!migrations.length) throw new Error("OpenCode V1 source has no recognized migration journal")
     const schemaVersion = migrations.length
+    if (schemaVersion > 64) throw new Error(`OpenCode V1 schema migration count ${schemaVersion} is outside the supported range 1..64`)
     const signatures = Object.keys(REQUIRED_COLUMNS).map((table) => {
       const columns = (db.query(`pragma table_info(${table})`).all() as Array<{ name: string; type: string; notnull: number; pk: number }>).map((row) => `${row.name}:${row.type}:${row.notnull}:${row.pk}`).join(",")
       const indexes = (db.query(`pragma index_list(${table})`).all() as Array<{ name: string; unique: number }>).map((row) => `${row.name}:${row.unique}`).sort().join(",")
       return `${table}|columns=${columns}|indexes=${indexes}`
     })
     const layoutFingerprint = createHash("sha256").update(`${migrations.join("\n")}\n${signatures.join("\n")}`).digest("hex")
-    return { schemaVersion, layoutFingerprint, migrations, tables }
+    return { adapterEnvelopeVersion: 1, schemaVersion, layoutFingerprint, migrations, tables }
   } finally {
     db.close()
   }

@@ -93,4 +93,17 @@ describe("portable better-compact state", () => {
     expect(state.claim("postgres", 10, 3, 60_000, "source-1", 0)).toHaveLength(1)
     state.close()
   })
+
+  test("reconciles a committed remote prefix after a local acknowledgement crash", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "better-compact-state-"))
+    temporary.push(directory)
+    const state = await openSyncState(path.join(directory, "state.sqlite"))
+    state.ensureInstallation("install-1", "incarnation-1")
+    state.upsertSource({ id: "source-1", installationID: "install-1", kind: "fixture", schemaVersion: 1, locator: "fixture://one", incarnation: "source-inc-1" })
+    state.enqueue([{ sourceID: "source-1", recordKind: "message", naturalKey: "m1", payloadJSON: "one", payloadSHA256: "one", observedAt: 1 }], "source-1", "messages", {})
+    expect(state.reconcileCommitted("source-1", 1)).toBe(true)
+    expect(state.remoteRevision("source-1")).toBe(1)
+    expect(state.pendingCount()).toBe(0)
+    state.close()
+  })
 })

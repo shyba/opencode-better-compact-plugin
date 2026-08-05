@@ -8,6 +8,7 @@ type SQLClient = {
 
 export type PostgresSource = {
   installationID: string
+  installationIncarnation: string
   sourceID: string
   incarnation: string
   expectedRevision: number
@@ -26,11 +27,15 @@ export async function ensureRemoteSource(client: SQLClient, source: PostgresSour
   await client.unsafe(`insert into opencode.installation(installation_id, incarnation, label)
     values ($1,$2,$3)
     on conflict (installation_id) do update set last_seen_at=now()
-    where opencode.installation.incarnation=$2`, [source.installationID, source.incarnation, source.installationID])
+    where opencode.installation.incarnation=$2`, [source.installationID, source.installationIncarnation, source.installationID])
+  const installations = await client.unsafe<Array<{ incarnation: string }>>("select incarnation from opencode.installation where installation_id=$1", [source.installationID])
+  if (installations[0]?.incarnation !== source.installationIncarnation) throw new Error("Postgres installation incarnation fence failed; run installation reset or adopt")
   await client.unsafe(`insert into opencode.source(installation_id, source_id, incarnation, kind, schema_version, locator_fingerprint)
     values ($1,$2,$3,$4,$5,$6)
     on conflict (installation_id, source_id) do update set last_seen_at=now()
     where opencode.source.incarnation=$3`, [source.installationID, source.sourceID, source.incarnation, kind, schemaVersion, fingerprint])
+  const sources = await client.unsafe<Array<{ incarnation: string }>>("select incarnation from opencode.source where installation_id=$1 and source_id=$2", [source.installationID, source.sourceID])
+  if (sources[0]?.incarnation !== source.incarnation) throw new Error("Postgres source incarnation fence failed; run installation reset or adopt")
 }
 
 export async function readRemoteFence(client: SQLClient, source: PostgresSource, acceptDifferentIncarnation = false) {
