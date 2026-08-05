@@ -1,4 +1,5 @@
 import type { RecoveryLedger } from "./ledger.js"
+import type { ProjectedSummary } from "./projection.js"
 
 export const ATTEMPT_TTL_MS = 30 * 60 * 1_000
 export const MAX_ATTEMPTS = 128
@@ -7,6 +8,7 @@ export type Attempt = {
   sessionID: string
   createdAt: number
   ledger: RecoveryLedger
+  projection?: ProjectedSummary
   summaryMessageID?: string
   textPartID?: string
   validation: "pending" | "provider" | "fallback" | "invalid"

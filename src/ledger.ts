@@ -230,6 +230,15 @@ export function buildRecoveryLedger(input: {
       if (value.type !== "tool" || typeof value.tool !== "string") continue
       const state = record(value.state)
       if (!state || typeof state.status !== "string") continue
+      if (/^(write|edit|patch|apply[_-]?patch|write[_-]?file|edit[_-]?file|str_replace_editor)$/i.test(value.tool)) {
+        const input = record(state.input)
+        for (const key of ["path", "filename", "filePath", "targetPath"] as const) {
+          if (typeof input?.[key] === "string") addBoundedPath(touchedPaths, input[key])
+        }
+        const file = record(input?.file)
+        if (typeof file?.path === "string") addBoundedPath(touchedPaths, file.path)
+        if (typeof file?.filename === "string") addBoundedPath(touchedPaths, file.filename)
+      }
       if (toolStatuses.length < LEDGER_LIMITS.tool_statuses) {
         const status: { tool: string; status: string; title?: string } = {
           tool: compact(value.tool, 96),

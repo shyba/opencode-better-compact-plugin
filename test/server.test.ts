@@ -3,12 +3,14 @@ import type { Config, Hooks, PluginInput } from "@opencode-ai/plugin"
 import {
   buildRecoveryLedger,
   canonicalLedger,
+  type RecoveryLedgerData,
   sha256,
   type MessageRecord,
   type RecoveryLedger,
   type TodoRecord,
   utf8Bytes,
 } from "../src/ledger.js"
+import { ledgerReferenceID } from "../src/projection.js"
 import { parseOptions, resolveOptions } from "../src/options.js"
 import { decodedDataUrlBytes, sanitizeHistory, server } from "../src/server.js"
 import {
@@ -17,6 +19,7 @@ import {
   isAuthoritativeSummary,
   isPluginValidSummary,
   parsePluginLedger,
+  parseProjectedSummary,
 } from "../src/validation.js"
 
 type StoredMessage = MessageRecord & {
@@ -55,7 +58,7 @@ const TEST_OPTIONS = {
   max_inline_data_bytes: 3,
   max_historical_part_bytes: 128,
   max_ledger_bytes: 4_096,
-  max_summary_bytes: 8_192,
+  max_summary_bytes: 12_288,
 } satisfies Record<string, unknown>
 
 function state(...fixtures: Array<[string, SessionFixture]>): MockState {
@@ -1009,6 +1012,36 @@ describe("real hook compaction flows", () => {
 
     expect(await complete(hooks, sessionID, exchange.summary.info.id, exchange.partIDs[0]!, original, exchange.summary)).toBe(original)
     expect(isPluginValidSummary(original, Number(TEST_OPTIONS.max_summary_bytes))).toBe(true)
+    expect(await autocontinue(hooks, sessionID)).toBe(true)
+  })
+
+  test("accepts model JSON and renders a durable validated projection", async () => {
+    const sessionID = "valid-json"
+    const requestText = "Must retain this JSON projection request"
+    const fixture = { messages: [user("valid-json-user", sessionID, requestText)], todos: [] }
+    const mock = state([sessionID, fixture])
+    const hooks = await server(pluginInput(mock), TEST_OPTIONS)
+    await compact(hooks, sessionID)
+    const exchange = compactionExchange(sessionID, "")
+    fixture.messages.push(exchange.request, exchange.summary)
+    const ledger = expectedLedger(fixture, exchange.summary.info.id)
+    const ref = (section: keyof RecoveryLedgerData, value: unknown) => [ledgerReferenceID(section, value)]
+    const candidate = {
+      version: 1,
+      goal: { text: requestText, ledger_refs: ref("recent_requests", requestText) },
+      constraints: [],
+      decisions: [],
+      current_state: [],
+      files: [],
+      evidence: [],
+      blockers: [],
+      next_actions: [],
+      ledger_sha256: ledger.digest,
+    }
+    const output = await completeOutput(hooks, sessionID, exchange.summary.info.id, exchange.partIDs[0]!, JSON.stringify(candidate), exchange.summary)
+    expect(output.retry).toBeUndefined()
+    expect(parseProjectedSummary(output.text, ledger)?.goal.text).toBe(requestText)
+    expect(output.text).toContain("opencode-safe-compaction projection v1 start")
     expect(await autocontinue(hooks, sessionID)).toBe(true)
   })
 

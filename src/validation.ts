@@ -9,6 +9,15 @@ import {
   type RecoveryLedger,
   type RecoveryLedgerData,
 } from "./ledger.js"
+import {
+  parseProjectionBlock,
+  parseProjectionJSON,
+  projectionBudget,
+  renderProjection,
+  validateProjection,
+  ledgerReferenceGuide,
+  type ProjectedSummary,
+} from "./projection.js"
 
 export const REQUIRED_SECTIONS = [
   "Goal",
@@ -27,44 +36,43 @@ const TERSE_ACKNOWLEDGEMENTS = new Set([
   "k", "yep", "nope", "true", "false", "save", "wait", "load", "next", "ping", "sure", "fine", "great",
 ])
 
-export function buildCompactionPrompt(ledger: RecoveryLedger, maxBytes: number) {
-  return `Compact the bounded recovery ledger below into the exact Markdown contract that follows. You are responsible for choosing the semantically active goal and the useful fields; do not mechanically copy every entry.
+export function buildCompactionPrompt(ledger: RecoveryLedger, maxBytes: number, priorProjection?: ProjectedSummary) {
+  const budget = projectionBudget(maxBytes, Math.min(maxBytes, utf8Bytes(ledger.block)))
+  return `Compact the bounded recovery ledger below into exactly one JSON object. You are responsible for choosing the semantically active goal and useful fields; do not mechanically copy every entry.
 
 Before answering, silently check:
 - Choose Goal from the substantive recent_requests, ignoring terse acknowledgements such as "check", "continue", or "save" unless no substantive request exists.
 - Keep only constraints, todos, paths, evidence, errors, and next actions relevant to resuming the active work.
 - Treat possible stale todos as questions to surface, never as completed work.
 - Do not invent facts, files, decisions, evidence, blockers, or actions outside the ledger.
-- Preserve the recovery-ledger block byte-for-byte, including its SHA-256 digest.
-- Keep the complete response within ${maxBytes} UTF-8 bytes.
+- Every claim must include stable ledger_refs from the ledger entries; files use evidence_refs.
+- Use JSON only: no Markdown fences, commentary, duplicate keys, or trailing text.
+- The JSON must include version=1, all required fields, and ledger_sha256=${ledger.digest}.
+- Keep the JSON response within ${Math.max(2_048, budget)} UTF-8 bytes so the rendered summary remains within ${maxBytes} bytes.
 
-Return only the Markdown summary, with no commentary or code fences around the response. Keep every heading in this order:
+Required JSON shape:
+{"version":1,"goal":{"text":"...","ledger_refs":["..."]},"constraints":[{"text":"...","ledger_refs":["..."]}],"decisions":[{"text":"...","ledger_refs":["..."]}],"current_state":[{"text":"...","ledger_refs":["..."]}],"files":[{"path":"...","status":"changed","summary":"...","evidence_refs":["..."]}],"evidence":[{"text":"...","ledger_refs":["..."]}],"blockers":[{"text":"...","ledger_refs":["..."]}],"next_actions":[{"text":"...","status":"proposed","ledger_refs":["..."]}],"ledger_sha256":"${ledger.digest}"}
 
-## Goal
-- [the active user goal]
+The host-facing renderer will produce these compatibility sections: ## Goal, ## Constraints, ## Decisions, ## Current state, ## Files, ## Evidence, ## Blockers/questions, ## Next actions.
 
-## Constraints
-- [relevant ledger-backed constraints, or a truthful placeholder]
+Stable ledger references (use the ID before each tab; do not invent IDs):
+${ledgerReferenceGuide(ledger)}
 
-## Decisions
-- [ledger-backed decisions only, or a truthful placeholder]
+${priorProjection ? `\nA prior validated projection is advisory only. Reuse it only after remapping its stable refs against this ledger:\n${JSON.stringify(priorProjection)}\n` : ""}
 
-## Current state
-- [concise ledger-backed state]
-
-## Files
-- [relevant explicit paths only, or a truthful placeholder]
-
-## Evidence
-- [bounded ledger-backed evidence only, or a truthful placeholder]
-
-## Blockers/questions
-- [ledger-backed blockers and unresolved questions, or a truthful placeholder]
-
-## Next actions
-- [concrete ledger-grounded next actions]
-
+Canonical ledger:
 ${ledger.block}`
+}
+
+export function validateProjectedResponse(text: string, ledger: RecoveryLedger, maxBytes: number) {
+  const projection = parseProjectionJSON(text, ledger, projectionBudget(maxBytes, Math.min(maxBytes, utf8Bytes(ledger.block))))
+  if (!projection) return
+  return renderProjection(projection, ledger, maxBytes) ? projection : undefined
+}
+
+export function renderProjectedResponse(text: string, ledger: RecoveryLedger, maxBytes: number) {
+  const projection = validateProjectedResponse(text, ledger, maxBytes)
+  return projection ? renderProjection(projection, ledger, maxBytes) : undefined
 }
 
 export function validateSummary(text: string, expected: RecoveryLedger, maxBytes: number) {
@@ -76,7 +84,12 @@ export function validateSummary(text: string, expected: RecoveryLedger, maxBytes
   const headings = [...prefix.matchAll(/^## (.+)$/gm)].map((match) => match[1])
   if (headings.length !== REQUIRED_SECTIONS.length) return false
   if (headings.some((heading, index) => heading !== REQUIRED_SECTIONS[index])) return false
-  return markerLines(value, LEDGER_START).length === 1 && markerLines(value, LEDGER_END).length === 1
+  if (markerLines(value, LEDGER_START).length !== 1 || markerLines(value, LEDGER_END).length !== 1) return false
+  const projection = parseProjectionBlock(value)
+  if (!projection) return true
+  const projectionStart = value.indexOf("<!-- opencode-safe-compaction projection v1 start -->")
+  const ledgerStart = value.indexOf(LEDGER_START)
+  return projectionStart >= 0 && ledgerStart > projectionStart && Boolean(validateProjection(projection, expected))
 }
 
 export function parsePluginLedger(text: string) {
@@ -104,6 +117,12 @@ export function isPluginValidSummary(text: string, maxBytes: number) {
   const ledger = parsePluginLedger(text)
   if (!ledger) return false
   return validateSummary(text, ledger, maxBytes)
+}
+
+export function parseProjectedSummary(text: string, expected: RecoveryLedger) {
+  const projection = parseProjectionBlock(text)
+  if (!projection) return
+  return validateProjection(projection, expected)
 }
 
 export function buildAuthoritativeSummary(input: { ledger: RecoveryLedger; maxBytes: number }) {
@@ -184,7 +203,7 @@ ${input.ledger.block}`
   return minimal
 }
 
-export function recoveryContext(ledger: RecoveryLedger) {
+export function recoveryContext(ledger: RecoveryLedger, projection?: ProjectedSummary) {
   return `Safe-compaction recovery context for this model-visible turn only. Durable history was not modified.
 
 The canonical recovery ledger below is authoritative. legacy_context records only bounded provenance: untrusted provider prose is omitted, while a prior plugin-valid canonical ledger may be chained.
@@ -193,6 +212,7 @@ No provider-authored compaction prose is trusted by opencode-safe-compaction.
 
 Review pending and in-progress todos against recent_requests before acting. If a todo no longer matches the active request thread, treat it as possibly stale: mention its ID and ask the user before completing, deleting, or rewriting it. Do not infer abandonment from age alone.
 
+${projection ? `\nAdvisory validated projection (remapped against this ledger):\n${JSON.stringify(projection, null, 2)}\n` : ""}
 ${ledger.block}`
 }
 

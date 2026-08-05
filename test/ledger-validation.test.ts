@@ -247,6 +247,21 @@ describe("recovery ledger", () => {
     expect(ledger.data.touched_paths).not.toContain("/g")
   })
 
+  test("accepts structured paths from allowlisted write tools", () => {
+    const ledger = buildRecoveryLedger({
+      messages: [message("request", sessionID, "user", [{ type: "text", text: "Write the review" }]), message("write", sessionID, "assistant", [
+        { type: "tool", tool: "write", state: { status: "completed", input: { path: "/repo/aidocs/review.md" } } },
+        { type: "tool", tool: "shell", state: { status: "completed", input: { path: "/repo/not-a-file-evidence" } } },
+      ])],
+      todos: [],
+      tailTurns: 1,
+      maxBytes: 16_384,
+    })
+
+    expect(ledger.data.touched_paths).toContain("/repo/aidocs/review.md")
+    expect(ledger.data.touched_paths).not.toContain("/repo/not-a-file-evidence")
+  })
+
   test("normalizes V1 todos that omit IDs and optional metadata", () => {
     const oversizedWhitespaceID = " ".repeat(1_024 * 1_024) + "must-not-be-reached"
     const input = {

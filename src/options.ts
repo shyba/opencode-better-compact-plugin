@@ -113,5 +113,8 @@ export function resolveOptions(options: ParsedOptions, existing: ExistingOptions
   if (result.max_summary_bytes < result.max_ledger_bytes + 1_024) {
     throw new TypeError('Option "max_summary_bytes" must exceed "max_ledger_bytes" by at least 1024 bytes')
   }
+  if (result.max_summary_bytes < result.max_ledger_bytes + 4_096 + 2_048) {
+    throw new TypeError('Option "max_summary_bytes" must leave at least 2048 bytes for the JSON projection after ledger and rendering overhead')
+  }
   return result
 }

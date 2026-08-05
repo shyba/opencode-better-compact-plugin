@@ -112,6 +112,14 @@ describe("plugin option precedence", () => {
     ).toThrow('Option "max_summary_bytes" must exceed "max_ledger_bytes" by at least 1024 bytes')
   })
 
+  test("requires projection room after the ledger and rendering overhead", () => {
+    expect(() =>
+      resolveOptions(
+        parseOptions({ model: "test/model", max_ledger_bytes: 4_096, max_summary_bytes: 8_191 }),
+      ),
+    ).toThrow('Option "max_summary_bytes" must leave at least 2048 bytes for the JSON projection after ledger and rendering overhead')
+  })
+
   test("rejects limits too small for deterministic history markers and the canonical ledger", () => {
     expect(() =>
       resolveOptions(parseOptions({ model: "test/model", max_historical_part_bytes: 127 })),

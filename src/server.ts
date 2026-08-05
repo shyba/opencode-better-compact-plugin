@@ -3,12 +3,15 @@ import { LEDGER_LIMITS, buildRecoveryLedger, record, summaryText, utf8Bytes, typ
 import { SELECTED_MODEL, parseOptions, resolveOptions, type PluginOptions } from "./options.js"
 import { decodedDataUrlBytes, sanitizeHistory } from "./sanitize.js"
 import { AttemptStore, type Attempt } from "./state.js"
+import { remapProjection } from "./projection.js"
 import {
   buildAuthoritativeSummary,
   buildCompactionPrompt,
   isPluginValidSummary,
   parsePluginLedger,
+  parseProjectedSummary,
   recoveryContext,
+  renderProjectedResponse,
 } from "./validation.js"
 
 // The 1.18.4 V1 SDK type omits compaction fields that the 1.18.4 runtime schema accepts.
@@ -132,13 +135,15 @@ export async function server(input: PluginInput, rawOptions?: OpenCodePluginOpti
           maxBytes: options.max_ledger_bytes,
           ...(priorSummary ? { priorSummary } : {}),
         })
+        const projection = priorSummary?.projection ? remapProjection(priorSummary.projection, ledger) : undefined
         attempts.set({
           sessionID,
           createdAt: Date.now(),
           ledger,
+          ...(projection ? { projection } : {}),
           validation: "pending",
         })
-        output.prompt = buildCompactionPrompt(ledger, options.max_summary_bytes)
+        output.prompt = buildCompactionPrompt(ledger, options.max_summary_bytes, projection)
       }, () => {
         attempts.delete(sessionID)
       })
@@ -185,7 +190,7 @@ export async function server(input: PluginInput, rawOptions?: OpenCodePluginOpti
             messageID: recoveryUser.info.id,
             type: "text" as const,
             synthetic: true,
-            text: recoveryContext(attempt.ledger),
+            text: recoveryContext(attempt.ledger, attempt.projection),
           }
           : undefined
         // Preserve the initial selected-model history so providers can reuse an existing
@@ -269,6 +274,12 @@ export async function server(input: PluginInput, rawOptions?: OpenCodePluginOpti
         attempt.textPartID = hookInput.partID
         attempt.summaryMessageID = hookInput.messageID
         const candidate = output.text.trimEnd()
+        const projected = renderProjectedResponse(candidate, attempt.ledger, options.max_summary_bytes)
+        if (projected) {
+          output.text = projected
+          attempt.validation = "provider"
+          return
+        }
         const candidateLedger = parsePluginLedger(candidate)
         if (
           targetTextParts >= 1 &&
@@ -420,17 +431,20 @@ async function rebuildAttempt(
     summaryMessageID,
     options.max_summary_bytes,
   )
+  const ledger = buildRecoveryLedger({
+    messages: data.messages,
+    todos: data.todos,
+    tailTurns: options.tail_turns,
+    maxBytes: options.max_ledger_bytes,
+    excludeSummaryID: summaryMessageID,
+    ...(priorSummary ? { priorSummary } : {}),
+  })
+  const projection = priorSummary?.projection ? remapProjection(priorSummary.projection, ledger) : undefined
   return {
     sessionID,
     createdAt: Date.now(),
-    ledger: buildRecoveryLedger({
-      messages: data.messages,
-      todos: data.todos,
-      tailTurns: options.tail_turns,
-      maxBytes: options.max_ledger_bytes,
-      excludeSummaryID: summaryMessageID,
-      ...(priorSummary ? { priorSummary } : {}),
-    }),
+    ledger,
+    ...(projection ? { projection } : {}),
     summaryMessageID,
     validation: "pending",
   } satisfies Attempt
@@ -582,7 +596,7 @@ async function newestPriorPluginSummaryOnPage(
     if (embedded) {
       if (!isCompactionParent(embedded, sessionID, summary.info.parentID)) continue
       const ledger = parsePluginLedger(text)
-      if (ledger) return { id: summary.info.id, ledger }
+      if (ledger) return { id: summary.info.id, ledger, projection: parseProjectedSummary(text, ledger) }
       continue
     }
     const parent = await input.client.session.message({
@@ -598,7 +612,7 @@ async function newestPriorPluginSummaryOnPage(
     const data = parent.data as MessageRecord
     if (!isCompactionParent(data, sessionID, summary.info.parentID)) continue
     const ledger = parsePluginLedger(text)
-    if (ledger) return { id: summary.info.id, ledger }
+    if (ledger) return { id: summary.info.id, ledger, projection: parseProjectedSummary(text, ledger) }
   }
 }
 
