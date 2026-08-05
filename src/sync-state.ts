@@ -72,8 +72,8 @@ export class SyncState {
   }
 
   upsertSource(source: { id: string; installationID: string; kind: string; schemaVersion: number; locator: string; fingerprint?: string; incarnation: string }) {
-    const existing = this.db.query("select fingerprint, installation_id from source where id=?").get(source.id) as { fingerprint?: string; installation_id: string } | null
-    if (existing?.fingerprint && source.fingerprint && existing.fingerprint !== source.fingerprint) throw new Error(`source layout fingerprint changed for ${source.id}; inspect the migration before syncing`)
+    const existing = this.db.query("select fingerprint, schema_version, installation_id from source where id=?").get(source.id) as { fingerprint?: string; schema_version: number; installation_id: string } | null
+    if (existing?.fingerprint && source.fingerprint && existing.fingerprint !== source.fingerprint && source.schemaVersion <= existing.schema_version) throw new Error(`source layout fingerprint changed without a recognized migration for ${source.id}`)
     if (existing?.installation_id && existing.installation_id !== source.installationID) throw new Error(`source ${source.id} belongs to a different installation`)
     this.db.query(`insert into source(id, installation_id, kind, schema_version, canonical_locator, fingerprint, incarnation, created_at, last_seen_at)
       values (?, ?, ?, ?, ?, ?, ?, ?, ?)
