@@ -1,11 +1,16 @@
 #!/usr/bin/env bun
 import { access, readFile, stat } from "node:fs/promises"
 import { spawn } from "node:child_process"
+import { createHash } from "node:crypto"
 import path from "node:path"
+import { configPaths, loadConfig } from "../src/config.js"
+import { discoverOpenCodeV1 } from "../src/opencode-v1.js"
+import { openSyncState } from "../src/sync-state.js"
 
 const installDir = path.resolve(process.env.OPENCODE_SAFE_COMPACTION_DIR ?? path.join(process.env.HOME ?? ".", ".local/share/opencode/plugins/safe-compaction"))
 const configDir = path.resolve(process.env.OPENCODE_SAFE_COMPACTION_CONFIG_DIR ?? process.env.OPENCODE_CONFIG_DIR ?? path.join(process.env.XDG_CONFIG_HOME ?? path.join(process.env.HOME ?? ".", ".config"), "opencode"))
 const databasePath = path.resolve(process.env.OPENCODE_DB ?? path.join(process.env.XDG_DATA_HOME ?? path.join(process.env.HOME ?? ".", ".local/share"), "opencode", "opencode.db"))
+const paths = configPaths()
 
 const command = process.argv[2] ?? "help"
 if (command === "help" || command === "--help" || command === "-h") {
@@ -19,6 +24,13 @@ if (command === "update") {
 if (command === "doctor") {
   process.exit(await doctor())
 }
+if (command === "sync") {
+  if (process.argv[3] !== "run") {
+    console.error("Usage: better-compact sync run")
+    process.exit(2)
+  }
+  process.exit(await syncRun())
+}
 console.error(`Unknown command: ${command}`)
 printHelp()
 process.exit(2)
@@ -29,6 +41,7 @@ function printHelp() {
 Usage:
   better-compact update   Update the managed checkout and verify configuration
   better-compact doctor   Check installation, OpenCode, configuration, and SQLite access
+  better-compact sync run Discover configured sources and stage redacted records locally
   better-compact help     Show this help
 
 Environment overrides:
@@ -36,7 +49,9 @@ Environment overrides:
   OPENCODE_SAFE_COMPACTION_CONFIG_DIR
   OPENCODE_SAFE_COMPACTION_OPENCODE
   OPENCODE_SAFE_COMPACTION_BUN
-  OPENCODE_DB`)
+  OPENCODE_DB
+  BETTER_COMPACT_CONFIG
+  BETTER_COMPACT_STATE`)
 }
 
 async function update() {
@@ -47,7 +62,10 @@ async function update() {
 
 async function doctor() {
   const checks: Array<[string, boolean, string]> = []
+  const config = await loadConfig(paths)
   checks.push(["managed checkout", await exists(path.join(installDir, ".git")), installDir])
+  checks.push(["better-compact config", await exists(paths.config), paths.config])
+  checks.push(["better-compact state parent", await exists(path.dirname(paths.state)), path.dirname(paths.state)])
   checks.push(["configuration directory", await exists(configDir), configDir])
   checks.push(["server configuration", await configured("opencode.json") || await configured("opencode.jsonc"), configDir])
   checks.push(["TUI configuration", await configured("tui.json") || await configured("tui.jsonc"), configDir])
@@ -60,6 +78,36 @@ async function doctor() {
   const sqlite = await commandWorks("sqlite3", [databasePath, "PRAGMA busy_timeout=1000; PRAGMA query_only=ON; SELECT 1 FROM sqlite_master LIMIT 1;"])
   console.log(`${sqlite ? "OK" : "FAIL"} SQLite read-only probe: ${databasePath}`)
   if (!sqlite) return 1
+  for (const source of config.sources) {
+    const supported = source.kind === "opencode-v1-sqlite"
+    console.log(`${supported ? "OK" : "FAIL"} source adapter: ${source.kind}`)
+  }
+  if (config.sources.some((source) => source.kind !== "opencode-v1-sqlite")) return 1
+  return 0
+}
+
+async function syncRun() {
+  const config = await loadConfig(paths)
+  if (!config.sync.enabled) {
+    console.log("sync disabled; set sync.enabled=true in the better-compact config")
+    return 0
+  }
+  const state = await openSyncState(paths.state)
+  try {
+    const installation = state.ensureDefaultInstallation()
+    for (const source of config.sources) {
+      if (source.kind !== "opencode-v1-sqlite") throw new Error(`unsupported source adapter: ${source.kind}`)
+      const filename = path.resolve(source.database.replace(/^~(?=\/|$)/, process.env.HOME ?? "."))
+      const sourceID = createHash("sha256").update(`${source.kind}\n${filename}`).digest("hex").slice(0, 32)
+      const inspection = await import("../src/opencode-v1.js").then((module) => module.inspectOpenCodeV1(filename))
+      state.upsertSource({ id: sourceID, installationID: installation.id, kind: source.kind, schemaVersion: inspection.schemaVersion, locator: filename, fingerprint: inspection.layoutFingerprint, incarnation: installation.incarnation })
+      const result = discoverOpenCodeV1(filename, sourceID, state.nextRevision(sourceID), config.sync.include_parts)
+      state.enqueue(result.records, sourceID, "messages", result.checkpoint)
+      console.log(`staged ${result.records.length} records from ${filename}`)
+    }
+  } finally {
+    state.close()
+  }
   return 0
 }
 

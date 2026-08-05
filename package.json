@@ -34,6 +34,7 @@
     "dist",
     "scripts/configure.ts",
     "scripts/cli.ts",
+    "db/migrations",
     "LICENSE",
     "README.md"
   ],
