@@ -29,6 +29,17 @@ export async function ensureRemoteSource(client: SQLClient, source: PostgresSour
     where opencode.source.incarnation=$3`, [source.installationID, source.sourceID, source.incarnation, kind, schemaVersion, fingerprint])
 }
 
+export async function readRemoteFence(client: SQLClient, source: PostgresSource) {
+  const rows = await client.unsafe<Array<{ incarnation: string; remote_revision_high_water: number }>>(
+    "select incarnation, remote_revision_high_water from opencode.source where installation_id=$1 and source_id=$2",
+    [source.installationID, source.sourceID],
+  )
+  const row = rows[0]
+  if (!row) return { incarnation: source.incarnation, revision: 0 }
+  if (row.incarnation !== source.incarnation) throw new Error("Postgres source incarnation fence failed; run installation reset or adopt")
+  return { incarnation: row.incarnation, revision: Number(row.remote_revision_high_water) }
+}
+
 export async function uploadFenced(client: SQLClient, source: PostgresSource, rows: OutboxRow[]) {
   if (!rows.length) return source.expectedRevision
   let uploadedHighWater = source.expectedRevision
@@ -45,7 +56,8 @@ export async function uploadFenced(client: SQLClient, source: PostgresSource, ro
     for (const row of rows) {
       if (row.recordRevision <= highWater) continue
       const payload = row.payloadJSON ? JSON.parse(row.payloadJSON) as Record<string, unknown> : {}
-      await upsertRecord(transaction, source, row, payload)
+      const routing = row.routingJSON ? JSON.parse(row.routingJSON) as Record<string, unknown> : {}
+      await upsertRecord(transaction, source, row, { ...routing, ...payload })
       highWater = row.recordRevision
     }
     await transaction.unsafe(

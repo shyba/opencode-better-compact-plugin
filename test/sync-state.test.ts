@@ -52,6 +52,20 @@ describe("portable better-compact state", () => {
     state.close()
   })
 
+  test("does not restage an unchanged observation", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "better-compact-state-"))
+    temporary.push(directory)
+    const state = await openSyncState(path.join(directory, "state.sqlite"))
+    state.ensureInstallation("install-1", "incarnation-1")
+    state.upsertSource({ id: "source-1", installationID: "install-1", kind: "fixture", schemaVersion: 1, locator: "fixture://one", incarnation: "source-inc-1" })
+    const record = { sourceID: "source-1", recordKind: "message", naturalKey: "m1", payloadJSON: "same", payloadSHA256: "same", observedAt: 1 }
+    state.enqueue([record], "source-1", "messages", { cursor: "1" })
+    state.enqueue([record], "source-1", "messages", { cursor: "2" })
+    expect(state.pendingCount()).toBe(1)
+    expect(state.nextRevision("source-1")).toBe(1)
+    state.close()
+  })
+
   test("creates tombstones only for a completed snapshot", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "better-compact-state-"))
     temporary.push(directory)

@@ -5,7 +5,7 @@ import { createHash } from "node:crypto"
 import path from "node:path"
 import { configPaths, loadConfig } from "../src/config.js"
 import { discoverOpenCodeV1, inspectOpenCodeV1 } from "../src/opencode-v1.js"
-import { ensureRemoteSource, openPostgres, uploadFenced } from "../src/postgres.js"
+import { ensureRemoteSource, openPostgres, readRemoteFence, uploadFenced } from "../src/postgres.js"
 import { openSyncState } from "../src/sync-state.js"
 
 const installDir = path.resolve(process.env.OPENCODE_SAFE_COMPACTION_DIR ?? path.join(process.env.HOME ?? ".", ".local/share/opencode/plugins/safe-compaction"))
@@ -19,8 +19,7 @@ if (command === "help" || command === "--help" || command === "-h") {
   process.exit(0)
 }
 if (command === "update" || command === "install") {
-  await update()
-  process.exit(0)
+  process.exit(await update())
 }
 if (command === "doctor") {
   process.exit(await doctor())
@@ -61,9 +60,22 @@ Environment overrides:
 }
 
 async function update() {
+  const mode = await installationMode()
+  if (mode !== "git") {
+    console.error(`${mode} execution is not self-updating; use the package manager to upgrade, then run better-compact install from a stable package location`)
+    return 2
+  }
   await access(path.join(installDir, "install.sh"))
   const result = await run("sh", [path.join(installDir, "install.sh")], process.env)
-  if (result !== 0) process.exit(result)
+  return result
+}
+
+async function installationMode() {
+  if (await exists(path.join(installDir, ".git"))) return "git"
+  const executable = process.argv[1] ?? ""
+  if (process.env.npm_config_user_agent?.includes("npx") || executable.includes("/.npm/_npx/")) return "npx"
+  if (executable.includes("node_modules")) return "npm"
+  return "package"
 }
 
 async function doctor() {
@@ -98,11 +110,33 @@ async function syncRun(once: boolean) {
     console.log("sync disabled; set sync.enabled=true in the better-compact config")
     return 0
   }
-  do {
-    await syncPass(config)
-    if (once) return 0
-    await new Promise((resolve) => setTimeout(resolve, config.sync.poll_interval_ms))
-  } while (true)
+  const lock = `${paths.state}.lock`
+  try {
+    await mkdir(lock, { recursive: false, mode: 0o700 })
+  } catch {
+    let lockPID = ""
+    try { lockPID = (await readFile(path.join(lock, "pid"), "utf8")).trim() } catch {}
+    let running = false
+    if (lockPID && /^\d+$/.test(lockPID)) {
+      try { process.kill(Number(lockPID), 0); running = true } catch {}
+    }
+    if (running) {
+      console.error(`sync is already running; lock exists at ${lock}`)
+      return 1
+    }
+    await rm(lock, { recursive: true, force: true })
+    await mkdir(lock, { recursive: false, mode: 0o700 })
+  }
+  await writeFile(path.join(lock, "pid"), `${process.pid}\n`, { mode: 0o600 })
+  try {
+    do {
+      await syncPass(config)
+      if (once) return 0
+      await new Promise((resolve) => setTimeout(resolve, config.sync.poll_interval_ms))
+    } while (true)
+  } finally {
+    await rm(lock, { recursive: true, force: true })
+  }
 }
 
 async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>) {
@@ -115,16 +149,21 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>) {
       const sourceID = createHash("sha256").update(`${source.kind}\n${filename}`).digest("hex").slice(0, 32)
       const inspection = inspectOpenCodeV1(filename)
       state.upsertSource({ id: sourceID, installationID: installation.id, kind: source.kind, schemaVersion: inspection.schemaVersion, locator: filename, fingerprint: inspection.layoutFingerprint, incarnation: installation.incarnation })
-      const result = discoverOpenCodeV1(filename, sourceID, state.nextRevision(sourceID), config.sync.include_parts)
-      state.enqueue(result.records, sourceID, "messages", result.checkpoint, "postgres", { complete: true, recordKinds: ["session", "message", "part", "todo"] })
+      const result = discoverOpenCodeV1(filename, sourceID, state.nextRevision(sourceID), config.sync.include_parts, config.sync.include_tool_output)
+      state.enqueue(result.records, sourceID, "messages", result.checkpoint, "postgres", { complete: true, recordKinds: ["session", "message", "part", "todo"] }, config.sync.max_outbox_bytes)
       console.log(`staged ${result.records.length} records from ${filename}`)
       const databaseURL = process.env[config.sync.database_url_env]
       if (databaseURL) {
         const client = openPostgres(databaseURL)
         try {
           await ensureRemoteSource(client, { installationID: installation.id, sourceID, incarnation: installation.incarnation, expectedRevision: state.remoteRevision(sourceID) }, source.kind, inspection.schemaVersion, inspection.layoutFingerprint)
-          const rows = state.claim("postgres", config.sync.batch_size, Date.now(), 60_000, sourceID)
-          const revision = await uploadFenced(client, { installationID: installation.id, sourceID, incarnation: installation.incarnation, expectedRevision: state.remoteRevision(sourceID) }, rows)
+          const fence = await readRemoteFence(client, { installationID: installation.id, sourceID, incarnation: installation.incarnation, expectedRevision: state.remoteRevision(sourceID) })
+          if (fence.revision > state.remoteRevision(sourceID)) {
+            state.setRemoteRevision(sourceID, fence.revision)
+            state.acknowledgeThrough(sourceID, fence.revision)
+          }
+          const rows = state.claim("postgres", config.sync.batch_size, Date.now(), 60_000, sourceID, fence.revision)
+          const revision = await uploadFenced(client, { installationID: installation.id, sourceID, incarnation: installation.incarnation, expectedRevision: fence.revision }, rows)
           state.setRemoteRevision(sourceID, revision)
           state.acknowledge(rows.map((row) => row.id))
           console.log(`uploaded ${rows.length} records from ${filename}`)
@@ -148,6 +187,11 @@ async function syncStatus() {
 }
 
 async function syncInstall() {
+  const mode = await installationMode()
+  if (mode === "npx") {
+    console.error("refusing to install a persistent service from an ephemeral npx path; materialize the package first")
+    return 2
+  }
   if (process.platform !== "linux") {
     console.error("sync install currently supports systemd user services on Linux; use sync run for foreground mode")
     return 2

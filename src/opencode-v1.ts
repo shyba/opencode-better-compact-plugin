@@ -33,46 +33,46 @@ export function inspectOpenCodeV1(filename: string): OpenCodeV1Inspection {
         : []
     if (!migrations.length) throw new Error("OpenCode V1 source has no recognized migration journal")
     const schemaVersion = migrations.length
-    const layoutFingerprint = createHash("sha256").update(`${schemaVersion}\n${tables.join("\n")}\n${Object.entries(REQUIRED_COLUMNS).map(([table, columns]) => `${table}:${columns.join(",")}`).join("\n")}`).digest("hex")
+    const signatures = Object.keys(REQUIRED_COLUMNS).map((table) => {
+      const columns = (db.query(`pragma table_info(${table})`).all() as Array<{ name: string; type: string; notnull: number; pk: number }>).map((row) => `${row.name}:${row.type}:${row.notnull}:${row.pk}`).join(",")
+      const indexes = (db.query(`pragma index_list(${table})`).all() as Array<{ name: string; unique: number }>).map((row) => `${row.name}:${row.unique}`).sort().join(",")
+      return `${table}|columns=${columns}|indexes=${indexes}`
+    })
+    const layoutFingerprint = createHash("sha256").update(`${migrations.join("\n")}\n${signatures.join("\n")}`).digest("hex")
     return { schemaVersion, layoutFingerprint, migrations, tables }
   } finally {
     db.close()
   }
 }
 
-export function discoverOpenCodeV1(filename: string, sourceID: string, revisionStart = 0, includeParts = true): { records: NormalizedRecord[]; checkpoint: { sessionCreatedAt: number; sessionID: string; revision: number } } {
+export function discoverOpenCodeV1(filename: string, sourceID: string, _revisionStart = 0, includeParts = true, includeToolOutput = false): { records: NormalizedRecord[]; checkpoint: { sessionCreatedAt: number; sessionID: string } } {
   const inspection = inspectOpenCodeV1(filename)
   const db = new Database(filename, { readonly: true })
   try {
     db.exec("begin")
     const sessions = db.query("select id, time_created, time_updated, title, directory, metadata from session order by time_created, id").all() as Array<Record<string, unknown>>
     const records: NormalizedRecord[] = []
-    let revision = revisionStart
     for (const session of sessions) {
       const sessionID = String(session.id)
-      const sessionPayload = allowlistedPayload({ session: { title: session.title, directory: session.directory, metadata: parseJSON(session.metadata) }, source_schema_version: inspection.schemaVersion })
-      revision++
-      records.push(record(sourceID, "session", sessionID, sessionPayload, revision, Number(session.time_updated ?? session.time_created)))
+      const sessionPayload = allowlistedPayload({ title: session.title, directory: session.directory, metadata: parseJSON(session.metadata), source_schema_version: inspection.schemaVersion })
+      records.push(record(sourceID, "session", sessionID, sessionPayload, Number(session.time_updated ?? session.time_created)))
       const messages = db.query("select id, session_id, time_created, time_updated, data from message where session_id=? order by time_created, id").all(sessionID) as Array<Record<string, unknown>>
       for (const message of messages) {
-        revision++
-        records.push(record(sourceID, "message", String(message.id), allowlistedPayload({ session_id: message.session_id, data: parseJSON(message.data) }), revision, Number(message.time_updated ?? message.time_created)))
+        records.push(record(sourceID, "message", String(message.id), { session_id: String(message.session_id), data: normalizeMessageData(parseJSON(message.data), includeToolOutput) }, Number(message.time_updated ?? message.time_created)))
         if (!includeParts) continue
         const parts = db.query("select id, message_id, session_id, time_created, time_updated, data from part where message_id=? order by id").all(String(message.id)) as Array<Record<string, unknown>>
         for (const part of parts) {
-          revision++
-          records.push(record(sourceID, "part", `${part.message_id}:${part.id}`, allowlistedPayload({ session_id: part.session_id, message_id: part.message_id, data: parseJSON(part.data) }), revision, Number(part.time_updated ?? part.time_created)))
+          records.push(record(sourceID, "part", `${part.message_id}:${part.id}`, { session_id: String(part.session_id), message_id: String(part.message_id), data: normalizePartData(parseJSON(part.data), includeToolOutput) }, Number(part.time_updated ?? part.time_created)))
         }
       }
       const todos = db.query("select session_id, position, time_created, time_updated, content, status, priority from todo where session_id=? order by position").all(sessionID) as Array<Record<string, unknown>>
       for (const todo of todos) {
-        revision++
-        records.push(record(sourceID, "todo", `${todo.session_id}:${todo.position}`, allowlistedPayload(todo), revision, Number(todo.time_updated ?? todo.time_created)))
+        records.push(record(sourceID, "todo", `${todo.session_id}:${todo.position}`, allowlistedPayload(todo), Number(todo.time_updated ?? todo.time_created)))
       }
     }
     db.exec("commit")
     const last = sessions.at(-1)
-    return { records, checkpoint: { sessionCreatedAt: Number(last?.time_created ?? 0), sessionID: String(last?.id ?? ""), revision } }
+    return { records, checkpoint: { sessionCreatedAt: Number(last?.time_created ?? 0), sessionID: String(last?.id ?? "") } }
   } catch (error) {
     try { db.exec("rollback") } catch {}
     throw error
@@ -81,12 +81,13 @@ export function discoverOpenCodeV1(filename: string, sourceID: string, revisionS
   }
 }
 
-function record(sourceID: string, recordKind: string, naturalKey: string, payload: Record<string, unknown>, recordRevision: number, observedAt: number): NormalizedRecord {
+function record(sourceID: string, recordKind: string, naturalKey: string, payload: Record<string, unknown>, observedAt: number): NormalizedRecord {
   const rawJSON = JSON.stringify(payload)
   const payloadJSON = utf8Bytes(rawJSON) > 131_072
     ? JSON.stringify({ omitted: true, reason: "payload-bound", sha256: createHash("sha256").update(rawJSON).digest("hex"), bytes: utf8Bytes(rawJSON) })
     : rawJSON
-  return { sourceID, recordKind, naturalKey, payloadJSON, payloadSHA256: createHash("sha256").update(payloadJSON).digest("hex"), recordRevision, observedAt }
+  const routing = Object.fromEntries(Object.entries(payload).filter(([key]) => ["session_id", "message_id", "position"].includes(key)))
+  return { sourceID, recordKind, naturalKey, routingJSON: JSON.stringify(routing), payloadJSON, payloadSHA256: createHash("sha256").update(payloadJSON).digest("hex"), observedAt }
 }
 
 function parseJSON(value: unknown) {
@@ -97,9 +98,21 @@ function parseJSON(value: unknown) {
 function allowlistedPayload(value: Record<string, unknown>): Record<string, unknown> {
   const allowed: Record<string, unknown> = {}
   for (const [key, item] of Object.entries(value)) {
-    if (["session", "session_id", "message_id", "data", "source_schema_version", "position", "content", "status", "priority"].includes(key)) allowed[key] = sanitizeValue(item)
+    if (["title", "directory", "metadata", "session_id", "message_id", "position", "content", "status", "priority", "source_schema_version"].includes(key)) allowed[key] = sanitizeValue(item)
   }
   return allowed
+}
+
+function normalizeMessageData(value: unknown, includeToolOutput: boolean) {
+  const data = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
+  const allowed = ["id", "role", "parentID", "mode", "agent", "summary", "model", "path", "time", "tokens", "cost", "finish"]
+  return Object.fromEntries(Object.entries(data).filter(([key]) => includeToolOutput || allowed.includes(key)).map(([key, item]) => [key, sanitizeValue(item)]))
+}
+
+function normalizePartData(value: unknown, includeToolOutput: boolean) {
+  const data = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
+  const allowed = ["id", "type", "text", "synthetic", "messageID", "sessionID", "time", "hash"]
+  return Object.fromEntries(Object.entries(data).filter(([key]) => includeToolOutput || allowed.includes(key)).map(([key, item]) => [key, sanitizeValue(item)]))
 }
 
 function sanitizeValue(value: unknown): unknown {
