@@ -3,9 +3,12 @@ import { canonicalLedger, type RecoveryLedgerData } from "../src/ledger.js"
 import {
   REQUIRED_SECTIONS,
   buildAuthoritativeSummary,
+  buildCompactionPrompt,
+  buildFallback,
   isAuthoritativeSummary,
   isPluginValidSummary,
   recoveryContext,
+  renderProjectedResponse,
 } from "../src/validation.js"
 
 const EMPTY_DATA: RecoveryLedgerData = {
@@ -103,5 +106,37 @@ describe("authoritative summary", () => {
     expect(context).toContain("possibly stale")
     expect(context).toContain("ask the user")
     expect(context).toContain('"todo-old"')
+  })
+})
+
+describe("legacy markdown response mode", () => {
+  const ledger = canonicalLedger({
+    ...EMPTY_DATA,
+    recent_requests: ["Finish the exporter"],
+    constraints: ["Keep the schema"],
+    next_actions: ["Run the regression"],
+  })
+
+  test("emits the legacy Markdown contract instead of the JSON shape", () => {
+    const prompt = buildCompactionPrompt(ledger, 49_152, undefined, "markdown")
+    expect(prompt).toContain("exact Markdown contract")
+    expect(prompt).toContain("## Goal")
+    expect(prompt).toContain("## Next actions")
+    expect(prompt).toContain(ledger.block)
+    expect(prompt).not.toContain("Required JSON shape")
+    expect(prompt).not.toContain("ledger_sha256=")
+  })
+
+  test("accepts a legacy plugin-valid Markdown summary", () => {
+    const summary = buildFallback({ ledger, maxBytes: 49_152 })
+    const accepted = renderProjectedResponse(summary, ledger, 49_152, "markdown")
+    expect(accepted).toBe(summary.trimEnd())
+    expect(renderProjectedResponse(summary, ledger, 49_152, "json")).toBeUndefined()
+  })
+
+  test("rejects prose, malformed summaries, and JSON-only responses", () => {
+    expect(renderProjectedResponse("some prose without a ledger", ledger, 49_152, "markdown")).toBeUndefined()
+    expect(renderProjectedResponse("## Goal\n- malformed", ledger, 49_152, "markdown")).toBeUndefined()
+    expect(renderProjectedResponse('{"version":1}', ledger, 49_152, "markdown")).toBeUndefined()
   })
 })

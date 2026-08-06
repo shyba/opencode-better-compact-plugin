@@ -1,5 +1,6 @@
 export const OPTION_KEYS = [
   "model",
+  "response_mode",
   "tail_turns",
   "preserve_recent_tokens",
   "reserved_tokens",
@@ -11,8 +12,12 @@ export const OPTION_KEYS = [
   "max_summary_bytes",
 ] as const
 
+export const RESPONSE_MODES = ["json", "markdown"] as const
+export type ResponseMode = (typeof RESPONSE_MODES)[number]
+
 export type PluginOptions = {
   model: string
+  response_mode: ResponseMode
   tail_turns: number
   preserve_recent_tokens: number
   reserved_tokens: number
@@ -36,6 +41,7 @@ export type ExistingOptions = {
 export const SELECTED_MODEL = "selected"
 
 export const DEFAULT_OPTIONS = {
+  response_mode: "json",
   tail_turns: 4,
   preserve_recent_tokens: 16_000,
   reserved_tokens: 32_000,
@@ -75,7 +81,14 @@ export function parseOptions(input: Record<string, unknown> | undefined) {
     result.model = value.model
   }
 
-  for (const key of OPTION_KEYS.filter((item) => item !== "model")) {
+  if (value.response_mode !== undefined) {
+    if (typeof value.response_mode !== "string" || !(RESPONSE_MODES as readonly string[]).includes(value.response_mode)) {
+      throw new TypeError(`Option "response_mode" must be one of: ${RESPONSE_MODES.join(", ")}`)
+    }
+    result.response_mode = value.response_mode as ResponseMode
+  }
+
+  for (const key of OPTION_KEYS.filter((item) => item !== "model" && item !== "response_mode")) {
     if (value[key] === undefined) continue
     if (!Number.isSafeInteger(value[key]) || (key === "tail_turns" ? Number(value[key]) < 0 : Number(value[key]) <= 0)) {
       throw new TypeError(`Option "${key}" must be a ${key === "tail_turns" ? "non-negative" : "positive"} integer`)
@@ -88,6 +101,7 @@ export function parseOptions(input: Record<string, unknown> | undefined) {
 export function resolveOptions(options: ParsedOptions, existing: ExistingOptions = {}) {
   const result: PluginOptions = {
     model: options.model ?? existing.model ?? SELECTED_MODEL,
+    response_mode: options.response_mode ?? DEFAULT_OPTIONS.response_mode,
     tail_turns: options.tail_turns ?? existing.tail_turns ?? DEFAULT_OPTIONS.tail_turns,
     preserve_recent_tokens:
       options.preserve_recent_tokens ?? existing.preserve_recent_tokens ?? DEFAULT_OPTIONS.preserve_recent_tokens,
@@ -113,7 +127,7 @@ export function resolveOptions(options: ParsedOptions, existing: ExistingOptions
   if (result.max_summary_bytes < result.max_ledger_bytes + 1_024) {
     throw new TypeError('Option "max_summary_bytes" must exceed "max_ledger_bytes" by at least 1024 bytes')
   }
-  if (result.max_summary_bytes < result.max_ledger_bytes + 4_096 + 2_048) {
+  if (result.response_mode === "json" && result.max_summary_bytes < result.max_ledger_bytes + 4_096 + 2_048) {
     throw new TypeError('Option "max_summary_bytes" must leave at least 2048 bytes for the JSON projection after ledger and rendering overhead')
   }
   return result

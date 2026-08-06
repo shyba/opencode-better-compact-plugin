@@ -10,9 +10,19 @@ export const PROJECTION_MIN_BYTES = 2_048
 const CLAIM_LIMITS = {
   goal: 2_048,
   list: 1_024,
-  items: 24,
   refs: 8,
 } as const
+
+export const PROJECTION_SECTION_LIMITS = {
+  constraints: 16,
+  decisions: 16,
+  current_state: 24,
+  blockers: 16,
+  evidence: 32,
+} as const
+
+export const PROJECTION_FILES_MAX = 64
+export const PROJECTION_ACTIONS_MAX = 16
 
 export type ProjectionClaim = { text: string; ledger_refs: string[] }
 export type ProjectedFile = {
@@ -54,16 +64,16 @@ export function validateProjection(value: unknown, ledger: RecoveryLedger, optio
   const references = options.references ?? ledgerReferenceIDs(ledger)
   const goal = claim(object.goal, references, CLAIM_LIMITS.goal)
   if (!goal) return
-  const constraints = claims(object.constraints, references, CLAIM_LIMITS.items)
-  const decisions = claims(object.decisions, references, CLAIM_LIMITS.items)
-  const currentState = claims(object.current_state, references, CLAIM_LIMITS.items)
-  const evidence = claims(object.evidence, references, CLAIM_LIMITS.items)
-  const blockers = claims(object.blockers, references, CLAIM_LIMITS.items)
+  const constraints = claims(object.constraints, references, PROJECTION_SECTION_LIMITS.constraints)
+  const decisions = claims(object.decisions, references, PROJECTION_SECTION_LIMITS.decisions)
+  const currentState = claims(object.current_state, references, PROJECTION_SECTION_LIMITS.current_state)
+  const evidence = claims(object.evidence, references, PROJECTION_SECTION_LIMITS.evidence)
+  const blockers = claims(object.blockers, references, PROJECTION_SECTION_LIMITS.blockers)
   if (!constraints || !decisions || !currentState || !evidence || !blockers) return
-  if (!Array.isArray(object.files) || object.files.length > 64) return
+  if (!Array.isArray(object.files) || object.files.length > PROJECTION_FILES_MAX) return
   const files = object.files.map((item) => file(item, references, ledger)).filter((item): item is ProjectedFile => Boolean(item))
   if (files.length !== object.files.length) return
-  if (!Array.isArray(object.next_actions) || object.next_actions.length > 16) return
+  if (!Array.isArray(object.next_actions) || object.next_actions.length > PROJECTION_ACTIONS_MAX) return
   const nextActions = object.next_actions.map((item) => action(item, references)).filter((item): item is ProjectedAction => Boolean(item))
   if (nextActions.length !== object.next_actions.length) return
   return { version: 1, goal, constraints, decisions, current_state: currentState, files, evidence, blockers, next_actions: nextActions, ledger_sha256: object.ledger_sha256 } satisfies ProjectedSummary
@@ -123,10 +133,23 @@ export function remapProjection(projection: ProjectedSummary, ledger: RecoveryLe
     const refs = item.evidence_refs.filter((ref) => references.has(ref))
     return refs.length ? { ...item, evidence_refs: refs } : undefined
   }).filter((item): item is ProjectedFile => Boolean(item))
-  const nextActions = projection.next_actions.map((item) => {
+  // A projected action whose references no longer resolve is stale. It must never be
+  // silently presented as current work, so surface it as a bounded question anchored
+  // to the surviving goal instead of dropping it.
+  const nextActions: ProjectedAction[] = []
+  const staleActions: ProjectionClaim[] = []
+  for (const item of projection.next_actions) {
     const refs = item.ledger_refs.filter((ref) => references.has(ref))
-    return refs.length ? { ...item, ledger_refs: refs } : undefined
-  }).filter((item): item is ProjectedAction => Boolean(item))
+    if (refs.length) {
+      nextActions.push({ ...item, ledger_refs: refs })
+      continue
+    }
+    staleActions.push({
+      text: truncateUtf8(`[stale projected action] ${item.text} — verify before resuming`, CLAIM_LIMITS.list),
+      ledger_refs: goal.ledger_refs.slice(0, 1),
+    })
+  }
+  const blockers = [...remapClaims(projection.blockers), ...staleActions].slice(0, PROJECTION_SECTION_LIMITS.blockers)
   return {
     ...projection,
     goal,
@@ -135,7 +158,7 @@ export function remapProjection(projection: ProjectedSummary, ledger: RecoveryLe
     current_state: remapClaims(projection.current_state),
     files,
     evidence: remapClaims(projection.evidence),
-    blockers: remapClaims(projection.blockers),
+    blockers,
     next_actions: nextActions,
     ledger_sha256: ledger.digest,
   } satisfies ProjectedSummary
@@ -212,7 +235,7 @@ function file(value: unknown, references: Set<string>, ledger: RecoveryLedger): 
   if (!value || typeof value !== "object" || Array.isArray(value)) return
   const object = value as Record<string, unknown>
   if (!exactKeys(object, ["path", "status", "summary", "evidence_refs"]) || typeof object.path !== "string" || typeof object.status !== "string" || typeof object.summary !== "string" || !Array.isArray(object.evidence_refs)) return
-  if (!/^(changed|created|deleted|read|unchanged|unverified)$/.test(object.status) || utf8Bytes(object.path) > 512 || utf8Bytes(object.summary) > CLAIM_LIMITS.list || object.evidence_refs.length > CLAIM_LIMITS.refs) return
+  if (!/^(changed|created|deleted|read|unchanged|unverified)$/.test(object.status) || !object.path.trim() || utf8Bytes(object.path) > 512 || utf8Bytes(object.summary) > CLAIM_LIMITS.list || object.evidence_refs.length > CLAIM_LIMITS.refs) return
   if (object.status !== "unverified" && !ledger.data.touched_paths.includes(object.path)) return
   const refs = object.evidence_refs.filter((item): item is string => typeof item === "string" && references.has(item) && item.startsWith("evidence:"))
   if (refs.length !== object.evidence_refs.length || !refs.length) return

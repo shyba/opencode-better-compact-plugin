@@ -31,6 +31,22 @@ describe("sanitized compaction eval", () => {
     expect(report.plugin_gates.passed).toBe(true)
   })
 
+  test("compares the markdown and JSON projections against the fallback gates", async () => {
+    const report = await runEval({ provider: fixtureProvider, repetitions: 3, quiet: true })
+    expect(report.projections.markdown.runs).toBe(90)
+    expect(report.projections.json.runs).toBe(90)
+    expect(report.projections.markdown.fallbacks).toBe(60)
+    expect(report.projections.json.fallbacks).toBe(60)
+    for (const mode of ["markdown", "json"] as const) {
+      expect(report.projections[mode].structural_valid).toEqual({ count: 90, total: 90, rate: 1 })
+      expect(report.projections[mode].digest_valid).toEqual({ count: 90, total: 90, rate: 1 })
+      expect(report.projections[mode].invalid_or_empty_auto_continuations).toBe(0)
+      expect(report.projections[mode].key_fact_recall.rate).toBeGreaterThanOrEqual(0.95)
+      expect(report.projections[mode].unsupported_material_claims).toBe(0)
+    }
+    expect(report.projection_gates.passed).toBe(true)
+  })
+
   test("builds a shell-free OpenCode CLI command", () => {
     expect(buildOpenCodeCommand("/opt/opencode/bin/opencode", "demo/model-v1")).toEqual([
       "/opt/opencode/bin/opencode",

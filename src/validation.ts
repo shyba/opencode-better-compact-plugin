@@ -1,3 +1,4 @@
+import type { ResponseMode } from "./options.js"
 import {
   LEDGER_END,
   LEDGER_START,
@@ -10,6 +11,9 @@ import {
   type RecoveryLedgerData,
 } from "./ledger.js"
 import {
+  PROJECTION_ACTIONS_MAX,
+  PROJECTION_FILES_MAX,
+  PROJECTION_SECTION_LIMITS,
   parseProjectionBlock,
   parseProjectionJSON,
   projectionBudget,
@@ -36,7 +40,51 @@ const TERSE_ACKNOWLEDGEMENTS = new Set([
   "k", "yep", "nope", "true", "false", "save", "wait", "load", "next", "ping", "sure", "fine", "great",
 ])
 
-export function buildCompactionPrompt(ledger: RecoveryLedger, maxBytes: number, priorProjection?: ProjectedSummary) {
+export function buildCompactionPrompt(
+  ledger: RecoveryLedger,
+  maxBytes: number,
+  priorProjection?: ProjectedSummary,
+  responseMode: ResponseMode = "json",
+) {
+  if (responseMode === "markdown") {
+    return `Compact the bounded recovery ledger below into the exact Markdown contract that follows. You are responsible for choosing the semantically active goal and the useful fields; do not mechanically copy every entry.
+
+Before answering, silently check:
+- Choose Goal from the substantive recent_requests, ignoring terse acknowledgements such as "check", "continue", or "save" unless no substantive request exists.
+- Keep only constraints, todos, paths, evidence, errors, and next actions relevant to resuming the active work.
+- Treat possible stale todos as questions to surface, never as completed work.
+- Do not invent facts, files, decisions, evidence, blockers, or actions outside the ledger.
+- Preserve the recovery-ledger block byte-for-byte, including its SHA-256 digest.
+- Keep the complete response within ${maxBytes} UTF-8 bytes.
+
+Return only the Markdown summary, with no commentary or code fences around the response. Keep every heading in this order:
+
+## Goal
+- [the active user goal]
+
+## Constraints
+- [relevant ledger-backed constraints, or a truthful placeholder]
+
+## Decisions
+- [ledger-backed decisions only, or a truthful placeholder]
+
+## Current state
+- [concise ledger-backed state]
+
+## Files
+- [relevant explicit paths only, or a truthful placeholder]
+
+## Evidence
+- [bounded ledger-backed evidence only, or a truthful placeholder]
+
+## Blockers/questions
+- [ledger-backed blockers and unresolved questions, or a truthful placeholder]
+
+## Next actions
+- [concrete ledger-grounded next actions]
+
+${ledger.block}`
+  }
   const budget = projectionBudget(maxBytes, Math.min(maxBytes, utf8Bytes(ledger.block)))
   return `Compact the bounded recovery ledger below into exactly one JSON object. You are responsible for choosing the semantically active goal and useful fields; do not mechanically copy every entry.
 
@@ -49,6 +97,7 @@ Before answering, silently check:
 - Use JSON only: no Markdown fences, commentary, duplicate keys, or trailing text.
 - The JSON must include version=1, all required fields, and ledger_sha256=${ledger.digest}.
 - Keep the JSON response within ${Math.max(2_048, budget)} UTF-8 bytes so the rendered summary remains within ${maxBytes} bytes.
+- Respect the item limits: constraints ${PROJECTION_SECTION_LIMITS.constraints}, decisions ${PROJECTION_SECTION_LIMITS.decisions}, current_state ${PROJECTION_SECTION_LIMITS.current_state}, blockers ${PROJECTION_SECTION_LIMITS.blockers}, evidence ${PROJECTION_SECTION_LIMITS.evidence}, files ${PROJECTION_FILES_MAX}, and next_actions ${PROJECTION_ACTIONS_MAX}.
 
 Required JSON shape:
 {"version":1,"goal":{"text":"...","ledger_refs":["..."]},"constraints":[{"text":"...","ledger_refs":["..."]}],"decisions":[{"text":"...","ledger_refs":["..."]}],"current_state":[{"text":"...","ledger_refs":["..."]}],"files":[{"path":"...","status":"changed","summary":"...","evidence_refs":["..."]}],"evidence":[{"text":"...","ledger_refs":["..."]}],"blockers":[{"text":"...","ledger_refs":["..."]}],"next_actions":[{"text":"...","status":"proposed","ledger_refs":["..."]}],"ledger_sha256":"${ledger.digest}"}
@@ -64,13 +113,21 @@ Canonical ledger:
 ${ledger.block}`
 }
 
-export function validateProjectedResponse(text: string, ledger: RecoveryLedger, maxBytes: number) {
+export function validateProjectedResponse(text: string, ledger: RecoveryLedger, maxBytes: number, responseMode: ResponseMode = "json") {
+  if (responseMode === "markdown") {
+    return isPluginValidSummary(text, maxBytes) && parsePluginLedger(text)?.block === ledger.block
+      ? parseProjectedSummary(text, ledger)
+      : undefined
+  }
   const projection = parseProjectionJSON(text, ledger, projectionBudget(maxBytes, Math.min(maxBytes, utf8Bytes(ledger.block))))
   if (!projection) return
   return renderProjection(projection, ledger, maxBytes) ? projection : undefined
 }
 
-export function renderProjectedResponse(text: string, ledger: RecoveryLedger, maxBytes: number) {
+export function renderProjectedResponse(text: string, ledger: RecoveryLedger, maxBytes: number, responseMode: ResponseMode = "json") {
+  if (responseMode === "markdown") {
+    return isPluginValidSummary(text, maxBytes) && parsePluginLedger(text)?.block === ledger.block ? text.trimEnd() : undefined
+  }
   const projection = validateProjectedResponse(text, ledger, maxBytes)
   return projection ? renderProjection(projection, ledger, maxBytes) : undefined
 }

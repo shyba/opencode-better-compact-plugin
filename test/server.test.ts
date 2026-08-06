@@ -16,6 +16,7 @@ import { decodedDataUrlBytes, sanitizeHistory, server } from "../src/server.js"
 import {
   REQUIRED_SECTIONS,
   buildAuthoritativeSummary,
+  buildFallback,
   isAuthoritativeSummary,
   isPluginValidSummary,
   parsePluginLedger,
@@ -1042,6 +1043,57 @@ describe("real hook compaction flows", () => {
     expect(output.retry).toBeUndefined()
     expect(parseProjectedSummary(output.text, ledger)?.goal.text).toBe(requestText)
     expect(output.text).toContain("opencode-safe-compaction projection v1 start")
+    expect(await autocontinue(hooks, sessionID)).toBe(true)
+  })
+
+  test("keeps the legacy Markdown contract under response_mode=markdown", async () => {
+    const sessionID = "markdown-mode"
+    const requestText = "Retain this legacy markdown request"
+    const fixture = { messages: [user("markdown-user", sessionID, requestText)], todos: [] }
+    const mock = state([sessionID, fixture])
+    const hooks = await server(pluginInput(mock), { ...TEST_OPTIONS, response_mode: "markdown" })
+    const prompt = await compact(hooks, sessionID)
+
+    expect(prompt.prompt).toContain("exact Markdown contract")
+    expect(prompt.prompt).not.toContain("Required JSON shape")
+
+    const exchange = compactionExchange(sessionID, "")
+    fixture.messages.push(exchange.request, exchange.summary)
+    const ledger = expectedLedger(fixture, exchange.summary.info.id)
+    const legacy = buildFallback({ ledger, maxBytes: Number(TEST_OPTIONS.max_summary_bytes) })
+    const accepted = await completeOutput(hooks, sessionID, exchange.summary.info.id, exchange.partIDs[0]!, legacy, exchange.summary)
+    expect(accepted.retry).toBeUndefined()
+    expect(accepted.text).toBe(legacy.trimEnd())
+    expect(await autocontinue(hooks, sessionID)).toBe(true)
+  })
+
+  test("rejects JSON candidates under response_mode=markdown and falls back deterministically", async () => {
+    const sessionID = "markdown-mode-json-reject"
+    const requestText = "A JSON candidate must not win in markdown mode"
+    const fixture = { messages: [user("markdown-json-user", sessionID, requestText)], todos: [] }
+    const mock = state([sessionID, fixture])
+    const hooks = await server(pluginInput(mock), { ...TEST_OPTIONS, response_mode: "markdown" })
+    await compact(hooks, sessionID)
+    const exchange = compactionExchange(sessionID, "")
+    fixture.messages.push(exchange.request, exchange.summary)
+    const ledger = expectedLedger(fixture, exchange.summary.info.id)
+    const ref = (section: keyof RecoveryLedgerData, value: unknown) => [ledgerReferenceID(section, value)]
+    const candidate = JSON.stringify({
+      version: 1,
+      goal: { text: requestText, ledger_refs: ref("recent_requests", requestText) },
+      constraints: [],
+      decisions: [],
+      current_state: [],
+      files: [],
+      evidence: [],
+      blockers: [],
+      next_actions: [],
+      ledger_sha256: ledger.digest,
+    })
+    const output = await completeOutput(hooks, sessionID, exchange.summary.info.id, exchange.partIDs[0]!, candidate, exchange.summary)
+    expect(output.retry).toBe(true)
+    expect(isAuthoritativeSummary(output.text, Number(TEST_OPTIONS.max_summary_bytes))).toBe(true)
+    expect(parseProjectedSummary(output.text, ledger)).toBeUndefined()
     expect(await autocontinue(hooks, sessionID)).toBe(true)
   })
 

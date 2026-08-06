@@ -5,6 +5,7 @@ import { fixtureProvider } from "./providers/fixture.js"
 import { openAICompatibleProvider } from "./providers/openai-compatible.js"
 import { openCodeCLIProvider } from "./providers/opencode-cli.js"
 import type {
+  Condition,
   ConditionMetrics,
   EvalCase,
   EvalReport,
@@ -39,14 +40,21 @@ export async function runEval(input: {
   }
   const baseline = accumulator()
   const plugin = accumulator()
+  const markdown = accumulator()
+  const json = accumulator()
   for (const test of cases) {
     for (let repetition = 0; repetition < repetitions; repetition++) {
       await evaluate("baseline", test, repetition, input.provider, prepareBaseline(test), baseline, input.quiet)
-      await evaluate("plugin", test, repetition, input.provider, preparePlugin(test), plugin, input.quiet)
+      await evaluate("plugin", test, repetition, input.provider, preparePlugin(test, "fallback"), plugin, input.quiet)
+      await evaluate("markdown", test, repetition, input.provider, preparePlugin(test, "markdown"), markdown, input.quiet)
+      await evaluate("json", test, repetition, input.provider, preparePlugin(test, "json"), json, input.quiet)
     }
   }
   const baselineMetrics = metrics("baseline", baseline)
   const pluginMetrics = metrics("plugin", plugin)
+  const markdownMetrics = metrics("markdown", markdown)
+  const jsonMetrics = metrics("json", json)
+  const projectionMetrics = { markdown: markdownMetrics, json: jsonMetrics }
   const gates = {
     structural_and_digest_valid_after_fallback:
       pluginMetrics.structural_valid.count === pluginMetrics.structural_valid.total &&
@@ -57,9 +65,21 @@ export async function runEval(input: {
     zero_provider_errors: pluginMetrics.provider_errors === 0,
     passed: false,
   }
-  gates.passed = Object.entries(gates)
-    .filter(([key]) => key !== "passed")
-    .every(([, value]) => value)
+  gates.passed = everyGate(gates)
+  const projectionGates = {
+    structural_and_digest_valid_after_fallback:
+      [markdownMetrics, jsonMetrics].every((value) =>
+        value.structural_valid.count === value.structural_valid.total &&
+        value.digest_valid?.count === value.digest_valid?.total),
+    zero_invalid_or_empty_auto_continuations:
+      [markdownMetrics, jsonMetrics].every((value) => value.invalid_or_empty_auto_continuations === 0),
+    key_fact_recall_at_least_95_percent:
+      [markdownMetrics, jsonMetrics].every((value) => value.key_fact_recall.rate >= 0.95),
+    zero_unsupported_material_claims:
+      [markdownMetrics, jsonMetrics].every((value) => value.unsupported_material_claims === 0),
+    passed: false,
+  }
+  projectionGates.passed = everyGate(projectionGates)
   return {
     corpus_version: CORPUS_VERSION,
     corpus_cases: cases.length,
@@ -68,12 +88,14 @@ export async function runEval(input: {
     live_provider: input.liveProvider ?? false,
     baseline: baselineMetrics,
     plugin: pluginMetrics,
+    projections: projectionMetrics,
     plugin_gates: gates,
+    projection_gates: projectionGates,
   }
 }
 
 async function evaluate(
-  condition: "baseline" | "plugin",
+  condition: Condition,
   test: EvalCase,
   repetition: number,
   provider: ProviderAdapter,
@@ -95,7 +117,7 @@ async function evaluate(
   if (!finished.zeroText) {
     result.structuralTotal++
     if (finished.structuralValid) result.structuralValid++
-    if (condition === "plugin") {
+    if (condition !== "baseline") {
       result.digestTotal++
       if (finished.digestValid) result.digestValid++
     }
@@ -126,7 +148,7 @@ function accumulator(): Accumulator {
   }
 }
 
-function metrics(condition: "baseline" | "plugin", value: Accumulator): ConditionMetrics {
+function metrics(condition: Condition, value: Accumulator): ConditionMetrics {
   return {
     condition,
     runs: value.runs,
@@ -134,7 +156,7 @@ function metrics(condition: "baseline" | "plugin", value: Accumulator): Conditio
     zero_text_responses: value.zeroText,
     fallbacks: value.fallbacks,
     structural_valid: rate(value.structuralValid, value.structuralTotal),
-    ...(condition === "plugin" ? { digest_valid: rate(value.digestValid, value.digestTotal) } : {}),
+    ...(condition !== "baseline" ? { digest_valid: rate(value.digestValid, value.digestTotal) } : {}),
     invalid_or_empty_auto_continuations: value.invalidAutoContinues,
     key_fact_recall: {
       recalled: value.factsRecalled,
@@ -143,6 +165,12 @@ function metrics(condition: "baseline" | "plugin", value: Accumulator): Conditio
     },
     unsupported_material_claims: value.unsupportedClaims,
   }
+}
+
+function everyGate(gates: Record<string, boolean>) {
+  return Object.entries(gates)
+    .filter(([key]) => key !== "passed")
+    .every(([, value]) => value)
 }
 
 function rate(count: number, total: number) {
@@ -183,5 +211,5 @@ if (import.meta.main) {
     liveProvider: providerName !== "fixture",
   })
   console.log(JSON.stringify(report, null, 2))
-  if (!report.plugin_gates.passed) process.exitCode = 1
+  if (!report.plugin_gates.passed || !report.projection_gates.passed) process.exitCode = 1
 }

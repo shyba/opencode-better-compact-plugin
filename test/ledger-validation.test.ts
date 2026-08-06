@@ -262,6 +262,26 @@ describe("recovery ledger", () => {
     expect(ledger.data.touched_paths).not.toContain("/repo/not-a-file-evidence")
   })
 
+  test("accepts explicitly structured source paths from allowlisted write tools", () => {
+    const ledger = buildRecoveryLedger({
+      messages: [message("write", sessionID, "assistant", [{
+        type: "tool",
+        tool: "write",
+        state: {
+          status: "completed",
+          input: {
+            file: { source: { path: "/repo/nested.ts" } },
+            source: { path: "/repo/source.ts" },
+          },
+        },
+      }])],
+      todos: [],
+      tailTurns: 1,
+      maxBytes: 4_096,
+    })
+    expect(ledger.data.touched_paths).toEqual(["/repo/nested.ts", "/repo/source.ts"])
+  })
+
   test("normalizes V1 todos that omit IDs and optional metadata", () => {
     const oversizedWhitespaceID = " ".repeat(1_024 * 1_024) + "must-not-be-reached"
     const input = {

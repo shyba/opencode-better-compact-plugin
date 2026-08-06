@@ -238,6 +238,10 @@ export function buildRecoveryLedger(input: {
         const file = record(input?.file)
         if (typeof file?.path === "string") addBoundedPath(touchedPaths, file.path)
         if (typeof file?.filename === "string") addBoundedPath(touchedPaths, file.filename)
+        const source = record(file?.source)
+        if (typeof source?.path === "string") addBoundedPath(touchedPaths, source.path)
+        const inputSource = record(input?.source)
+        if (typeof inputSource?.path === "string") addBoundedPath(touchedPaths, inputSource.path)
       }
       if (toolStatuses.length < LEDGER_LIMITS.tool_statuses) {
         const status: { tool: string; status: string; title?: string } = {

@@ -134,6 +134,7 @@ Tuple options use snake case. Unknown keys and invalid values fail during plugin
 | Option | Default | Meaning |
 | --- | ---: | --- |
 | `model` | `selected` | `selected` follows the model chosen for each compaction; `provider/model` pins a dedicated compaction model. |
+| `response_mode` | `json` | `json` asks the model for the single strict JSON projection and validates it; `markdown` keeps the legacy Markdown contract for a compatibility window. The legacy Markdown validator stays available in both modes for already-stored plugin summaries. |
 | `tail_turns` | `4` | Number of recent ordinary user requests retained in the recovery ledger. May be zero. |
 | `preserve_recent_tokens` | `16000` | Recent-history budget written into OpenCode's V1 compaction settings. |
 | `reserved_tokens` | `32000` | Context reserved from compaction input; must leave usable model context. |
@@ -142,7 +143,7 @@ Tuple options use snake case. Unknown keys and invalid values fail during plugin
 | `max_inline_data_bytes` | `10485760` | Maximum combined decoded bytes in newly admitted inline `data:` attachments. Encoded representation and metadata have derived fixed bounds. |
 | `max_historical_part_bytes` | `131072` | Maximum UTF-8 bytes exposed from one historical text part during a compaction/recovery attempt. |
 | `max_ledger_bytes` | `12288` | Maximum canonical recovery-ledger block size. |
-| `max_summary_bytes` | `49152` | Maximum accepted summary size. It must leave at least 2048 bytes for the JSON projection after the ledger and rendering overhead. |
+| `max_summary_bytes` | `49152` | Maximum accepted summary size. In `json` mode it must leave at least 2048 bytes for the projection after the ledger and rendering overhead; `markdown` mode retains the legacy 1024-byte margin. |
 
 For values OpenCode already exposes (`model`, `tail_turns`, `preserve_recent_tokens`, and `reserved_tokens`), precedence is explicit tuple option, existing OpenCode value, then plugin default. Other plugin limits use the explicit tuple option or plugin default. The configuration hook pins a dedicated model or removes that override in `selected` mode, sets temperature zero, and applies the selected compaction thresholds. The request hook validates and caps the actual per-compaction model in either mode while preserving an omitted temperature when the model declares that parameter unsupported. Existing explicit `compaction.auto` and `compaction.prune` values are preserved; absent values default to `true` and `false` respectively.
 
@@ -154,7 +155,7 @@ The plugin has five defensive stages:
 
 1. Admission rejects oversized new user text, decoded inline data, or an oversized encoded data-URL representation and reports the measured and allowed byte counts. Data-URL metadata has a fixed 16 KiB ceiling. It recommends file references or smaller chunks; it never silently truncates a new request.
 2. Compaction asks the OpenCode API for the newest 10,000 session messages plus todos, then applies smaller deterministic newest-first message, part, and collection budgets while building the ledger. If that recent window has no prior plugin-valid ledger, it follows at most 255 older 256-message cursor pages until it finds the newest older one or reaches the scan budget; the surrounding provider prose is never trusted. Overflow-replay matching uses the same paging contract and stops as soon as it has the two distinct durable requests needed for proof. Page order or durable creation time establishes chronology rather than caller-controlled Message IDs. Requests and constraints come only from eligible user text; assistant, synthetic, and ignored prose cannot become recovered intent. The fallback Goal chooses the newest substantive request instead of a terse acknowledgement such as `check` or `continue`; if every recovered request is terse, it uses an honest placeholder. Synthetic carry-over actions are not accumulated across ledgers. Touched paths come only from explicit patch/file artifacts, not arbitrary tool-input strings; they are normalized and short URL/API fragments are rejected. Credential-shaped values are redacted, and tool evidence hashes only a bounded source prefix rather than scanning or copying an unbounded output.
-3. The compaction prompt asks for one strict JSON object with the required semantic fields and stable ledger references. The accepted response is rendered as Markdown with `Goal`, `Constraints`, `Decisions`, `Current state`, `Files`, `Evidence`, `Blockers/questions`, and `Next actions`, followed by a versioned projection block and the canonical SHA-256 recovery-ledger block.
+3. The compaction prompt asks for one strict JSON object with the required semantic fields and stable ledger references. Per-section item limits bound the response: constraints 16, decisions 16, current state 24, blockers 16, evidence 32, files 64, and next actions 16, each item at most 1,024 bytes with at most 8 references. The accepted response is rendered as Markdown with `Goal`, `Constraints`, `Decisions`, `Current state`, `Files`, `Evidence`, `Blockers/questions`, and `Next actions`, followed by a versioned projection block and the canonical SHA-256 recovery-ledger block. Stale projected next actions whose references no longer resolve on a later compaction are surfaced as bounded `[stale projected action]` blockers/questions anchored to the surviving goal instead of being silently dropped.
 4. During an initial compaction in `selected` mode, the cloned provider history is left byte-for-byte unchanged so a provider may reuse its existing prompt-cache prefix; the bounded ledger and replacement instruction are appended as the new compaction request. Recovery and overflow replay histories are redacted and byte-bounded; dedicated-model compactions also use the safer transformed history because they cannot reuse the ordinary model's cache. Reasoning is converted to unsigned text; credential-keyed tool input values, outputs, errors, state metadata, and attachments are redacted or bounded; inline and external attachments are replaced by metadata-only omission markers. Bounded opaque provider continuation metadata is preserved because same-model Gemini and similar providers require its signatures to replay tool calls. Malformed historical data URLs cannot abort compaction. Normal turns are left byte-for-byte unchanged.
 5. Every targeted nonempty compaction text is replaced with the exact deterministic summary derived from the canonical ledger. Auto-continuation re-loads durable history, binds to the precise core compaction parent, and permits continuation only when that exact summary and ledger still match. An earlier plugin's disabled setting is preserved.
 
@@ -209,22 +210,23 @@ For a portability smoke test, copy or clone the repository outside any OpenCode 
 
 ## Evaluation
 
-The `eval/` directory contains 30 sanitized, synthetic transcripts. The runner evaluates three repetitions per case under two separately implemented conditions:
+The `eval/` directory contains 30 sanitized, synthetic transcripts. The runner evaluates three repetitions per case under four separately implemented conditions:
 
 - `baseline` uses a checked-in snapshot of the OpenCode 1.18.4 V1 compaction prompt. It is informational and does not import OpenCode core.
-- `plugin` uses this package's real ledger builder, compaction prompt, and authoritative deterministic-summary generator.
+- `plugin` reproduces the deterministic fallback contract: whatever the model produced, the accepted text is the ledger-grounded authoritative summary, and continuation is gated on its structure and digest.
+- `markdown` and `json` exercise the two projection contracts end to end: the model is prompted with the Markdown or JSON contract, its output is validated (including digest and stable references), and only a valid projection is accepted before any fallback.
 
-Provider transport is a separate adapter shared by both conditions. The default fixture adapter is deterministic and deliberately cycles through valid, malformed, and refusal responses so the harness and fallback path can be tested offline. It is not evidence of model quality or live-provider performance.
+Provider transport is a separate adapter shared by all conditions. The default fixture adapter is deterministic and deliberately cycles through valid, malformed, and refusal responses so the harness and fallback path can be tested offline. For the `json` condition the valid response is a ledger-referenced JSON projection. It is not evidence of model quality or live-provider performance.
 
 ```sh
-# Offline harness/tests: 30 cases x 3 repetitions x 2 conditions
+# Offline harness/tests: 30 cases x 3 repetitions x 4 conditions
 bun test eval
 
 # Print the deterministic report
 bun eval/run.ts --provider fixture --repetitions 3
 ```
 
-The report includes structural validity, plugin digest validity, invalid/empty auto-continuations, exact normalized key-fact recall, and matches against each case's explicit unsupported-material-claim list. The structural/digest denominator contains nonempty accepted responses; zero-text responses are reported separately because the runtime text hook cannot replace them. The plugin gate requires 100% structure/digest validity after applicable fallback, zero invalid or empty auto-continuations, at least 95% key-fact recall, zero listed unsupported claims, and zero provider errors.
+The report includes structural validity, plugin digest validity, invalid/empty auto-continuations, exact normalized key-fact recall, and matches against each case's explicit unsupported-material-claim list. The structural/digest denominator contains nonempty accepted responses; zero-text responses are reported separately because the runtime text hook cannot replace them. The plugin gate requires 100% structure/digest validity after applicable fallback, zero invalid or empty auto-continuations, at least 95% key-fact recall, zero listed unsupported claims, and zero provider errors. The same requirements apply to the Markdown and JSON projection conditions in `projection_gates`.
 
 The unsupported-claim metric is a closed, reproducible corpus check, not a general semantic hallucination judge. Review accepted summaries separately before treating a new provider/model as qualified.
 
@@ -236,7 +238,7 @@ SAFE_COMPACTION_EVAL_MODEL="opencode-go/glm-5.2" \
 bun eval/run.ts --provider opencode-cli --repetitions 3
 ```
 
-The adapter starts one non-interactive `opencode run --agent compaction` process per condition, case, and repetition, injects an evaluation-only `{"*":"deny"}` permission override for that agent, passes the tagged synthetic message sequence through stdin, and uses the selected model from the installed OpenCode configuration. A full 30-case, three-repetition comparison starts 180 isolated CLI runs and may consume provider quota. It strips ANSI presentation, normalizes line endings, removes the OpenCode assistant header, and preserves the complete requested baseline or plugin response from plain stdout so trailing material is validated. CLI stderr is consumed but never copied into the eval report or error log, avoiding accidental conversation-content logging.
+The adapter starts one non-interactive `opencode run --agent compaction` process per condition, case, and repetition, injects an evaluation-only `{"*":"deny"}` permission override for that agent, passes the tagged synthetic message sequence through stdin, and uses the selected model from the installed OpenCode configuration. A full 30-case, three-repetition comparison starts 360 isolated CLI runs and may consume provider quota. It strips ANSI presentation, normalizes line endings, removes the OpenCode assistant header, and preserves the complete requested baseline or plugin response from plain stdout so trailing material is validated. CLI stderr is consumed but never copied into the eval report or error log, avoiding accidental conversation-content logging.
 
 Alternatively, run the same corpus directly against an OpenAI-compatible chat-completions endpoint:
 

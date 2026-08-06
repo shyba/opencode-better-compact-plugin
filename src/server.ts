@@ -143,7 +143,7 @@ export async function server(input: PluginInput, rawOptions?: OpenCodePluginOpti
           ...(projection ? { projection } : {}),
           validation: "pending",
         })
-        output.prompt = buildCompactionPrompt(ledger, options.max_summary_bytes, projection)
+        output.prompt = buildCompactionPrompt(ledger, options.max_summary_bytes, projection, options.response_mode)
       }, () => {
         attempts.delete(sessionID)
       })
@@ -274,14 +274,17 @@ export async function server(input: PluginInput, rawOptions?: OpenCodePluginOpti
         attempt.textPartID = hookInput.partID
         attempt.summaryMessageID = hookInput.messageID
         const candidate = output.text.trimEnd()
-        const projected = renderProjectedResponse(candidate, attempt.ledger, options.max_summary_bytes)
+        const projected = renderProjectedResponse(candidate, attempt.ledger, options.max_summary_bytes, options.response_mode)
         if (projected) {
           output.text = projected
           attempt.validation = "provider"
           return
         }
+        // In JSON mode a plugin-valid legacy Markdown summary remains a compatibility
+        // anchor. Markdown mode already validated the candidate above.
         const candidateLedger = parsePluginLedger(candidate)
         if (
+          options.response_mode === "json" &&
           targetTextParts >= 1 &&
           candidateLedger?.block === attempt.ledger.block &&
           isPluginValidSummary(candidate, options.max_summary_bytes)

@@ -56,7 +56,7 @@ export function parsePlainAssistantOutput(stdout: string, condition: ProviderReq
   const lines = normalized.split("\n")
   const header = lines.findLastIndex((line) => /^>\s+.+\s+[·•]\s+.+\s*$/.test(line))
   const body = lines.slice(header + 1).join("\n").trim()
-  const heading = condition === "plugin" ? "## Goal" : "## Objective"
+  const heading = condition === "baseline" ? "## Objective" : "## Goal"
   const starts = [...body.matchAll(new RegExp(`^${escapeRegExp(heading)}\\s*$`, "gm"))]
   const start = starts.at(-1)?.index
   if (start === undefined) return body

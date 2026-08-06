@@ -32,8 +32,10 @@ export type ProviderMessage = {
   content: string
 }
 
+export type Condition = "baseline" | "plugin" | "markdown" | "json"
+
 export type ProviderRequest = {
-  condition: "baseline" | "plugin"
+  condition: Condition
   caseID: string
   repetition: number
   messages: ProviderMessage[]
@@ -61,7 +63,7 @@ export type PreparedCondition = {
 }
 
 export type ConditionMetrics = {
-  condition: "baseline" | "plugin"
+  condition: Condition
   runs: number
   provider_errors: number
   zero_text_responses: number
@@ -81,12 +83,23 @@ export type EvalReport = {
   live_provider: boolean
   baseline: ConditionMetrics
   plugin: ConditionMetrics
+  projections: {
+    markdown: ConditionMetrics
+    json: ConditionMetrics
+  }
   plugin_gates: {
     structural_and_digest_valid_after_fallback: boolean
     zero_invalid_or_empty_auto_continuations: boolean
     key_fact_recall_at_least_95_percent: boolean
     zero_unsupported_material_claims: boolean
     zero_provider_errors: boolean
+    passed: boolean
+  }
+  projection_gates: {
+    structural_and_digest_valid_after_fallback: boolean
+    zero_invalid_or_empty_auto_continuations: boolean
+    key_fact_recall_at_least_95_percent: boolean
+    zero_unsupported_material_claims: boolean
     passed: boolean
   }
 }
