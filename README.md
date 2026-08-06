@@ -193,6 +193,80 @@ This plugin mitigates compaction failures; it cannot make OpenCode's core cutove
 - During recovery, the model is explicitly asked to compare pending todos with the recent request thread and flag possible zombies by ID. That review is advisory only; the plugin never marks, deletes, or rewrites a todo from model judgment alone.
 - Attempt state is process-local. This plugin does not implement clustered compaction ownership or crash-safe provider retries.
 
+## Pi support
+
+The package ships two pi extension entry points alongside the OpenCode V1 plugin. They are separate from the OpenCode runtime and are loaded by pi, not by OpenCode.
+
+### `opencode-safe-compaction/pi` — recovery-ledger compaction
+
+A pi extension that re-uses the same host-agnostic core (`ledger.ts`, `projection.ts`, `validation.ts`, `options.ts`) to do ledger-grounded compaction through pi's own events, with no OpenCode involvement.
+
+Install the built module and load it as a pi extension:
+
+```sh
+pi -e /abs/path/to/dist/pi.js
+```
+
+or add it to `~/.pi/agent/settings.json` packages/extensions. The extension registers:
+
+- `session_before_compact` — builds the bounded recovery ledger from the messages pi is about to summarize (plus the split-turn prefix), optionally chains a prior plugin-valid ledger found on the branch, asks the selected compaction model (or a pinned one) for the strict JSON projection, validates digest/refs, and returns either the rendered projection summary or the deterministic authoritative fallback. Any internal failure degrades to pi's default compaction.
+- `session_before_tree` — the same pipeline for `/tree` branch summarization when the user opts into a summary.
+- `/compaction-model` — pick a dedicated compaction model or "follow selected model". The choice is persisted to `<cwd>/.pi/safe-compaction.json` (mode `0600`, atomic rename).
+
+Plugin-side options are read from `<cwd>/.pi/safe-compaction.json`:
+
+```jsonc
+{
+  "model": "selected",
+  "response_mode": "json",
+  "tail_turns": 4,
+  "max_output_tokens": 16384,
+  "max_user_text_bytes": 524288,
+  "max_inline_data_bytes": 10485760,
+  "max_historical_part_bytes": 131072,
+  "max_ledger_bytes": 12288,
+  "max_summary_bytes": 49152
+}
+```
+
+`model: "selected"` follows the model pi selects for the session; `provider/model` pins a dedicated compaction model. `preserve_recent_tokens` and `reserved_tokens` are not persisted here — pi manages its own recent-history budgets via `compaction.keepRecentTokens` / `compaction.reserveTokens`.
+
+Todo recovery depends on a user-installed todo-tracking extension (e.g. the `todo` example). The adapter scans the branch for the most recent `todo`-tool result; with no such extension installed the ledger's todos section is empty.
+
+Pi-specific limits:
+
+- No admission hook for oversized input — pi rejects oversized messages at its own layer.
+- No history-transform hook — sanitization runs inside the ledger build (input) and the rendered summary (output) only. The model-visible history pi sends to its own summarizer is untouched.
+- Runs under both Bun-based and Node-based pi installs; under Node a minimal `node:crypto`-backed shim provides the `Bun.CryptoHasher` the shared core uses.
+
+### `opencode-safe-compaction/cat` — attach files to context
+
+A `/cat` slash command that attaches full file contents to the conversation, bypassing pi's bash-output truncation (pi truncates `!cmd` output at ~50 KiB and `!!cmd` excludes it from context entirely).
+
+```
+/cat <ext> [dir] [tokens]          shorthand: all <ext> files under dir (default .)
+/cat <glob>... [tokens]            explicit globs: src/**/*.ts, 'src/**/*.{ts,tsx}'
+```
+
+Examples:
+
+```
+/cat .rs src                       all .rs files under src
+/cat .md                           all .md files under cwd
+/cat src/main.ts src/util.ts       two literal files
+/cat 'src/**/*.ts' 80000           glob capped at 80k tokens
+```
+
+Behavior:
+
+- Files are read in full (no truncation), wrapped in `<file:path>` markers, and injected as a single user message via `pi.sendUserMessage`. When the agent is streaming the message is queued as a follow-up.
+- Before injecting, the projected token count (current usage from `ctx.getContextUsage()` plus `chars / 4` per character, the same heuristic pi uses) is compared against the model context window. If it would exceed `warnThreshold` (default `0.95`) of the window, the command refuses and lists the three largest files; run `/compact` first or re-run with a narrower pattern or a `[tokens]` budget.
+- A trailing integer argument is a token budget: the read stops once cumulative estimates exceed it.
+- A default skip list excludes `node_modules`, `.git`, `dist`, `build`, `out`, `target`, `vendor`, `__pycache__`, `.next`, `.nuxt`, `.turbo`, `.cache`, `.venv`, `venv`, `.idea`, `.vscode`, `.gradle`. Binary files, files over `maxFileBytes` (4 MiB), and results over `maxTotalBytes` (32 MiB) or `maxFileCount` (1000) are skipped with a marker.
+- Settings live in `<cwd>/.pi/cat-files.json` (mode `0600`): `warnThreshold`, `unknownUsageFraction`, `charsPerToken`, `maxFileBytes`, `maxTotalBytes`, `maxFileCount`, `skipDirs`.
+
+Token counts are approximate (`chars / 4`, matching pi's own estimator). Lower `charsPerToken` (e.g. `3.5`) or `warnThreshold` for pessimistic estimates. There is no confirmation dialog — the command either injects or refuses.
+
 ## Development and packaging
 
 Run commands from this repository, not from an enclosing checkout:
@@ -202,11 +276,11 @@ bun install --frozen-lockfile
 bun run typecheck
 bun test
 bun run build
-bun -e 'await Promise.all([import("./dist/index.js"), import("./dist/tui.js")])'
+bun -e 'await Promise.all([import("./dist/index.js"), import("./dist/tui.js"), import("./dist/pi.js"), import("./dist/cat.js")])'
 npm pack --dry-run
 ```
 
-`dist/` is deliberately untracked. `prepack` builds the server and TUI modules plus TypeScript declarations. The package includes the transactional configurator used by the selector and exposes `opencode-safe-compaction`, `opencode-safe-compaction/server`, and `opencode-safe-compaction/tui`; the root and server exports resolve to the server runtime, while the TUI export contains only the selector. Keep `private: true` until publication is explicitly approved.
+`dist/` is deliberately untracked. `prepack` builds the server and TUI modules plus TypeScript declarations. The package includes the transactional configurator used by the selector and exposes `opencode-safe-compaction`, `opencode-safe-compaction/server`, `opencode-safe-compaction/tui`, `opencode-safe-compaction/pi`, and `opencode-safe-compaction/cat`; the root and server exports resolve to the server runtime, the TUI export contains only the selector, and the pi and cat exports are the pi extension entry points. Keep `private: true` until publication is explicitly approved.
 
 For a portability smoke test, copy or clone the repository outside any OpenCode checkout, repeat install/build/test, and load either the absolute `runtime` directory or the packed artifact from an isolated OpenCode configuration. Nothing in source, tests, or eval tooling depends on the parent checkout.
 
