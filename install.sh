@@ -503,7 +503,14 @@ install_cli_wrapper() {
   fi
   cli_wrapper=$cli_bin_dir/better-compact
   cli_temp=$cli_wrapper.tmp.$$
-  printf '%s\n' '#!/bin/sh' "exec \"$persistent_bun\" \"$install_dir/scripts/cli.ts\" \"\$@\"" > "$cli_temp"
+  fallback_install_dir=$HOME/.local/share/opencode/plugins/safe-compaction
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    "cli=\"$install_dir/scripts/cli.ts\"" \
+    "if [ ! -f \"\$cli\" ] && [ -f \"$fallback_install_dir/scripts/cli.ts\" ]; then cli=\"$fallback_install_dir/scripts/cli.ts\"; fi" \
+    "if [ ! -f \"\$cli\" ]; then echo \"better-compact: installed CLI source is missing; rerun the installer\" >&2; exit 1; fi" \
+    "exec \"$persistent_bun\" \"\$cli\" \"\$@\"" > "$cli_temp"
   chmod 755 "$cli_temp"
   mv -f "$cli_temp" "$cli_wrapper"
   say "installed CLI at $cli_wrapper"
