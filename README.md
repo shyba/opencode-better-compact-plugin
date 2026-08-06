@@ -67,6 +67,8 @@ better-compact installation reset --yes
 better-compact installation adopt --yes
 ```
 
+The generated wrapper points at the persistent checkout and also falls back to the standard checkout path if an older wrapper still references a deleted temporary installer directory. Re-running the installer repairs that wrapper in place.
+
 `installation reset --yes` intentionally discards the local sync identity, cursors, and outbox so the next run starts a new installation. `installation adopt --yes` is the explicit clone/recovery operation: it imports the remote source incarnation and high-water mark, then acknowledges matching local rows. Both commands are destructive and require the flag.
 
 `doctor` checks the managed checkout, both OpenCode configuration surfaces, the OpenCode and Bun executables, and performs a read-only SQLite probe. `update` runs the same rollback-safe checkout/configuration transaction as the installer. If Bun was bootstrapped temporarily during installation, install Bun separately or invoke the CLI with `OPENCODE_SAFE_COMPACTION_BUN=/path/to/bun`.
