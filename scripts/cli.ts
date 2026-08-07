@@ -27,6 +27,11 @@ if (command === "help" || command === "--help" || command === "-h") {
   process.exit(0)
 }
 if (command === "install") {
+  if (process.argv[3] === "pi") process.exit(await installPi())
+  if (process.argv[3]) {
+    console.error("Usage: better-compact install [pi]")
+    process.exit(2)
+  }
   process.exit(await activate())
 }
 if (command === "update") {
@@ -59,7 +64,8 @@ function printHelp() {
   console.log(`better-compact - OpenCode safe-compaction maintenance
 
 Usage:
-  better-compact install  Activate the plugin using the selected installation mode
+  better-compact install  Activate the OpenCode plugin using the selected installation mode
+  better-compact install pi  Register both extensions with Pi
   better-compact update   Update the managed checkout and verify configuration
   better-compact doctor   Check installation, OpenCode, configuration, and SQLite access
   better-compact sync run [--once] [--config FILE] [--state FILE] Discover sources and deliver redacted records
@@ -73,6 +79,8 @@ Environment overrides:
   OPENCODE_SAFE_COMPACTION_CONFIG_DIR
   OPENCODE_SAFE_COMPACTION_OPENCODE
   OPENCODE_SAFE_COMPACTION_BUN
+  OPENCODE_SAFE_COMPACTION_PI
+  OPENCODE_SAFE_COMPACTION_PI_SOURCE
   OPENCODE_DB
   BETTER_COMPACT_CONFIG
   BETTER_COMPACT_STATE`)
@@ -118,6 +126,37 @@ async function activate() {
     OPENCODE_SAFE_COMPACTION_TUI_ENTRY: path.join(packageRoot, "dist", "tui.js"),
   }
   return run(bun, [configure], environment)
+}
+
+async function installPi() {
+  const pi = process.env.OPENCODE_SAFE_COMPACTION_PI ?? "pi"
+  if (!(await commandWorks(pi, ["--version"]))) {
+    console.error(`Pi executable not found or not runnable: ${pi}`)
+    console.error("Install Pi first, or set OPENCODE_SAFE_COMPACTION_PI to its absolute executable path")
+    return 2
+  }
+
+  const mode = await installationMode()
+  const source = piSource(mode)
+  if (!source) return 2
+  console.log(`Installing safe-compaction Pi extensions from ${source}`)
+  return run(pi, ["install", source], process.env)
+}
+
+function piSource(mode: Awaited<ReturnType<typeof installationMode>>) {
+  const override = process.env.OPENCODE_SAFE_COMPACTION_PI_SOURCE
+  if (override) return packageSource(override)
+  if (mode === "npx") {
+    console.error("npx is ephemeral; set OPENCODE_SAFE_COMPACTION_PI_SOURCE to a Git or npm Pi package source")
+    return undefined
+  }
+  if (mode === "git") return installDir
+  return path.resolve(path.dirname(process.argv[1] ?? "."), "..")
+}
+
+function packageSource(source: string) {
+  if (source.startsWith("git:") || source.startsWith("npm:") || source.includes("://")) return source
+  return path.resolve(source)
 }
 
 async function installationMode() {
@@ -470,9 +509,9 @@ function commandWorks(command: string, args: string[]) {
 }
 
 function run(command: string, args: string[], env: NodeJS.ProcessEnv) {
-  return new Promise<number>((resolve, reject) => {
+  return new Promise<number>((resolve) => {
     const child = spawn(command, args, { stdio: "inherit", env })
-    child.once("error", reject)
+    child.once("error", () => resolve(127))
     child.once("exit", (code) => resolve(code ?? 1))
   })
 }

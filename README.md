@@ -61,6 +61,7 @@ The installer also creates `better-compact` in the user bin directory when a per
 better-compact help
 better-compact doctor
 better-compact update
+better-compact install pi
 better-compact sync run --once
 better-compact sync status
 better-compact installation reset --yes
@@ -68,6 +69,8 @@ better-compact installation adopt --yes
 ```
 
 The generated wrapper points at the persistent checkout and also falls back to the standard checkout path if an older wrapper still references a deleted temporary installer directory. Re-running the installer repairs that wrapper in place.
+
+`better-compact install pi` delegates to Pi's package manager and registers both the recovery-ledger and `/cat` extensions. For a Git-installed Better Compact checkout, it uses that managed checkout as a local Pi package, so `better-compact update` updates both hosts together. Set `OPENCODE_SAFE_COMPACTION_PI` when the `pi` executable is not on `PATH`; set `OPENCODE_SAFE_COMPACTION_PI_SOURCE` to a `git:...`, `npm:...`, or absolute package path to override the source. The command refuses an implicit `npx` source because its temporary directory disappears after the command; provide an explicit source instead.
 
 `installation reset --yes` intentionally discards the local sync identity, cursors, and outbox so the next run starts a new installation. `installation adopt --yes` is the explicit clone/recovery operation: it imports the remote source incarnation and high-water mark, then acknowledges matching local rows. Both commands are destructive and require the flag.
 
