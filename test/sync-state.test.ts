@@ -81,6 +81,21 @@ describe("portable better-compact state", () => {
     state.close()
   })
 
+  test("reconciles only the completed JSONL file prefix", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "better-compact-state-"))
+    temporary.push(directory)
+    const state = await openSyncState(path.join(directory, "state.sqlite"))
+    state.ensureInstallation("install-1", "incarnation-1")
+    state.upsertSource({ id: "source-1", installationID: "install-1", kind: "codex-jsonl", schemaVersion: 1, locator: "fixture://jsonl", incarnation: "source-inc-1" })
+    const records = [0, 1, 2].map((line) => ({ sourceID: "source-1", recordKind: "message", naturalKey: `session.jsonl|line:${line}`, payloadJSON: JSON.stringify({ line }), payloadSHA256: `hash-${line}`, observedAt: line + 1 }))
+    state.enqueue(records, "source-1", "messages", { cursor: 3 })
+    state.enqueue([], "source-1", "messages", { cursor: 2 }, "postgres", { prefixes: [{ prefix: "session.jsonl|", lineCount: 2, recordKinds: ["session", "message"] }] })
+    const rows = state.claim("postgres", 10, 3)
+    expect(rows.some((row) => row.operation === "delete" && row.naturalKey === "session.jsonl|line:2")).toBe(true)
+    expect(rows.some((row) => row.operation === "delete" && row.naturalKey === "session.jsonl|line:1")).toBe(false)
+    state.close()
+  })
+
   test("keeps failed rows retryable and refuses revision gaps", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "better-compact-state-"))
     temporary.push(directory)

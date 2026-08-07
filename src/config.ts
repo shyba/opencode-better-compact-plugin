@@ -10,6 +10,7 @@ export type SyncConfig = {
   include_parts: boolean
   include_tool_output: boolean
   retention_days: number
+  allow_insecure_remote: boolean
 }
 
 export type SourceConfig = {
@@ -42,6 +43,7 @@ const defaults: BetterCompactConfig = {
     include_parts: true,
     include_tool_output: false,
     retention_days: 90,
+    allow_insecure_remote: false,
   },
   sources: [],
   installation: { name: "default" },
@@ -112,6 +114,6 @@ export function validateConfig(value: unknown): BetterCompactConfig {
   for (const key of ["poll_interval_ms", "batch_size", "max_outbox_bytes", "retention_days"] as const) {
     if (!Number.isSafeInteger(result.sync[key]) || result.sync[key] <= 0) throw new TypeError(`sync.${key} must be a positive integer`)
   }
-  if (typeof result.sync.include_parts !== "boolean" || typeof result.sync.include_tool_output !== "boolean") throw new TypeError("sync include flags must be boolean")
+  if (typeof result.sync.include_parts !== "boolean" || typeof result.sync.include_tool_output !== "boolean" || typeof result.sync.allow_insecure_remote !== "boolean") throw new TypeError("sync include flags must be boolean")
   return result
 }

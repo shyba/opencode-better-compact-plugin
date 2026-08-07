@@ -120,7 +120,7 @@ export class SyncState {
     try { return JSON.parse(row.checkpoint_json) as Record<string, unknown> } catch { return undefined }
   }
 
-  enqueue(records: NormalizedRecord[], sourceID: string, stream: string, checkpoint: unknown, destinationID = "postgres", snapshot?: { complete: boolean; recordKinds: string[] }, maxOutboxBytes = Number.POSITIVE_INFINITY) {
+  enqueue(records: NormalizedRecord[], sourceID: string, stream: string, checkpoint: unknown, destinationID = "postgres", snapshot?: { complete?: boolean; recordKinds?: string[]; prefixes?: Array<{ prefix: string; lineCount: number; recordKinds: string[] }> }, maxOutboxBytes = Number.POSITIVE_INFINITY) {
     const transaction = this.db.transaction(() => {
       let nextRevision = this.nextRevision(sourceID)
       for (const record of records) {
@@ -134,24 +134,42 @@ export class SyncState {
           values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
           on conflict(destination_id, source_id, record_kind, natural_key, record_revision) do nothing`).run(destinationID, record.sourceID, record.recordKind, record.naturalKey, record.routingJSON ?? null, record.payloadJSON ?? null, record.payloadSHA256, nextRevision, record.deletedAt === undefined ? "upsert" : "delete", Date.now(), Date.now())
       }
-      if (snapshot?.complete) {
-        const seen = new Set(records.filter((record) => snapshot.recordKinds.includes(record.recordKind)).map((record) => `${record.recordKind}\u0000${record.naturalKey}`))
+      if (snapshot?.complete && snapshot.recordKinds?.length) {
+        const seen = new Set(records.filter((record) => snapshot.recordKinds?.includes(record.recordKind)).map((record) => `${record.recordKind}\u0000${record.naturalKey}`))
         const placeholders = snapshot.recordKinds.map(() => "?").join(",")
         const existing = this.db.query(`select record_kind, natural_key, routing_json from normalized_record where source_id=? and record_kind in (${placeholders}) and deleted_at is null`).all(sourceID, ...snapshot.recordKinds) as Array<{ record_kind: string; natural_key: string; routing_json?: string }>
         for (const row of existing) {
           if (seen.has(`${row.record_kind}\u0000${row.natural_key}`)) continue
-          nextRevision++
-          const deletedAt = Date.now()
-          this.db.query(`update normalized_record set payload_json=null, payload_sha256='', record_revision=?, deleted_at=?, observed_at=? where source_id=? and record_kind=? and natural_key=?`).run(nextRevision, deletedAt, deletedAt, sourceID, row.record_kind, row.natural_key)
-          this.db.query(`insert into outbox(destination_id, source_id, record_kind, natural_key, routing_json, payload_json, payload_sha256, record_revision, operation, state, next_attempt_at, created_at)
-            values (?, ?, ?, ?, ?, null, '', ?, 'delete', 'pending', ?, ?)
-            on conflict(destination_id, source_id, record_kind, natural_key, record_revision) do nothing`).run(destinationID, sourceID, row.record_kind, row.natural_key, row.routing_json ?? null, nextRevision, Date.now(), Date.now())
+          nextRevision = this.enqueueTombstone(nextRevision, destinationID, sourceID, row)
+        }
+      }
+      for (const prefix of snapshot?.prefixes ?? []) {
+        const pattern = `${escapeLike(prefix.prefix)}%`
+        const placeholders = prefix.recordKinds.map(() => "?").join(",")
+        const existing = this.db.query(`select record_kind, natural_key, routing_json from normalized_record where source_id=? and record_kind in (${placeholders}) and natural_key like ? escape '\\' and deleted_at is null`).all(sourceID, ...prefix.recordKinds, pattern) as Array<{ record_kind: string; natural_key: string; routing_json?: string }>
+        for (const row of existing) {
+          if (prefix.lineCount > 0 && row.record_kind === "session" && row.natural_key === `${prefix.prefix}session`) continue
+          if (prefix.lineCount > 0 && row.record_kind === "message") {
+            const match = row.natural_key.match(/\|line:(\d+)$/)
+            if (match && Number(match[1]) < prefix.lineCount) continue
+          }
+          nextRevision = this.enqueueTombstone(nextRevision, destinationID, sourceID, row)
         }
       }
       if (this.outboxBytes(destinationID) > maxOutboxBytes) throw new Error(`better-compact outbox exceeds configured limit of ${maxOutboxBytes} bytes`)
       this.db.query("insert into source_cursor(source_id, stream, checkpoint_json, updated_at) values (?, ?, ?, ?) on conflict(source_id, stream) do update set checkpoint_json=excluded.checkpoint_json, updated_at=excluded.updated_at").run(sourceID, stream, JSON.stringify(checkpoint), Date.now())
     })
     transaction()
+  }
+
+  private enqueueTombstone(nextRevision: number, destinationID: string, sourceID: string, row: { record_kind: string; natural_key: string; routing_json?: string }) {
+    nextRevision++
+    const deletedAt = Date.now()
+    this.db.query(`update normalized_record set payload_json=null, payload_sha256='', record_revision=?, deleted_at=?, observed_at=? where source_id=? and record_kind=? and natural_key=?`).run(nextRevision, deletedAt, deletedAt, sourceID, row.record_kind, row.natural_key)
+    this.db.query(`insert into outbox(destination_id, source_id, record_kind, natural_key, routing_json, payload_json, payload_sha256, record_revision, operation, state, next_attempt_at, created_at)
+      values (?, ?, ?, ?, ?, null, '', ?, 'delete', 'pending', ?, ?)
+      on conflict(destination_id, source_id, record_kind, natural_key, record_revision) do nothing`).run(destinationID, sourceID, row.record_kind, row.natural_key, row.routing_json ?? null, nextRevision, Date.now(), Date.now())
+    return nextRevision
   }
 
   claim(destinationID: string, limit: number, now = Date.now(), leaseMs = 60_000, sourceID?: string, afterRevision = 0): OutboxRow[] {
@@ -179,6 +197,10 @@ export class SyncState {
   pendingCount(destinationID = "postgres") { const row = this.db.query("select count(*) as value from outbox where destination_id=?").get(destinationID) as { value: number }; return Number(row.value) }
   purgePayloads(retentionMs: number) { this.db.query("update normalized_record set payload_json=null where observed_at<? and not exists (select 1 from outbox where outbox.source_id=normalized_record.source_id and outbox.record_kind=normalized_record.record_kind and outbox.natural_key=normalized_record.natural_key)").run(Date.now() - retentionMs) }
   outboxBytes(destinationID = "postgres") { const rows = this.db.query("select payload_json, routing_json from outbox where destination_id=?").all(destinationID) as Array<{ payload_json?: string; routing_json?: string }>; return rows.reduce((total, row) => total + new TextEncoder().encode(`${row.payload_json ?? ""}${row.routing_json ?? ""}`).byteLength, 0) }
+}
+
+function escapeLike(value: string) {
+  return value.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_")
 }
 
 export async function openSyncState(filename: string) {

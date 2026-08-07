@@ -78,11 +78,9 @@ export async function uploadFenced(client: SQLClient, source: PostgresSource, ro
     let highWater = source.expectedRevision
     for (const row of rows) {
       if (row.recordRevision !== highWater + 1) throw new Error(`non-contiguous outbox delivery at revision ${row.recordRevision}; expected ${highWater + 1}`)
-      const payload = row.payloadJSON ? JSON.parse(row.payloadJSON) as Record<string, unknown> : {}
-      const routing = row.routingJSON ? JSON.parse(row.routingJSON) as Record<string, unknown> : {}
-      await upsertRecord(transaction, source, row, { ...routing, ...payload })
       highWater = row.recordRevision
     }
+    await upsertRecords(transaction, source, rows)
     await transaction.unsafe(
       "update opencode.source set remote_revision_high_water=$1, lease_until=now() + interval '30 seconds', last_seen_at=now() where installation_id=$2 and source_id=$3 and incarnation=$4 and remote_revision_high_water=$5 and lease_owner=$6",
       [highWater, source.installationID, source.sourceID, source.incarnation, source.expectedRevision, source.ownerToken],
@@ -92,38 +90,108 @@ export async function uploadFenced(client: SQLClient, source: PostgresSource, ro
   return uploadedHighWater
 }
 
-async function upsertRecord(client: SQLClient, source: PostgresSource, row: OutboxRow, payload: Record<string, unknown>) {
-  const table = row.recordKind === "session" || row.recordKind === "message" || row.recordKind === "part" || row.recordKind === "todo" ? row.recordKind : undefined
-  if (!table) throw new Error(`unsupported remote record kind: ${row.recordKind}`)
-  const deleted = row.operation === "delete" ? new Date() : null
-  if (table === "session") {
-    await client.unsafe(`insert into opencode.session(installation_id, source_id, session_id, parent_session_id, directory, title, model, metadata, source_created_at, source_updated_at, record_revision, deleted_at)
-      values ($1,$2,$3,$4,$5,$6,$7,$8,to_timestamp($9 / 1000.0),to_timestamp($10 / 1000.0),$11,$12)
-      on conflict (installation_id, source_id, session_id) do update set parent_session_id=excluded.parent_session_id, directory=excluded.directory, title=excluded.title, model=excluded.model, metadata=excluded.metadata, source_created_at=excluded.source_created_at, source_updated_at=excluded.source_updated_at, record_revision=excluded.record_revision, deleted_at=excluded.deleted_at, synced_at=now()
-      where excluded.record_revision > opencode.session.record_revision`, [source.installationID, source.sourceID, row.naturalKey, stringValue(payload.parent_session_id), stringValue(payload.directory), stringValue(payload.title), objectValue(payload.model), objectValue(payload.metadata), Number(payload.source_created_at ?? 0), Number(payload.source_updated_at ?? 0), row.recordRevision, deleted])
-    return
+async function upsertRecords(client: SQLClient, source: PostgresSource, rows: OutboxRow[]) {
+  const groups = new Map<string, OutboxRow[]>()
+  for (const row of deduplicateRemoteKeys(rows)) {
+    if (!["session", "message", "part", "todo"].includes(row.recordKind)) throw new Error(`unsupported remote record kind: ${row.recordKind}`)
+    const group = groups.get(row.recordKind)
+    if (group) group.push(row)
+    else groups.set(row.recordKind, [row])
   }
-  if (table === "message") {
+  for (const [table, group] of groups) {
+    if (table === "session") await upsertSessions(client, source, group)
+    if (table === "message") await upsertMessages(client, source, group)
+    if (table === "part") await upsertParts(client, source, group)
+    if (table === "todo") await upsertTodos(client, source, group)
+  }
+}
+
+function deduplicateRemoteKeys(rows: OutboxRow[]) {
+  const latest = new Map<string, OutboxRow>()
+  for (const row of rows) {
+    const key = `${row.recordKind}\u0000${remoteKey(row)}`
+    const previous = latest.get(key)
+    if (!previous || row.recordRevision > previous.recordRevision) latest.set(key, row)
+  }
+  return [...latest.values()].sort((left, right) => left.recordRevision - right.recordRevision)
+}
+
+function remoteKey(row: OutboxRow) {
+  const payload = mergePayload(row)
+  if (row.recordKind === "session") return row.naturalKey
+  if (row.recordKind === "message") return `${stringValue(payload.session_id) ?? ""}\u0000${row.naturalKey}`
+  if (row.recordKind === "part") return `${stringValue(payload.session_id) ?? ""}\u0000${stringValue(payload.message_id) ?? ""}\u0000${row.naturalKey.split(":").at(-1) ?? ""}`
+  if (row.recordKind === "todo") return `${stringValue(payload.session_id) ?? ""}\u0000${String(payload.position ?? "")}`
+  return row.naturalKey
+}
+
+async function upsertSessions(client: SQLClient, source: PostgresSource, rows: OutboxRow[]) {
+  const args: unknown[] = []
+  const values = rows.map((row) => {
+    const payload = mergePayload(row)
+    return tuple(args, [source.installationID, source.sourceID, row.naturalKey, stringValue(payload.parent_session_id), stringValue(payload.directory), stringValue(payload.title), objectValue(payload.model), objectValue(payload.metadata), Number(payload.source_created_at ?? 0), Number(payload.source_updated_at ?? 0), row.recordRevision, deletedAt(row)], [8, 9])
+  })
+  await client.unsafe(`insert into opencode.session(installation_id, source_id, session_id, parent_session_id, directory, title, model, metadata, source_created_at, source_updated_at, record_revision, deleted_at)
+    values ${values.join(",")} on conflict (installation_id, source_id, session_id) do update set parent_session_id=excluded.parent_session_id, directory=excluded.directory, title=excluded.title, model=excluded.model, metadata=excluded.metadata, source_created_at=excluded.source_created_at, source_updated_at=excluded.source_updated_at, record_revision=excluded.record_revision, deleted_at=excluded.deleted_at, synced_at=now()
+    where excluded.record_revision > opencode.session.record_revision`, args)
+}
+
+async function upsertMessages(client: SQLClient, source: PostgresSource, rows: OutboxRow[]) {
+  const args: unknown[] = []
+  const values = rows.map((row) => {
+    const payload = mergePayload(row)
     const data = objectValue(payload.data)
-    await client.unsafe(`insert into opencode.message(installation_id, source_id, session_id, message_id, role, parent_id, summary, data, source_created_at, source_updated_at, record_revision, deleted_at)
-      values ($1,$2,$3,$4,$5,$6,$7,$8,to_timestamp($9 / 1000.0),to_timestamp($10 / 1000.0),$11,$12)
-      on conflict (installation_id, source_id, session_id, message_id) do update set role=excluded.role, parent_id=excluded.parent_id, summary=excluded.summary, data=excluded.data, source_created_at=excluded.source_created_at, source_updated_at=excluded.source_updated_at, record_revision=excluded.record_revision, deleted_at=excluded.deleted_at, synced_at=now()
-      where excluded.record_revision > opencode.message.record_revision`, [source.installationID, source.sourceID, stringValue(payload.session_id), row.naturalKey, stringValue(data.role) ?? "unknown", stringValue(data.parentID), data.summary === true, data, Number(payload.source_created_at ?? 0), Number(payload.source_updated_at ?? 0), row.recordRevision, deleted])
-    return
-  }
-  if (table === "part") {
+    return tuple(args, [source.installationID, source.sourceID, stringValue(payload.session_id), row.naturalKey, stringValue(data.role) ?? "unknown", stringValue(data.parentID), data.summary === true, data, Number(payload.source_created_at ?? 0), Number(payload.source_updated_at ?? 0), row.recordRevision, deletedAt(row)], [8, 9])
+  })
+  await client.unsafe(`insert into opencode.message(installation_id, source_id, session_id, message_id, role, parent_id, summary, data, source_created_at, source_updated_at, record_revision, deleted_at)
+    values ${values.join(",")} on conflict (installation_id, source_id, session_id, message_id) do update set role=excluded.role, parent_id=excluded.parent_id, summary=excluded.summary, data=excluded.data, source_created_at=excluded.source_created_at, source_updated_at=excluded.source_updated_at, record_revision=excluded.record_revision, deleted_at=excluded.deleted_at, synced_at=now()
+    where excluded.record_revision > opencode.message.record_revision`, args)
+}
+
+async function upsertParts(client: SQLClient, source: PostgresSource, rows: OutboxRow[]) {
+  const args: unknown[] = []
+  const values = rows.map((row) => {
+    const payload = mergePayload(row)
     const data = objectValue(payload.data)
-    await client.unsafe(`insert into opencode.part(installation_id, source_id, session_id, message_id, part_id, part_type, data, source_created_at, source_updated_at, record_revision, deleted_at)
-      values ($1,$2,$3,$4,$5,$6,$7,to_timestamp($8 / 1000.0),to_timestamp($9 / 1000.0),$10,$11)
-      on conflict (installation_id, source_id, session_id, message_id, part_id) do update set part_type=excluded.part_type, data=excluded.data, source_created_at=excluded.source_created_at, source_updated_at=excluded.source_updated_at, record_revision=excluded.record_revision, deleted_at=excluded.deleted_at, synced_at=now()
-      where excluded.record_revision > opencode.part.record_revision`, [source.installationID, source.sourceID, stringValue(payload.session_id), stringValue(payload.message_id), row.naturalKey.split(":").at(-1), stringValue(data.type) ?? "unknown", data, Number(payload.source_created_at ?? 0), Number(payload.source_updated_at ?? 0), row.recordRevision, deleted])
-    return
-  }
-  const data = payload
+    return tuple(args, [source.installationID, source.sourceID, stringValue(payload.session_id), stringValue(payload.message_id), row.naturalKey.split(":").at(-1), stringValue(data.type) ?? "unknown", data, Number(payload.source_created_at ?? 0), Number(payload.source_updated_at ?? 0), row.recordRevision, deletedAt(row)], [7, 8])
+  })
+  await client.unsafe(`insert into opencode.part(installation_id, source_id, session_id, message_id, part_id, part_type, data, source_created_at, source_updated_at, record_revision, deleted_at)
+    values ${values.join(",")} on conflict (installation_id, source_id, session_id, message_id, part_id) do update set part_type=excluded.part_type, data=excluded.data, source_created_at=excluded.source_created_at, source_updated_at=excluded.source_updated_at, record_revision=excluded.record_revision, deleted_at=excluded.deleted_at, synced_at=now()
+    where excluded.record_revision > opencode.part.record_revision`, args)
+}
+
+async function upsertTodos(client: SQLClient, source: PostgresSource, rows: OutboxRow[]) {
+  const args: unknown[] = []
+  const values = rows.map((row) => {
+    const data = mergePayload(row)
+    return tuple(args, [source.installationID, source.sourceID, stringValue(data.session_id), Number(data.position), data, Number(data.source_updated_at ?? 0), row.recordRevision, deletedAt(row)], [5])
+  })
   await client.unsafe(`insert into opencode.todo(installation_id, source_id, session_id, position, data, source_updated_at, record_revision, deleted_at)
-    values ($1,$2,$3,$4,$5,to_timestamp($6 / 1000.0),$7,$8)
-    on conflict (installation_id, source_id, session_id, position) do update set data=excluded.data, source_updated_at=excluded.source_updated_at, record_revision=excluded.record_revision, deleted_at=excluded.deleted_at, synced_at=now()
-    where excluded.record_revision > opencode.todo.record_revision`, [source.installationID, source.sourceID, stringValue(data.session_id), Number(data.position), data, Number(data.source_updated_at ?? 0), row.recordRevision, deleted])
+    values ${values.join(",")} on conflict (installation_id, source_id, session_id, position) do update set data=excluded.data, source_updated_at=excluded.source_updated_at, record_revision=excluded.record_revision, deleted_at=excluded.deleted_at, synced_at=now()
+    where excluded.record_revision > opencode.todo.record_revision`, args)
+}
+
+function mergePayload(row: OutboxRow) {
+  const payload = row.payloadJSON ? JSON.parse(row.payloadJSON) as Record<string, unknown> : {}
+  const routing = row.routingJSON ? JSON.parse(row.routingJSON) as Record<string, unknown> : {}
+  return sanitizeJSONValue({ ...routing, ...payload }) as Record<string, unknown>
+}
+
+function sanitizeJSONValue(value: unknown): unknown {
+  if (typeof value === "string") return value.replaceAll("\u0000", "\\u0000")
+  if (Array.isArray(value)) return value.map((item) => sanitizeJSONValue(item))
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key.replaceAll("\u0000", "\\u0000"), sanitizeJSONValue(item)]))
+  return value
+}
+
+function deletedAt(row: OutboxRow) {
+  return row.operation === "delete" ? new Date() : null
+}
+
+function tuple(args: unknown[], values: unknown[], timestamps: number[] = []) {
+  const start = args.length + 1
+  args.push(...values)
+  return `(${values.map((_, index) => timestamps.includes(index) ? `to_timestamp($${start + index} / 1000.0)` : `$${start + index}`).join(",")})`
 }
 
 function objectValue(value: unknown) {

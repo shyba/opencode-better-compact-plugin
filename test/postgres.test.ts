@@ -4,10 +4,13 @@ import type { OutboxRow } from "../src/sync-state.js"
 
 function fakeClient(remoteRevision = 0) {
   const calls: string[] = []
+  const values: unknown[][] = []
   const client = {
     calls,
-    unsafe: async <T>(query: string): Promise<T> => {
+    values,
+    unsafe: async <T>(query: string, parameters?: unknown[]): Promise<T> => {
       calls.push(query)
+      if (parameters) values.push(parameters)
       if (query.includes("for update")) return [{ incarnation: "source-inc", remote_revision_high_water: remoteRevision, lease_owner: "owner" }] as T
       return [] as T
     },
@@ -43,6 +46,14 @@ describe("Postgres delivery fences", () => {
     const highWater = await uploadFenced(client, source, [row(1), row(2)])
     expect(highWater).toBe(2)
     expect(client.calls.some((query) => query.includes("remote_revision_high_water=$1"))).toBe(true)
+  })
+
+  test("escapes NUL bytes before sending JSONB payloads", async () => {
+    const client = fakeClient()
+    await uploadFenced(client, source, [{ ...row(1), payloadJSON: JSON.stringify({ title: "before\u0000after" }) }])
+    const serialized = client.values.flatMap((parameters) => parameters.map((value) => JSON.stringify(value) ?? "")).join("\n")
+    expect(serialized.includes("\u0000")).toBe(false)
+    expect(serialized.includes("\\u0000")).toBe(true)
   })
 
   test("rejects a revision gap before applying the later record", async () => {

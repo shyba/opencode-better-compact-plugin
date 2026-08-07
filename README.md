@@ -64,6 +64,8 @@ better-compact update
 better-compact install pi
 better-compact sync run --once
 better-compact sync status
+better-compact sync migrate
+better-compact sync install
 better-compact installation reset --yes
 better-compact installation adopt --yes
 ```
@@ -76,9 +78,26 @@ The generated wrapper points at the persistent checkout and also falls back to t
 
 `doctor` checks the managed checkout, both OpenCode configuration surfaces, the OpenCode and Bun executables, and performs a read-only SQLite probe. `update` runs the same rollback-safe checkout/configuration transaction as the installer. If Bun was bootstrapped temporarily during installation, install Bun separately or invoke the CLI with `OPENCODE_SAFE_COMPACTION_BUN=/path/to/bun`.
 
-The sync runner reads configured OpenCode V1 SQLite sources read-only, stages redacted records in the stable local state database, and uploads bounded batches when the configured Postgres environment variable is present. `--once` performs one reconciliation pass; without it, the runner continues polling. Postgres failures leave leased outbox rows for retry and do not affect OpenCode.
+The sync runner reads configured OpenCode V1 SQLite, Codex JSONL, and Pi JSONL sources read-only, stages redacted records in the stable local state database, and uploads bounded batches when the configured Postgres environment variable is present. The `*-sessions` adapters provide a fast, session-only index; pair them with the full-history adapters when message and part records are also wanted. `--once` drains discovery and the local outbox until no work remains; without it, the runner continues polling. Postgres failures leave leased outbox rows for retry and do not affect OpenCode. JSONL discovery is resumable by file and byte/line cursor, and completed files reconcile only their own natural-key prefix.
 
-Remote Postgres URLs must use certificate-verifying TLS (`sslmode=verify-full`) unless the host is loopback. The runner applies the checked-in, idempotent SQL migrations before the source handshake. Credentials stay in the environment or a separate mode-`0600` service environment file; they are never written to the JSON configuration.
+Remote Postgres URLs must use certificate-verifying TLS (`sslmode=verify-full`) unless the host is loopback. If a trusted LAN server genuinely has no TLS, `sync.allow_insecure_remote=true` is an explicit opt-in and emits a warning; it must not be enabled on an untrusted network. When no URL variable is set, the runner can compose one from `POSTGRES_*` plus `DB_WRITER_*` environment variables. Run `better-compact sync migrate` once with explicit admin credentials before starting the worker; the long-running sync process is deliberately DDL-free and uses only writer privileges. Credentials stay in the environment or a separate mode-`0600` service environment file; they are never written to the JSON configuration. `better-compact sync install` installs the opt-in per-user service and preserves the same local state/outbox across restarts.
+
+Example source configuration:
+
+```json
+{
+  "version": 1,
+  "sync": { "enabled": true, "allow_insecure_remote": false },
+  "sources": [
+    { "kind": "opencode-v1-sqlite", "database": "~/.local/share/opencode/opencode.db" },
+    { "kind": "opencode-v1-sessions", "database": "~/.local/share/opencode/opencode.db" },
+    { "kind": "codex-jsonl", "database": "~/.codex/sessions" },
+    { "kind": "codex-jsonl-sessions", "database": "~/.codex/sessions" },
+    { "kind": "pi-jsonl", "database": "~/.pi/agent/sessions" }
+  ],
+  "installation": { "name": "workstation" }
+}
+```
 
 During compaction, the model receives the bounded ledger and a single-response JSON contract. The JSON projection contains goal, constraints, decisions, current state, files, evidence, blockers, and next actions, with every claim tied to stable references in the canonical ledger. The plugin strictly parses it (including duplicate-key rejection), validates its digest and provenance, and renders it into the durable Markdown summary together with the canonical ledger block. The ledger remains the verified recovery anchor; projected files and actions are useful model-authored organization, not independent evidence. Legacy Markdown summaries remain accepted for compatibility. Missing sections, invented digests, stale references, oversized output, refusals, and split/empty responses are replaced with a bounded ledger-grounded summary so the host remains usable; the hook also marks that provisional result with an optimistic `retry` signal, which a retry-capable future host can use to discard it and retry the model before cutover. Current V1 ignores unknown output fields, so no OpenCode fork is required.
 

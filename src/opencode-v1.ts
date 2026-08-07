@@ -150,6 +150,25 @@ export function discoverOpenCodeV1(filename: string, sourceID: string, checkpoin
   }
 }
 
+export function discoverOpenCodeV1Sessions(filename: string, sourceID: string): { records: NormalizedRecord[]; checkpoint: OpenCodeV1Checkpoint; complete: true; hasMore: false; reconcilePrefixes: never[]; sourceUpdatedAt: number } {
+  const inspection = inspectOpenCodeV1(filename)
+  const db = new Database(filename, { readonly: true })
+  try {
+    db.exec("PRAGMA query_only=ON; PRAGMA busy_timeout=1000;")
+    const sessions = db.query("select id, time_created, time_updated, title, directory, metadata from session order by time_created, id").all() as Array<Record<string, unknown>>
+    const records = sessions.map((session) => {
+      const createdAt = Number(session.time_created ?? 0)
+      const updatedAt = Number(session.time_updated ?? createdAt)
+      return record(sourceID, "session", String(session.id), allowlistedPayload({ title: session.title, directory: session.directory, metadata: parseJSON(session.metadata), source_schema_version: inspection.schemaVersion, source_created_at: createdAt, source_updated_at: updatedAt }), updatedAt)
+    })
+    const last = sessions.at(-1)
+    const sourceUpdatedAt = sessions.reduce((latest, session) => Math.max(latest, Number(session.time_updated ?? session.time_created ?? 0)), 0)
+    return { records, checkpoint: { sourceUpdatedAt, sessionCreatedAt: Number(last?.time_created ?? 0), sessionID: String(last?.id ?? ""), reconcileBefore: Date.now() + 15 * 60_000 }, complete: true, hasMore: false, reconcilePrefixes: [], sourceUpdatedAt }
+  } finally {
+    db.close()
+  }
+}
+
 function groupBy(values: Array<Record<string, unknown>>, key: (value: Record<string, unknown>) => string) {
   const groups = new Map<string, Array<Record<string, unknown>>>()
   for (const value of values) {
