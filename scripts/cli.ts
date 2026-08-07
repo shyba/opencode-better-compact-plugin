@@ -16,6 +16,7 @@ import { openSyncState } from "../src/sync-state.js"
 const installDir = path.resolve(process.env.OPENCODE_SAFE_COMPACTION_DIR ?? path.join(process.env.HOME ?? ".", ".local/share/opencode/plugins/safe-compaction"))
 const configDir = path.resolve(process.env.OPENCODE_SAFE_COMPACTION_CONFIG_DIR ?? process.env.OPENCODE_CONFIG_DIR ?? path.join(process.env.XDG_CONFIG_HOME ?? path.join(process.env.HOME ?? ".", ".config"), "opencode"))
 const databasePath = path.resolve(process.env.OPENCODE_DB ?? path.join(process.env.XDG_DATA_HOME ?? path.join(process.env.HOME ?? ".", ".local/share"), "opencode", "opencode.db"))
+const maxUploadBatchesPerSource = 8
 const configFlag = flagValue("--config")
 const stateFlag = flagValue("--state")
 if (configFlag) process.env.BETTER_COMPACT_CONFIG = path.resolve(configFlag)
@@ -312,22 +313,36 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>, signal?:
         assertPostgresTLS(databaseURL, config.sync.allow_insecure_remote)
         const client = openPostgres(databaseURL)
         let rows: ReturnType<typeof state.claim> = []
+        let uploaded = 0
         try {
           await ensureRemoteSource(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, ownerToken: workerToken, expectedRevision: state.remoteRevision(sourceID) }, source.kind, inspection.schemaVersion, inspection.layoutFingerprint)
           const fence = await readRemoteFence(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, ownerToken: workerToken, expectedRevision: state.remoteRevision(sourceID) })
           if (fence.revision > state.remoteRevision(sourceID) && !state.reconcileCommitted(sourceID, fence.revision)) throw new Error(`remote revision ${fence.revision} is ahead of local ${state.remoteRevision(sourceID)}; run an explicit reset/adopt workflow`)
-          rows = state.claim("postgres", config.sync.batch_size, Date.now(), 60_000, sourceID, fence.revision)
-          const revision = await uploadFenced(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, ownerToken: workerToken, expectedRevision: fence.revision }, rows)
-          state.setRemoteRevision(sourceID, revision)
-          state.acknowledge(rows.map((row) => row.id))
-          progressed = progressed || rows.length > 0
+          let revision = fence.revision
+          for (let batch = 0; batch < maxUploadBatchesPerSource; batch++) {
+            if (signal?.aborted) break
+            rows = state.claim("postgres", config.sync.batch_size, Date.now(), 60_000, sourceID, revision)
+            if (!rows.length) break
+            try {
+              revision = await uploadFenced(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, ownerToken: workerToken, expectedRevision: revision }, rows)
+              state.setRemoteRevision(sourceID, revision)
+              state.acknowledge(rows.map((row) => row.id))
+              uploaded += rows.length
+              progressed = true
+              try {
+                await recordObservation(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, ownerToken: workerToken, expectedRevision: revision }, result.records.length, rows.length, result.sourceUpdatedAt ? Math.max(0, Date.now() - result.sourceUpdatedAt) : null)
+              } catch { console.error("warning: remote observation maintenance failed") }
+            } catch (error) {
+              state.fail(rows.map((row) => row.id), error instanceof Error ? error.message : String(error))
+              throw error
+            }
+          }
           try {
-            await recordObservation(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, ownerToken: workerToken, expectedRevision: revision }, result.records.length, rows.length, result.sourceUpdatedAt ? Math.max(0, Date.now() - result.sourceUpdatedAt) : null)
             await purgeRemoteTombstones(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, ownerToken: workerToken, expectedRevision: revision }, config.sync.retention_days)
-          } catch { console.error("warning: remote observation maintenance failed") }
-          console.log(`uploaded ${rows.length} records from ${filename}`)
+          } catch { console.error("warning: remote tombstone maintenance failed") }
+          console.log(`uploaded ${uploaded} records from ${filename}`)
         } catch (error) {
-          state.fail(rows.map((row) => row.id), error instanceof Error ? error.message : String(error))
+          if (rows.length) state.fail(rows.map((row) => row.id), error instanceof Error ? error.message : String(error))
           throw error
         } finally {
           await client.close()
