@@ -6,9 +6,10 @@ import { uuidv7 } from "@earendil-works/pi-ai"
 import { createHash } from "node:crypto"
 import { buildRecoveryLedger, utf8Bytes } from "./ledger.js"
 import { SELECTED_MODEL, parseOptions, resolveOptions, type PluginOptions } from "./options.js"
-import { loadPiOptions, priorPluginSummary, savePiOptions, toMessageRecords, todosFromBranch } from "./pi-adapter.js"
+import { isCatAttachment, loadPiOptions, priorPluginSummary, savePiOptions, toMessageRecords, todosFromBranch } from "./pi-adapter.js"
 import { remapProjection } from "./projection.js"
 import { buildAuthoritativeSummary, buildCompactionPrompt, renderProjectedResponse } from "./validation.js"
+import { collectFiles, formatPinnedBlock, loadCatOptions, loadFixedPin, pinnedPathsOnlyBlock } from "./cat-core.js"
 
 export { loadPiOptions, savePiOptions, toMessageRecords, todosFromBranch, priorPluginSummary } from "./pi-adapter.js"
 export type { PriorPluginSummary } from "./pi-adapter.js"
@@ -20,6 +21,10 @@ type PipelineResult = {
   usage: Usage
   details: { ledgerDigest: string; ledgerBytes: number }
 }
+
+/** Keep the complete compaction artifact below a conservative context fraction
+ *  when a fixed file prefix is added. */
+const PINNED_FILES_MAX_FRACTION = 0.8
 
 export default function piExtension(pi: ExtensionAPI) {
   ensureBunCryptoShim()
@@ -40,7 +45,11 @@ export default function piExtension(pi: ExtensionAPI) {
   }): Promise<PipelineResult | undefined> {
     const { messages, branch, sessionID, signal, ctx } = input
     if (signal.aborted) return
-    const records = toMessageRecords(messages, sessionID)
+    const fixedPin = loadFixedPin(ctx.cwd, sessionID)
+    const records = toMessageRecords(
+      fixedPin ? messages.filter((message) => !isCatAttachment(message)) : messages,
+      sessionID,
+    )
     const todos = todosFromBranch(branch)
     const prior = priorPluginSummary(branch)
     const ledger = buildRecoveryLedger({
@@ -74,6 +83,29 @@ export default function piExtension(pi: ExtensionAPI) {
     return { summary, usage: response.usage, details: { ledgerDigest: ledger.digest, ledgerBytes: utf8Bytes(ledger.block) } }
   }
 
+  /** When /cat --fixed pinned files for this session, re-collect them fresh and
+   *  embed the block at the front of the summary. The pinned block is
+   *  deterministic, so the files stay loaded across compactions, pick up edits
+   *  made since the last compaction, and form a cacheable fixed prefix. */
+  async function withPinnedFiles(ctx: ExtensionContext, sessionID: string, summary: string): Promise<string> {
+    const pin = loadFixedPin(ctx.cwd, sessionID)
+    if (!pin || pin.sessionId !== sessionID) return summary
+    const collected = collectFiles(pin.patterns, ctx.cwd, loadCatOptions(ctx.cwd), pin.tokenBudget)
+    if (!collected.files.length) return summary
+    const usage = ctx.getContextUsage()
+    const contextWindow = usage?.contextWindow
+    if (contextWindow === undefined || contextWindow <= 0) return summary
+    const summaryBytes = utf8Bytes(summary)
+    const safeSummaryBytes = Math.floor(contextWindow * PINNED_FILES_MAX_FRACTION)
+    const availablePinnedBytes = safeSummaryBytes - summaryBytes - 2
+    if (availablePinnedBytes <= 0) return summary
+    const pinned = formatPinnedBlock(collected.files, collected.skipped)
+    if (utf8Bytes(pinned) <= availablePinnedBytes) return `${pinned}\n\n${summary}`
+    const paths = pinnedPathsOnlyBlock(collected.files, availablePinnedBytes)
+    if (utf8Bytes(paths) <= availablePinnedBytes) return `${paths}\n\n${summary}`
+    return summary
+  }
+
   pi.on("session_before_compact", async (event, ctx) => {
     const sessionID = ctx.sessionManager.getSessionId() ?? "pi-session"
     try {
@@ -87,7 +119,7 @@ export default function piExtension(pi: ExtensionAPI) {
       if (!result) return
       return {
         compaction: {
-          summary: result.summary,
+          summary: await withPinnedFiles(ctx, sessionID, result.summary),
           firstKeptEntryId: event.preparation.firstKeptEntryId,
           tokensBefore: event.preparation.tokensBefore,
           usage: result.usage,
@@ -113,7 +145,7 @@ export default function piExtension(pi: ExtensionAPI) {
         ctx,
       })
       if (!result) return
-      return { summary: { summary: result.summary, usage: result.usage, details: result.details } }
+      return { summary: { summary: await withPinnedFiles(ctx, sessionID, result.summary), usage: result.usage, details: result.details } }
     } catch (error) {
       warnHook("session_before_tree", sessionID, error)
       return

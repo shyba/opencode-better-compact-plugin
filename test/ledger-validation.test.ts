@@ -20,6 +20,7 @@ import {
   recoveryContext,
   validateSummary,
 } from "../src/validation.js"
+import { formatPinnedBlock } from "../src/cat-core.js"
 
 const EMPTY_DATA: RecoveryLedgerData = {
   recent_requests: [],
@@ -470,6 +471,13 @@ describe("summary validation and fallback", () => {
     expect(validateSummary(summary, ledger, utf8Bytes(summary) - 1)).toBe(false)
     expect(validateSummary(`${summary}\nUnsupported trailing claim`, ledger, 16_384)).toBe(false)
     expect(isPluginValidSummary(`${summary}\nUnsupported trailing claim`, 16_384)).toBe(false)
+  })
+
+  test("accepts a deterministic pinned-files prefix as transport framing", () => {
+    const pinned = `${formatPinnedBlock([{ path: "src/parser.ts", bytes: 1, tokens: 1, text: "export {}" }])}\n\n${summary}`
+    expect(validateSummary(pinned, ledger, 16_384)).toBe(true)
+    expect(isPluginValidSummary(pinned, 16_384)).toBe(true)
+    expect(parsePluginLedger(pinned)).toEqual(ledger)
   })
 
   test("rejects non-canonical JSON even when its digest is internally consistent", () => {

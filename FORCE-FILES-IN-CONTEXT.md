@@ -1,6 +1,6 @@
 # Force files into context (pi extension design)
 
-Status: implemented on branch `pi-support`. Separate from the better-compact pi-support work; can land as its own extension. Lives in `/home/user/repos/opencode-pi-support` worktree or a new one — TBD with user.
+Status: implemented on branch `cat-fixed`; this feature is now being reviewed for merge into the standalone Better Compact Pi extension.
 
 ## Problem
 
@@ -218,6 +218,30 @@ The parser, walker, formatter, and threshold logic are pure and unit-testable.
 3. **Notify-on-success**: should we still surface a small toast on successful injection (`Attached 12 files (~18k tokens, ~9% of context)`) so the user knows it happened? Or stay silent? Default: silent — the chat transcript shows the new user message, that's enough signal.
 4. **Heuristic multiplier calibration**: with `charsPerToken: 4`, code-heavy content can be off by 20–30 %. We default to the safe side (over-estimate) by also accepting a `< 1.0` multiplier in config (`charsPerToken: 3.5` = pessimistic). Acceptable as a v1 trade-off; not worth shipping a tokenizer.
 5. **No tokenizer shipped**: this means `/cat .md` on a giant Markdown-heavy repo may report a smaller number than the real token cost, because BPE tokenizes differently per model family. Acceptable for a v1 warn-and-cancel tool — we err on the side of false negatives (refusing when it would have fit) via the configurable multiplier. A v2 could ship `gpt-tokenizer` or similar with a per-model-id heuristic.
+
+### Pinning files across compaction (`--fixed` / `--reset`)
+
+Implemented on branch `cat-fixed`. `/cat <patterns> --fixed` records a session-scoped pin
+(`sessionId`, resolved `patterns`, optional `tokenBudget`) in `<cwd>/.pi/cat-files.json`; multiple
+sessions are stored as a bounded array of entries. `/cat --reset` clears the current session's pin.
+While a pin is active, every compaction re-reads the pinned files
+fresh from disk and embeds them deterministically at the front of the compaction summary:
+
+- The summary stays `[pinned files][conversation summary][ledger]`. The pinned block is
+  byte-identical across turns, so providers cache it as a fixed prefix; the conversation
+after it compacts normally.
+- While a fixed pin is active, its old attachment messages carry a marker (`<!-- cat-files v1 -->`)
+  and are excluded from the recovery ledger and summarization prompt, so compaction never
+  re-bills stale file contents. Ordinary `/cat` attachments retain the normal compaction path.
+- If the pinned block plus the ordinary summary would exceed 80% of the context window,
+  compaction embeds a bounded paths-only block or keeps the ordinary summary instead of
+  adding an overflowing prefix.
+
+This replaced the earlier design that re-injected files at the tail after each compaction
+(`session_compact` + `sendUserMessage`): tail re-injection places the files after the
+dynamic conversation, where providers cannot cache them, so every turn would re-bill the
+full file contents as uncached input. Embedding at the front of the summary keeps them in
+the cacheable fixed prefix.
 
 ### Verification
 

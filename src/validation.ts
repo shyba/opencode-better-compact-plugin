@@ -22,6 +22,7 @@ import {
   ledgerReferenceGuide,
   type ProjectedSummary,
 } from "./projection.js"
+import { PINNED_END, PINNED_START } from "./cat-markers.js"
 
 export const REQUIRED_SECTIONS = [
   "Goal",
@@ -136,7 +137,8 @@ export function validateSummary(text: string, expected: RecoveryLedger, maxBytes
   if (!text.trim() || utf8Bytes(text) > maxBytes) return false
   const value = text.trimEnd()
   if (!value.endsWith(expected.block)) return false
-  const prefix = value.slice(0, -expected.block.length).trimEnd()
+  const prefix = stripPinnedPrefix(value.slice(0, -expected.block.length).trimEnd())
+  if (!prefix) return false
   if (!prefix.startsWith("## Goal\n")) return false
   const headings = [...prefix.matchAll(/^## (.+)$/gm)].map((match) => match[1])
   if (headings.length !== REQUIRED_SECTIONS.length) return false
@@ -147,6 +149,17 @@ export function validateSummary(text: string, expected: RecoveryLedger, maxBytes
   const projectionStart = value.indexOf("<!-- opencode-safe-compaction projection v1 start -->")
   const ledgerStart = value.indexOf(LEDGER_START)
   return projectionStart >= 0 && ledgerStart > projectionStart && Boolean(validateProjection(projection, expected))
+}
+
+/** Pinned Pi summaries deliberately put a deterministic file block before the
+ *  ordinary summary so providers can reuse it as a cache prefix. Treat that
+ *  opaque prefix as transport framing while validating the canonical summary. */
+function stripPinnedPrefix(value: string) {
+  if (!value.startsWith(`${PINNED_START}\n`)) return value
+  const boundary = `\n${PINNED_END}\n\n`
+  const end = value.indexOf(boundary)
+  if (end < 0) return
+  return value.slice(end + boundary.length)
 }
 
 export function parsePluginLedger(text: string) {
