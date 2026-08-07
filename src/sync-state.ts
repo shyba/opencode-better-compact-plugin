@@ -38,6 +38,8 @@ export class SyncState {
       create table if not exists destination (id text primary key, kind text not null, config_ref text not null, created_at integer not null);
       create table if not exists outbox (id integer primary key, destination_id text not null references destination(id) on delete cascade, source_id text not null references source(id) on delete cascade, record_kind text not null, natural_key text not null, routing_json text, payload_json text, payload_sha256 text not null, record_revision integer not null, operation text not null check(operation in ('upsert', 'delete')), state text not null check(state in ('pending', 'leased', 'failed')), attempts integer not null default 0, next_attempt_at integer not null, lease_until integer, last_error text, created_at integer not null, unique(destination_id, source_id, record_kind, natural_key, record_revision));
       create index if not exists outbox_ready_idx on outbox(destination_id, state, next_attempt_at, record_revision);
+      create index if not exists normalized_record_retention_idx on normalized_record(observed_at);
+      create index if not exists outbox_record_idx on outbox(source_id, record_kind, natural_key);
     `)
     this.db.query("insert or ignore into schema_migration(version, applied_at) values (1, ?)").run(Date.now())
     this.applyLocalMigrations()
@@ -195,7 +197,14 @@ export class SyncState {
   adoptThrough(sourceID: string, revision: number, destinationID = "postgres") { this.db.query("delete from outbox where source_id=? and destination_id=? and record_revision<=?").run(sourceID, destinationID, revision) }
   fail(ids: number[], error: string, nextAttemptAt = Date.now() + 30_000) { if (ids.length) this.db.query(`update outbox set state='failed', lease_until=null, last_error=?, next_attempt_at=? where id in (${ids.map(() => "?").join(",")})`).run(error.slice(0, 1000), nextAttemptAt, ...ids) }
   pendingCount(destinationID = "postgres") { const row = this.db.query("select count(*) as value from outbox where destination_id=?").get(destinationID) as { value: number }; return Number(row.value) }
-  purgePayloads(retentionMs: number) { this.db.query("update normalized_record set payload_json=null where observed_at<? and not exists (select 1 from outbox where outbox.source_id=normalized_record.source_id and outbox.record_kind=normalized_record.record_kind and outbox.natural_key=normalized_record.natural_key)").run(Date.now() - retentionMs) }
+  purgePayloads(retentionMs: number, limit = 500) {
+    this.db.query(`update normalized_record set payload_json=null where rowid in (
+      select normalized_record.rowid from normalized_record
+      where observed_at<? and payload_json is not null
+        and not exists (select 1 from outbox where outbox.source_id=normalized_record.source_id and outbox.record_kind=normalized_record.record_kind and outbox.natural_key=normalized_record.natural_key)
+      limit ?
+    )`).run(Date.now() - retentionMs, limit)
+  }
   outboxBytes(destinationID = "postgres") { const rows = this.db.query("select payload_json, routing_json from outbox where destination_id=?").all(destinationID) as Array<{ payload_json?: string; routing_json?: string }>; return rows.reduce((total, row) => total + new TextEncoder().encode(`${row.payload_json ?? ""}${row.routing_json ?? ""}`).byteLength, 0) }
 }
 
