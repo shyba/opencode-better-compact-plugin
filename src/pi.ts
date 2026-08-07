@@ -1,7 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core"
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent"
 import { sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent"
-import type { Model, Usage } from "@earendil-works/pi-ai"
+import type { Api, Model, Usage } from "@earendil-works/pi-ai"
 import { uuidv7 } from "@earendil-works/pi-ai"
 import { createHash } from "node:crypto"
 import { buildRecoveryLedger, utf8Bytes } from "./ledger.js"
@@ -149,7 +149,7 @@ export default function piExtension(pi: ExtensionAPI) {
   })
 }
 
-function compactionModel(ctx: ExtensionContext, spec: string): Model<any> | undefined {
+function compactionModel(ctx: ExtensionContext, spec: string): Model<Api> | undefined {
   if (spec === SELECTED_MODEL) {
     if (!ctx.model || !ctx.modelRegistry.hasConfiguredAuth(ctx.model)) return undefined
     return ctx.model

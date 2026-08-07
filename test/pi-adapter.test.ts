@@ -3,7 +3,7 @@ import os from "node:os"
 import path from "node:path"
 import { describe, expect, test } from "bun:test"
 import type { AgentMessage } from "@earendil-works/pi-agent-core"
-import type { SessionEntry } from "@earendil-works/pi-coding-agent"
+import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent"
 import { canonicalLedger, type RecoveryLedgerData } from "../src/ledger.js"
 import { resolveOptions, parseOptions } from "../src/options.js"
 import {
@@ -14,6 +14,9 @@ import {
   todosFromBranch,
 } from "../src/pi-adapter.js"
 import { buildAuthoritativeSummary } from "../src/validation.js"
+import packageJSON from "../package.json"
+import piExtension from "../src/pi.js"
+import catExtension from "../src/cat.js"
 
 const EMPTY_DATA: RecoveryLedgerData = {
   recent_requests: [],
@@ -247,5 +250,39 @@ describe("pi option persistence", () => {
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
+  })
+})
+
+describe("Pi package integration", () => {
+  test("declares both source-first extension entry points", () => {
+    const manifest = packageJSON as {
+      pi?: { extensions?: unknown }
+      peerDependenciesMeta?: Record<string, { optional?: boolean }>
+    }
+    expect(manifest.pi?.extensions).toEqual(["./src/pi.ts", "./src/cat.ts"])
+    expect(manifest.peerDependenciesMeta?.["@earendil-works/pi-agent-core"]?.optional).toBe(true)
+    expect(manifest.peerDependenciesMeta?.["@earendil-works/pi-coding-agent"]?.optional).toBe(true)
+    expect(manifest.peerDependenciesMeta?.["@earendil-works/pi-ai"]?.optional).toBe(true)
+  })
+
+  test("registers both real extension entry points without host startup state", () => {
+    const events = new Map<string, unknown[]>()
+    const commands = new Map<string, unknown>()
+    const api = {
+      on(event: string, handler: unknown) {
+        events.set(event, [...(events.get(event) ?? []), handler])
+      },
+      registerCommand(name: string, options: unknown) {
+        commands.set(name, options)
+      },
+    } as unknown as ExtensionAPI
+
+    piExtension(api)
+    catExtension(api)
+
+    expect(events.get("session_before_compact")).toHaveLength(1)
+    expect(events.get("session_before_tree")).toHaveLength(1)
+    expect(commands.has("compaction-model")).toBe(true)
+    expect(commands.has("cat")).toBe(true)
   })
 })

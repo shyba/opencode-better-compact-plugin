@@ -197,6 +197,14 @@ This plugin mitigates compaction failures; it cannot make OpenCode's core cutove
 
 The package ships two pi extension entry points alongside the OpenCode V1 plugin. They are separate from the OpenCode runtime and are loaded by pi, not by OpenCode.
 
+Install the repository as a Pi package to load both extensions automatically:
+
+```sh
+pi install git:github.com/shyba/opencode-better-compact-plugin@default
+```
+
+The package manifest points Pi at the TypeScript sources, so this works from a Git checkout without a checked-in `dist/` directory. For a one-off or source checkout, load either entry point explicitly with `pi -e /abs/path/to/src/pi.ts` or `pi -e /abs/path/to/src/cat.ts`. Built `dist/pi.js` and `dist/cat.js` entry points are also available after `bun run build`.
+
 ### `opencode-safe-compaction/pi` — recovery-ledger compaction
 
 A pi extension that re-uses the same host-agnostic core (`ledger.ts`, `projection.ts`, `validation.ts`, `options.ts`) to do ledger-grounded compaction through pi's own events, with no OpenCode involvement.

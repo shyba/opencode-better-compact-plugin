@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/package.json",
   "name": "opencode-safe-compaction",
   "version": "0.1.0",
-  "description": "Bounded, validated recovery summaries for the OpenCode V1 compactor",
+  "description": "Bounded, validated recovery summaries for OpenCode V1 and Pi",
   "type": "module",
   "private": true,
   "license": "MIT",
@@ -13,6 +13,10 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./src/pi.ts", "./src/cat.ts"]
+  },
   "bin": {
     "better-compact": "./dist/cli.js"
   },
@@ -40,6 +44,7 @@
   },
   "files": [
     "dist",
+    "src",
     "scripts/configure.ts",
     "scripts/cli.ts",
     "db/migrations",
@@ -64,7 +69,19 @@
     "typescript": "5.9.3"
   },
   "peerDependencies": {
+    "@earendil-works/pi-agent-core": ">=0.84.0",
     "@earendil-works/pi-coding-agent": ">=0.84.0",
     "@earendil-works/pi-ai": ">=0.84.0"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-agent-core": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-ai": {
+      "optional": true
+    }
   }
 }

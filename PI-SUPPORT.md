@@ -1,6 +1,6 @@
 # Pi support plan for `opencode-safe-compaction`
 
-Status: implemented on branch `pi-support`. Branch: `pi-support`. Worktree: `/home/user/repos/better-compact-pi-support`.
+Status: implemented and merged into the standalone repository's `default` branch. The OpenCode and Pi entry points share the host-agnostic ledger, projection, and validation core while remaining separately loadable.
 Companion repo to add the entry point to: `shyba/opencode-better-compact-plugin` (vendored at `plugins/safe-compaction/` in the opencode monorepo).
 
 ## Goal
@@ -223,6 +223,10 @@ Wrap each event handler in a `try/catch` that logs metadata only (`{hook: "sessi
 
 ```jsonc
 {
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./src/pi.ts", "./src/cat.ts"]
+  },
   "exports": {
     ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
     "./server": { "types": "./dist/server.d.ts", "import": "./dist/index.js" },
@@ -230,14 +234,22 @@ Wrap each event handler in a `try/catch` that logs metadata only (`{hook: "sessi
     "./pi": { "types": "./dist/pi.d.ts", "import": "./dist/pi.js" }   // NEW
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-ai": "*"
+    "@earendil-works/pi-agent-core": ">=0.84.0",
+    "@earendil-works/pi-coding-agent": ">=0.84.0",
+    "@earendil-works/pi-ai": ">=0.84.0"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-agent-core": { "optional": true },
+    "@earendil-works/pi-coding-agent": { "optional": true },
+    "@earendil-works/pi-ai": { "optional": true }
   },
   "scripts": {
     "build:js": "bun build src/index.ts --outfile dist/index.js --target bun --format esm && bun build src/tui.ts --outfile dist/tui.js --target bun --format esm && bun build scripts/cli.ts --outfile dist/cli.js --target bun --format esm && bun build src/pi.ts --outfile dist/pi.js --target bun --format esm"
   }
 }
 ```
+
+The manifest uses source-first entries because `dist/` is deliberately untracked and Pi's Git package installer does not run the build. The npm package includes both `src/` and `dist/`; Pi's loader handles the TypeScript source and its host-module aliases. The Pi peers stay optional so OpenCode-only installs remain runtime-dependency-free.
 
 `bun.lock` regenerates on `bun install`.
 
