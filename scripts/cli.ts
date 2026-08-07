@@ -295,8 +295,9 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>, signal?:
       const inspection = source.kind === "opencode-v1-sqlite" || source.kind === "opencode-v1-sessions" ? inspectOpenCodeV1(filename) : await inspectJsonl(filename)
       const sourceIncarnation = state.sourceIncarnation(sourceID)
       state.upsertSource({ id: sourceID, installationID: installation.id, kind: source.kind, schemaVersion: inspection.schemaVersion, locator: filename, ...(source.kind === "opencode-v1-sqlite" || source.kind === "opencode-v1-sessions" ? { fingerprint: inspection.layoutFingerprint } : {}), incarnation: sourceIncarnation })
-      const backpressure = state.outboxBytes() >= config.sync.max_outbox_bytes
-      if (backpressure) console.error(`warning: sync backpressure at ${state.outboxBytes()} bytes; uploading existing rows only`)
+      const outboxBytes = state.outboxBytes()
+      const backpressure = outboxBytes >= config.sync.max_outbox_bytes * 0.75
+      if (backpressure) console.error(`warning: sync backpressure at ${outboxBytes} bytes; uploading existing rows only`)
       const checkpoint = state.checkpoint(sourceID)
       const result = backpressure
         ? emptyDiscovery(source.kind, checkpoint)
