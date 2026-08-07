@@ -15,6 +15,7 @@ import {
   todosFromBranch,
 } from "../src/pi-adapter.js"
 import { buildAuthoritativeSummary } from "../src/validation.js"
+import { PINNED_START, saveFixedPin, formatInjection } from "../src/cat-core.js"
 import packageJSON from "../package.json"
 import piExtension from "../src/pi.js"
 import catExtension from "../src/cat.js"
@@ -312,5 +313,90 @@ describe("Pi package integration", () => {
     expect(events.get("session_before_tree")).toHaveLength(1)
     expect(commands.has("compaction-model")).toBe(true)
     expect(commands.has("cat")).toBe(true)
+  })
+
+  test("pins fresh files in the real compaction hook without dropping ordinary attachments", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "sc-pi-hook-"))
+    try {
+      await mkdir(path.join(dir, "src"), { recursive: true })
+      await writeFile(path.join(dir, "src", "pinned.rs"), "fn main() {}\n")
+      await saveFixedPin(dir, { sessionId: "session-1", patterns: ["src/pinned.rs"], pinnedAt: 1 })
+
+      const events = new Map<string, unknown[]>()
+      let prompt = ""
+      const api = {
+        on(event: string, handler: unknown) {
+          events.set(event, [...(events.get(event) ?? []), handler])
+        },
+        registerCommand() {},
+      } as unknown as ExtensionAPI
+      piExtension(api)
+
+      const model = {
+        provider: "test",
+        id: "model",
+        api: "openai-completions",
+        name: "test",
+        baseUrl: "http://example.test",
+        reasoning: false,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 10_000,
+        maxTokens: 2_000,
+      }
+      const ctx = {
+        cwd: dir,
+        model,
+        sessionManager: { getSessionId: () => "session-1", getBranch: () => [] },
+        modelRegistry: {
+          hasConfiguredAuth: () => true,
+          complete: async (_model: unknown, context: { messages: Array<{ content: Array<{ text: string }> }> }) => {
+            prompt = context.messages[0]!.content[0]!.text
+            return {
+              role: "assistant",
+              content: [],
+              api: "openai-completions",
+              provider: "test",
+              model: "model",
+              usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+              stopReason: "stop",
+              timestamp: 1,
+            }
+          },
+        },
+        getContextUsage: () => ({ tokens: null, contextWindow: 10_000 }),
+      }
+      const start = events.get("session_start")![0] as (event: unknown, context: unknown) => unknown
+      await start({}, ctx)
+      const handler = events.get("session_before_compact")![0] as (event: unknown, context: unknown) => Promise<unknown>
+      const result = await handler({
+        preparation: {
+          messagesToSummarize: [userMessage("Inspect the pinned source")],
+          turnPrefixMessages: [],
+          firstKeptEntryId: "keep",
+          tokensBefore: 10,
+        },
+        signal: new AbortController().signal,
+      }, ctx)
+      const summary = (result as { compaction: { summary: string } }).compaction.summary
+      expect(summary.startsWith(`${PINNED_START}\n`)).toBe(true)
+      expect(summary).toContain("fn main() {}")
+      expect(prompt).not.toContain("cat-files v1")
+      expect(new TextEncoder().encode(summary).byteLength).toBeLessThanOrEqual(8_000)
+
+      const ordinary = formatInjection([{ path: "src/ordinary.rs", bytes: 1, tokens: 1, text: "fn ordinary() {}" }])
+      const ordinaryResult = await handler({
+        preparation: {
+          messagesToSummarize: [userMessage(ordinary)],
+          turnPrefixMessages: [],
+          firstKeptEntryId: "keep-2",
+          tokensBefore: 10,
+        },
+        signal: new AbortController().signal,
+      }, { ...ctx, sessionManager: { getSessionId: () => "session-without-pin", getBranch: () => [] } })
+      expect((ordinaryResult as { compaction: { summary: string } }).compaction.summary).toContain("ordinary.rs")
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })

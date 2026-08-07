@@ -8,7 +8,7 @@ import type { MessageRecord, RecoveryLedger, TodoRecord } from "./ledger.js"
 import { parseOptions, type ParsedOptions, type PluginOptions } from "./options.js"
 import type { ProjectedSummary } from "./projection.js"
 import { parsePluginLedger, parseProjectedSummary } from "./validation.js"
-import { CAT_INJECTION_MARKER } from "./cat-core.js"
+import { CAT_INJECTION_MARKER } from "./cat-markers.js"
 
 export const PI_CONFIG_FILENAME = "safe-compaction.json"
 
@@ -39,11 +39,11 @@ const PERSISTED_OPTION_KEYS = [
  *  from the fixed pin instead of being summarized by the model. */
 export function isCatAttachment(message: AgentMessage): boolean {
   if (message.role === "compactionSummary" || message.role === "branchSummary") {
-    return message.summary.includes(CAT_INJECTION_MARKER)
+    return message.summary.trimStart().startsWith(CAT_INJECTION_MARKER)
   }
   if (message.role !== "user" && message.role !== "custom") return false
-  if (typeof message.content === "string") return message.content.includes(CAT_INJECTION_MARKER)
-  return message.content.some((block) => block.type === "text" && block.text.includes(CAT_INJECTION_MARKER))
+  if (typeof message.content === "string") return message.content.trimStart().startsWith(CAT_INJECTION_MARKER)
+  return message.content.some((block, index) => index === 0 && block.type === "text" && block.text.trimStart().startsWith(CAT_INJECTION_MARKER))
 }
 
 /** Convert pi AgentMessages into the plugin's host-agnostic MessageRecord shape.

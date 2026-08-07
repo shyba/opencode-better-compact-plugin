@@ -2,17 +2,12 @@ import { readdirSync, readFileSync, statSync } from "node:fs"
 import { mkdir, rename, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent"
+import { truncateUtf8, utf8Bytes } from "./ledger.js"
+import { CAT_INJECTION_MARKER, PINNED_END, PINNED_START } from "./cat-markers.js"
+
+export { CAT_INJECTION_MARKER, PINNED_END, PINNED_START } from "./cat-markers.js"
 
 export const CAT_CONFIG_FILENAME = "cat-files.json"
-
-/** Marker placed at the start of every /cat attachment message so the
- *  compaction extension can recognize (and skip) attachment messages when
- *  building the recovery ledger and model prompt. */
-export const CAT_INJECTION_MARKER = "<!-- cat-files v1 -->"
-
-/** Delimiters for the pinned-files block embedded in compaction summaries. */
-export const PINNED_START = "<!-- cat-pinned-files v1 -->"
-export const PINNED_END = "<!-- /cat-pinned-files -->"
 
 export type CatOptions = {
   warnThreshold: number
@@ -54,6 +49,8 @@ export type CatFixedPin = {
   tokenBudget?: number
   pinnedAt: number
 }
+
+const MAX_FIXED_PINS = 64
 
 export type CatFile = {
   /** Path relative to cwd (with forward slashes). */
@@ -239,17 +236,22 @@ export function formatPinnedBlock(files: CatFile[], skipped: readonly string[] =
   return lines.join("\n")
 }
 
-/** Degraded pinned block used when the pinned files alone would consume too
- *  much of the context window to embed safely: paths only, no contents. */
-export function pinnedPathsOnlyBlock(files: CatFile[]): string {
-  const paths = files.map((file) => `- ${file.path} (${formatBytes(file.bytes)})`).join("\n")
-  return [
+/** Degraded pinned block used when the pinned files cannot fit beside the
+ *  summary within the context budget: paths only, no contents. */
+export function pinnedPathsOnlyBlock(files: CatFile[], maxBytes = Number.POSITIVE_INFINITY): string {
+  const prefix = [
     PINNED_START,
     "Pinned files (/cat --fixed) were not embedded: their contents would exceed the context budget.",
     "",
-    paths,
-    PINNED_END,
   ].join("\n")
+  const suffix = `\n${PINNED_END}`
+  const paths = files
+    .map((file) => `- ${file.path.replace(/[\r\n]+/g, " ")} (${formatBytes(file.bytes)})`)
+    .join("\n")
+  const available = maxBytes === Number.POSITIVE_INFINITY
+    ? Number.POSITIVE_INFINITY
+    : Math.max(0, maxBytes - utf8Bytes(prefix) - utf8Bytes(suffix))
+  return `${prefix}${truncateUtf8(paths, available)}${suffix}`
 }
 
 export type ContextUsage = {
@@ -296,27 +298,15 @@ export function loadCatOptions(cwd: string): CatOptions {
 }
 
 export async function saveCatOptions(cwd: string, options: CatOptions): Promise<void> {
-  await writeCatConfig(cwd, { ...options })
+  await updateCatConfig(cwd, (value) => ({ ...value, ...options }))
 }
 
 /** Read the fixed pin recorded by /cat --fixed, if any. Invalid or missing
  *  entries return undefined. */
-export function loadFixedPin(cwd: string): CatFixedPin | undefined {
+export function loadFixedPin(cwd: string, sessionID?: string): CatFixedPin | undefined {
   try {
-    const raw = readFileSync(path.join(cwd, CONFIG_DIR_NAME, CAT_CONFIG_FILENAME), "utf8")
-    const value = JSON.parse(raw) as unknown
-    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
-    const fixed = (value as Record<string, unknown>).fixed
-    if (!fixed || typeof fixed !== "object" || Array.isArray(fixed)) return undefined
-    const pin = fixed as Record<string, unknown>
-    if (typeof pin.sessionId !== "string" || !pin.sessionId) return undefined
-    if (!Array.isArray(pin.patterns) || !pin.patterns.length || !pin.patterns.every((item) => typeof item === "string" && item.length > 0)) return undefined
-    if (typeof pin.pinnedAt !== "number" || !Number.isFinite(pin.pinnedAt)) return undefined
-    const result: CatFixedPin = { sessionId: pin.sessionId, patterns: pin.patterns, pinnedAt: pin.pinnedAt }
-    if (typeof pin.tokenBudget === "number" && Number.isFinite(pin.tokenBudget) && pin.tokenBudget > 0) {
-      result.tokenBudget = pin.tokenBudget
-    }
-    return result
+    const pins = readFixedPins(readCatConfig(cwd).fixed)
+    return sessionID ? pins.find((pin) => pin.sessionId === sessionID) : pins[0]
   } catch {
     return undefined
   }
@@ -324,14 +314,26 @@ export function loadFixedPin(cwd: string): CatFixedPin | undefined {
 
 /** Record a fixed pin, preserving any existing cat options in the same file. */
 export async function saveFixedPin(cwd: string, pin: CatFixedPin): Promise<void> {
-  await writeCatConfig(cwd, { ...readCatConfig(cwd), fixed: pin })
+  await updateCatConfig(cwd, (value) => {
+    const pins = readFixedPins(value.fixed).filter((item) => item.sessionId !== pin.sessionId)
+    pins.push({ ...pin, patterns: [...pin.patterns] })
+    const bounded = pins
+      .sort((left, right) => right.pinnedAt - left.pinnedAt || left.sessionId.localeCompare(right.sessionId))
+      .slice(0, MAX_FIXED_PINS)
+      .sort((left, right) => left.pinnedAt - right.pinnedAt || left.sessionId.localeCompare(right.sessionId))
+    return { ...value, fixed: bounded.length === 1 ? bounded[0] : bounded }
+  })
 }
 
 /** Remove the fixed pin, preserving any existing cat options. */
-export async function clearFixedPin(cwd: string): Promise<void> {
-  const value = readCatConfig(cwd)
-  delete value.fixed
-  await writeCatConfig(cwd, value)
+export async function clearFixedPin(cwd: string, sessionID?: string): Promise<void> {
+  await updateCatConfig(cwd, (value) => {
+    const pins = readFixedPins(value.fixed).filter((pin) => sessionID !== undefined && pin.sessionId !== sessionID)
+    const next = { ...value }
+    if (!pins.length) delete next.fixed
+    else next.fixed = pins.length === 1 ? pins[0] : pins
+    return next
+  })
 }
 
 function readCatConfig(cwd: string): Record<string, unknown> {
@@ -345,7 +347,21 @@ function readCatConfig(cwd: string): Record<string, unknown> {
   return {}
 }
 
-async function writeCatConfig(cwd: string, value: Record<string, unknown>): Promise<void> {
+function readFixedPins(value: unknown): CatFixedPin[] {
+  const values = Array.isArray(value) ? value : [value]
+  return values.flatMap((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return []
+    const pin = item as Record<string, unknown>
+    if (typeof pin.sessionId !== "string" || !pin.sessionId) return []
+    if (!Array.isArray(pin.patterns) || !pin.patterns.length || !pin.patterns.every((pattern) => typeof pattern === "string" && pattern.length > 0)) return []
+    if (typeof pin.pinnedAt !== "number" || !Number.isFinite(pin.pinnedAt)) return []
+    const result: CatFixedPin = { sessionId: pin.sessionId, patterns: [...pin.patterns], pinnedAt: pin.pinnedAt }
+    if (typeof pin.tokenBudget === "number" && Number.isFinite(pin.tokenBudget) && pin.tokenBudget > 0) result.tokenBudget = pin.tokenBudget
+    return [result]
+  })
+}
+
+async function updateCatConfig(cwd: string, update: (value: Record<string, unknown>) => Record<string, unknown>): Promise<void> {
   const dir = path.join(cwd, CONFIG_DIR_NAME)
   await mkdir(dir, { recursive: true, mode: 0o700 })
   const file = path.join(dir, CAT_CONFIG_FILENAME)
@@ -356,6 +372,7 @@ async function writeCatConfig(cwd: string, value: Record<string, unknown>): Prom
     throw new Error(`cat-files configuration is busy: ${file}`)
   }
   try {
+    const value = update(readCatConfig(cwd))
     const temporary = `${file}.tmp-${process.pid}`
     await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 })
     await rename(temporary, file)
@@ -453,7 +470,7 @@ function listFiles(cwd: string, skipDirs: readonly string[]): string[] {
       if (entry.isFile()) files.push(relative)
     }
   }
-  return files
+  return files.sort()
 }
 
 /** Compile a glob pattern (supporting **, *, ?, [..], {a,b}) into a matcher. */

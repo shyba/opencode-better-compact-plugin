@@ -22,21 +22,18 @@ type PipelineResult = {
   details: { ledgerDigest: string; ledgerBytes: number }
 }
 
-/** When pinned files alone would consume more than this fraction of the
- *  context window, embed paths instead of contents so compaction never
- *  produces an overflowing summary. */
+/** Keep the complete compaction artifact below a conservative context fraction
+ *  when a fixed file prefix is added. */
 const PINNED_FILES_MAX_FRACTION = 0.8
 
 export default function piExtension(pi: ExtensionAPI) {
   ensureBunCryptoShim()
   let cwd = process.cwd()
   let resolved = resolveOptions(parseOptions(loadPiOptions(cwd)))
-  let catOptions = loadCatOptions(cwd)
 
   pi.on("session_start", (_event, ctx) => {
     cwd = ctx.cwd
     resolved = resolveOptions(parseOptions(loadPiOptions(cwd)))
-    catOptions = loadCatOptions(cwd)
   })
 
   async function runPipeline(input: {
@@ -48,7 +45,11 @@ export default function piExtension(pi: ExtensionAPI) {
   }): Promise<PipelineResult | undefined> {
     const { messages, branch, sessionID, signal, ctx } = input
     if (signal.aborted) return
-    const records = toMessageRecords(messages.filter((message) => !isCatAttachment(message)), sessionID)
+    const fixedPin = loadFixedPin(ctx.cwd, sessionID)
+    const records = toMessageRecords(
+      fixedPin ? messages.filter((message) => !isCatAttachment(message)) : messages,
+      sessionID,
+    )
     const todos = todosFromBranch(branch)
     const prior = priorPluginSummary(branch)
     const ledger = buildRecoveryLedger({
@@ -87,17 +88,22 @@ export default function piExtension(pi: ExtensionAPI) {
    *  deterministic, so the files stay loaded across compactions, pick up edits
    *  made since the last compaction, and form a cacheable fixed prefix. */
   async function withPinnedFiles(ctx: ExtensionContext, sessionID: string, summary: string): Promise<string> {
-    const pin = loadFixedPin(cwd)
+    const pin = loadFixedPin(ctx.cwd, sessionID)
     if (!pin || pin.sessionId !== sessionID) return summary
-    const collected = collectFiles(pin.patterns, cwd, catOptions, pin.tokenBudget)
+    const collected = collectFiles(pin.patterns, ctx.cwd, loadCatOptions(ctx.cwd), pin.tokenBudget)
     if (!collected.files.length) return summary
     const usage = ctx.getContextUsage()
     const contextWindow = usage?.contextWindow
     if (contextWindow === undefined || contextWindow <= 0) return summary
-    if (collected.totalTokens > Math.floor(contextWindow * PINNED_FILES_MAX_FRACTION)) {
-      return `${pinnedPathsOnlyBlock(collected.files)}\n\n${summary}`
-    }
-    return `${formatPinnedBlock(collected.files, collected.skipped)}\n\n${summary}`
+    const summaryBytes = utf8Bytes(summary)
+    const safeSummaryBytes = Math.floor(contextWindow * PINNED_FILES_MAX_FRACTION)
+    const availablePinnedBytes = safeSummaryBytes - summaryBytes - 2
+    if (availablePinnedBytes <= 0) return summary
+    const pinned = formatPinnedBlock(collected.files, collected.skipped)
+    if (utf8Bytes(pinned) <= availablePinnedBytes) return `${pinned}\n\n${summary}`
+    const paths = pinnedPathsOnlyBlock(collected.files, availablePinnedBytes)
+    if (utf8Bytes(paths) <= availablePinnedBytes) return `${paths}\n\n${summary}`
+    return summary
   }
 
   pi.on("session_before_compact", async (event, ctx) => {

@@ -287,12 +287,12 @@ Behavior:
 
 For review/exploration sessions that read a codebase without editing it, `--fixed` pins the resolved patterns (scoped to the pi session) so files stay loaded no matter how often the conversation is compacted:
 
-- The pin is recorded in `<cwd>/.pi/cat-files.json` as a `fixed` entry (`sessionId`, resolved `patterns`, optional `tokenBudget`). Other sessions in the same cwd do not inherit it.
+- The pin is recorded in `<cwd>/.pi/cat-files.json` as a `fixed` entry (`sessionId`, resolved `patterns`, optional `tokenBudget`); when several sessions share a cwd, it is a bounded array of entries. Other sessions do not inherit them.
 - On every compaction, the recovery-ledger extension re-reads the pinned files **fresh from disk** and embeds them, verbatim and deterministic (no model involvement), at the front of the compaction summary. Edited files come back updated; deleted files drop out of the block.
 - The summary therefore stays `[pinned files][conversation summary][ledger]`. The pinned block is byte-identical across turns, so providers cache it as a fixed prefix: after the first turn, the files cost cache reads, not full input tokens. The conversation after them still compacts normally.
-- The old attachment messages are recognized by a marker and excluded from the recovery ledger and the summarization prompt, so compaction never pays input tokens to re-summarize the file contents and the summary never contains stale file descriptions.
-- If the pinned files alone would exceed 80% of the context window, compaction embeds a paths-only block plus a note instead of overflowing. `/cat` itself still refuses attachments over `warnThreshold`.
-- `/cat --reset` clears the pin; the next compaction falls back to the normal bounded summary.
+- While a fixed pin is active, its old attachment messages are recognized by a marker and excluded from the recovery ledger and summarization prompt, so compaction never pays input tokens to re-summarize stale file contents. Ordinary `/cat` attachments keep the normal compaction behavior.
+- If the pinned block plus the ordinary summary would exceed 80% of the context window, compaction embeds a bounded paths-only block plus a note instead of overflowing; if even that cannot fit, it keeps the ordinary summary. `/cat` itself still refuses attachments over `warnThreshold`.
+- `/cat --reset` clears the current session's pin; the next compaction falls back to the normal bounded summary for that session.
 
 Token counts are approximate (`chars / 4`, matching pi's own estimator). Lower `charsPerToken` (e.g. `3.5`) or `warnThreshold` for pessimistic estimates. There is no confirmation dialog — the command either injects or refuses.
 

@@ -30,7 +30,12 @@ export default function catExtension(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const invocation = parseCatArgs(args)
       if (invocation.reset) {
-        await clearFixedPin(cwd)
+        try {
+          await clearFixedPin(cwd, ctx.sessionManager.getSessionId() ?? "pi-session")
+        } catch {
+          if (ctx.hasUI) ctx.ui.notify("Could not clear pinned files; the existing pin was left unchanged.", "error")
+          return
+        }
         if (ctx.hasUI) ctx.ui.notify("Pinned files cleared; compaction will no longer re-attach them.", "info")
         return
       }
@@ -81,21 +86,26 @@ export default function catExtension(pi: ExtensionAPI) {
         return
       }
 
+      if (invocation.fixed) {
+        try {
+          await saveFixedPin(cwd, {
+            sessionId: ctx.sessionManager.getSessionId() ?? "pi-session",
+            patterns,
+            ...(invocation.tokenBudget !== undefined ? { tokenBudget: invocation.tokenBudget } : {}),
+            pinnedAt: Date.now(),
+          })
+        } catch {
+          if (ctx.hasUI) ctx.ui.notify("Could not pin these files; nothing was attached.", "error")
+          return
+        }
+      }
       pi.sendUserMessage(
         formatInjection(collected.files),
         ctx.isIdle() ? undefined : { deliverAs: "followUp" },
       )
       const notices: string[] = []
       if (collected.skipped.length) notices.push(`${collected.skipped.length} skipped`)
-      if (invocation.fixed) {
-        await saveFixedPin(cwd, {
-          sessionId: ctx.sessionManager.getSessionId() ?? "pi-session",
-          patterns,
-          ...(invocation.tokenBudget !== undefined ? { tokenBudget: invocation.tokenBudget } : {}),
-          pinnedAt: Date.now(),
-        })
-        notices.push("pinned: files are re-attached, updated, after each compaction (/cat --reset to clear)")
-      }
+      if (invocation.fixed) notices.push("pinned: files are re-attached, updated, after each compaction (/cat --reset to clear)")
       if (notices.length && ctx.hasUI) {
         ctx.ui.notify(`Attached ${collected.files.length} files; ${notices.join("; ")}.`, "info")
       }

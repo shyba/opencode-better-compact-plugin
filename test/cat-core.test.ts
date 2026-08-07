@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { describe, expect, test } from "bun:test"
@@ -237,6 +237,12 @@ describe("pinned block formatting", () => {
     expect(text).toContain("- src/a.rs (5 B)")
     expect(text).not.toContain("fn a()")
   })
+
+  test("bounds the degraded block while preserving its closing marker", () => {
+    const text = pinnedPathsOnlyBlock([...files, ...files, ...files], 240)
+    expect(new TextEncoder().encode(text).byteLength).toBeLessThanOrEqual(240)
+    expect(text.endsWith("<!-- /cat-pinned-files -->")).toBe(true)
+  })
 })
 
 describe("fixed pin persistence", () => {
@@ -249,6 +255,49 @@ describe("fixed pin persistence", () => {
       await saveFixedPin(dir, pin)
       expect(loadFixedPin(dir)).toEqual(pin)
       expect(loadCatOptions(dir).warnThreshold).toBe(0.8)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("keeps independent session pins and clears only the current session", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "sc-cat-"))
+    const second = { ...pin, sessionId: "session-2", patterns: ["lib/**/*.rs"] }
+    try {
+      await saveFixedPin(dir, pin)
+      await saveFixedPin(dir, second)
+      expect(loadFixedPin(dir, "session-1")).toEqual(pin)
+      expect(loadFixedPin(dir, "session-2")).toEqual(second)
+      await clearFixedPin(dir, "session-1")
+      expect(loadFixedPin(dir, "session-1")).toBeUndefined()
+      expect(loadFixedPin(dir, "session-2")).toEqual(second)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("preserves pins when cat options are updated later", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "sc-cat-"))
+    try {
+      await saveFixedPin(dir, pin)
+      await saveCatOptions(dir, { ...DEFAULT_CAT_OPTIONS, warnThreshold: 0.8 })
+      expect(loadFixedPin(dir, "session-1")).toEqual(pin)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("bounds persisted pins so the shared config cannot grow without limit", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "sc-cat-"))
+    try {
+      for (let index = 0; index < 70; index++) {
+        await saveFixedPin(dir, { sessionId: `session-${index}`, patterns: [`src/${index}.rs`], pinnedAt: index })
+      }
+      expect(loadFixedPin(dir, "session-0")).toBeUndefined()
+      expect(loadFixedPin(dir, "session-69")).toEqual({ sessionId: "session-69", patterns: ["src/69.rs"], pinnedAt: 69 })
+      const raw = JSON.parse(await readFile(path.join(dir, ".pi", "cat-files.json"))) as { fixed: unknown[] }
+      expect(Array.isArray(raw.fixed)).toBe(true)
+      expect(raw.fixed).toHaveLength(64)
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

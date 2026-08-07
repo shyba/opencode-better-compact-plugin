@@ -1,6 +1,6 @@
 # Force files into context (pi extension design)
 
-Status: implemented on branch `pi-support`. Separate from the better-compact pi-support work; can land as its own extension. Lives in `/home/user/repos/opencode-pi-support` worktree or a new one — TBD with user.
+Status: implemented on branch `cat-fixed`; this feature is now being reviewed for merge into the standalone Better Compact Pi extension.
 
 ## Problem
 
@@ -222,18 +222,20 @@ The parser, walker, formatter, and threshold logic are pure and unit-testable.
 ### Pinning files across compaction (`--fixed` / `--reset`)
 
 Implemented on branch `cat-fixed`. `/cat <patterns> --fixed` records a session-scoped pin
-(`sessionId`, resolved `patterns`, optional `tokenBudget`) in `<cwd>/.pi/cat-files.json`;
-`/cat --reset` clears it. While a pin is active, every compaction re-reads the pinned files
+(`sessionId`, resolved `patterns`, optional `tokenBudget`) in `<cwd>/.pi/cat-files.json`; multiple
+sessions are stored as a bounded array of entries. `/cat --reset` clears the current session's pin.
+While a pin is active, every compaction re-reads the pinned files
 fresh from disk and embeds them deterministically at the front of the compaction summary:
 
 - The summary stays `[pinned files][conversation summary][ledger]`. The pinned block is
   byte-identical across turns, so providers cache it as a fixed prefix; the conversation
 after it compacts normally.
-- Old attachment messages carry a marker (`<!-- cat-files v1 -->`) and are excluded from the
-  recovery ledger and the summarization prompt, so compaction never re-bills the file
-  contents as input tokens and the summary never describes stale copies.
-- If the pinned files alone would exceed 80% of the context window, compaction embeds a
-  paths-only block plus a note instead of overflowing.
+- While a fixed pin is active, its old attachment messages carry a marker (`<!-- cat-files v1 -->`)
+  and are excluded from the recovery ledger and summarization prompt, so compaction never
+  re-bills stale file contents. Ordinary `/cat` attachments retain the normal compaction path.
+- If the pinned block plus the ordinary summary would exceed 80% of the context window,
+  compaction embeds a bounded paths-only block or keeps the ordinary summary instead of
+  adding an overflowing prefix.
 
 This replaced the earlier design that re-injected files at the tail after each compaction
 (`session_compact` + `sendUserMessage`): tail re-injection places the files after the
