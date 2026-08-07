@@ -255,14 +255,16 @@ Pi-specific limits:
 A `/cat` slash command that attaches full file contents to the conversation, bypassing pi's bash-output truncation (pi truncates `!cmd` output at ~50 KiB and `!!cmd` excludes it from context entirely).
 
 ```
-/cat <ext> [dir] [tokens]          shorthand: all <ext> files under dir (default .)
-/cat <glob>... [tokens]            explicit globs: src/**/*.ts, 'src/**/*.{ts,tsx}'
+/cat <ext> [dir] [tokens]          shorthand: all <ext> files under dir (default .); dot is optional
+/cat <glob>... [tokens]            explicit globs: src/**/*.ts, 'src/**/*.{ts,tsx}'; simple basenames recurse
 ```
 
 Examples:
 
 ```
+/cat rs src                        all .rs files under src (".rs" also works)
 /cat .rs src                       all .rs files under src
+/cat '*rs'                         all files whose basename ends in "rs" (find -name style)
 /cat .md                           all .md files under cwd
 /cat src/main.ts src/util.ts       two literal files
 /cat 'src/**/*.ts' 80000           glob capped at 80k tokens

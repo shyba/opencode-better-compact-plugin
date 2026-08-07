@@ -24,6 +24,10 @@ describe("parseCatArgs", () => {
     expect(parseCatArgs("src/**/*.ts 80000")).toEqual({ patterns: ["src/**/*.ts"], tokenBudget: 80_000 })
   })
 
+  test("accepts a conventional leading glob separator", () => {
+    expect(parseCatArgs('-- "src/**/*.rs"')).toEqual({ patterns: ["src/**/*.rs"] })
+  })
+
   test("does not treat a non-final number as a budget", () => {
     expect(parseCatArgs("50000 .rs")).toEqual({ patterns: ["50000", ".rs"] })
   })
@@ -36,12 +40,20 @@ describe("parseCatArgs", () => {
 describe("resolvePatterns", () => {
   test("expands extension shorthand with dir", () => {
     expect(resolvePatterns({ patterns: [".rs", "src"] })).toEqual(["src/**/*.rs"])
+    expect(resolvePatterns({ patterns: ["rs", "src"] })).toEqual(["src/**/*.rs"])
     expect(resolvePatterns({ patterns: [".md"] })).toEqual(["./**/*.md"])
+    expect(resolvePatterns({ patterns: ["md"] })).toEqual(["./**/*.md"])
   })
 
   test("passes explicit globs through", () => {
     expect(resolvePatterns({ patterns: ["src/**/*.ts"] })).toEqual(["src/**/*.ts"])
     expect(resolvePatterns({ patterns: ["src/main.ts", "README.md"] })).toEqual(["src/main.ts", "README.md"])
+  })
+
+  test("recurses simple basename globs like find -name", () => {
+    expect(resolvePatterns({ patterns: ["*rs"] })).toEqual(["**/*rs"])
+    expect(resolvePatterns({ patterns: ["*.rs"] })).toEqual(["**/*.rs"])
+    expect(resolvePatterns({ patterns: ["./*.rs"] })).toEqual(["./*.rs"])
   })
 
   test("falls back to glob mode for ambiguous input", () => {
@@ -70,6 +82,17 @@ describe("collectFiles", () => {
       expect(result.files.map((file) => file.path).sort()).toEqual(["a.rs", "b.rs"])
       expect(result.files.every((file) => file.tokens > 0)).toBe(true)
       expect(result.totalBytes).toBeGreaterThan(0)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("matches recursive basename globs", async () => {
+    const dir = await fixture({ "root.rs": "root", "src/api/library.rs": "library", "src/api/readme.md": "readme" })
+    try {
+      const invocation = parseCatArgs("*rs")
+      const result = collectFiles(resolvePatterns(invocation), dir, DEFAULT_CAT_OPTIONS)
+      expect(result.files.map((file) => file.path).sort()).toEqual(["root.rs", "src/api/library.rs"])
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

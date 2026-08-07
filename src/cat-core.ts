@@ -52,6 +52,7 @@ export type CatCollectResult = {
  *  integer, is the token budget. Everything else is a pattern. */
 export function parseCatArgs(args: string): CatInvocation {
   const tokens = tokenize(args)
+  if (tokens[0] === "--") tokens.shift()
   if (!tokens.length) return { patterns: [] }
   const last = tokens[tokens.length - 1]!
   if (/^[1-9]\d*$/.test(last)) {
@@ -62,9 +63,9 @@ export function parseCatArgs(args: string): CatInvocation {
 }
 
 /** Turn shorthand forms into explicit globs. Shorthand is `<ext> [dir]`:
- *  first arg starts with "." and looks like an extension (no separators, no
- *  glob meta, short), second arg (if any) must not look like a glob. Any
- *  ambiguous input falls back to explicit globs. */
+ *  the first arg looks like a short extension with or without its leading
+ *  dot, and the second arg (if any) must not look like a glob. Any ambiguous
+ *  input falls back to explicit globs. */
 export function resolvePatterns(invocation: CatInvocation): string[] {
   const { patterns } = invocation
   if (!patterns.length) return []
@@ -76,9 +77,9 @@ export function resolvePatterns(invocation: CatInvocation): string[] {
     !(second !== undefined && looksLikeGlob(second))
   ) {
     const dir = (second ?? ".").replace(/\/+$/, "") || "."
-    return [`${dir}/**/*${first}`]
+    return [`${dir}/**/*${first.startsWith(".") ? first : `.${first}`}`]
   }
-  return patterns
+  return patterns.map((pattern) => isRecursiveBasenameGlob(pattern) ? `**/${pattern}` : pattern)
 }
 
 /** Resolve patterns to file contents with skip list, per-file cap, aggregate
@@ -272,12 +273,17 @@ function tokenize(args: string): string[] {
 }
 
 function isExtensionShorthand(value: string): boolean {
-  if (!value.startsWith(".") || value.startsWith("./") || value.startsWith("../")) return false
-  return /^\.[a-z0-9]{1,8}$/i.test(value)
+  if (value.startsWith("./") || value.startsWith("../") || value.includes("/")) return false
+  const extension = value.startsWith(".") ? value.slice(1) : value
+  return /^[a-z0-9]{1,8}$/i.test(extension)
 }
 
 function looksLikeGlob(value: string): boolean {
   return /[*?[]/.test(value) || value.startsWith("./") || value.startsWith("/")
+}
+
+function isRecursiveBasenameGlob(value: string): boolean {
+  return !value.includes("/") && /[*?[{]/.test(value)
 }
 
 function isSkippedDir(relative: string, skipDirs: readonly string[]): boolean {
