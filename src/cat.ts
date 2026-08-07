@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import {
   DEFAULT_CAT_OPTIONS,
+  clearFixedPin,
   collectFiles,
   formatBytes,
   formatInjection,
@@ -9,10 +10,11 @@ import {
   parseCatArgs,
   projectContext,
   resolvePatterns,
+  saveFixedPin,
   type CatOptions,
 } from "./cat-core.js"
 
-export { DEFAULT_CAT_OPTIONS, collectFiles, formatInjection, loadCatOptions, parseCatArgs, projectContext, resolvePatterns } from "./cat-core.js"
+export { DEFAULT_CAT_OPTIONS, clearFixedPin, collectFiles, formatInjection, formatPinnedBlock, loadCatOptions, loadFixedPin, parseCatArgs, pinnedPathsOnlyBlock, projectContext, resolvePatterns, saveFixedPin } from "./cat-core.js"
 
 export default function catExtension(pi: ExtensionAPI) {
   let cwd = process.cwd()
@@ -24,9 +26,18 @@ export default function catExtension(pi: ExtensionAPI) {
   })
 
   pi.registerCommand("cat", {
-    description: "Attach file contents to the conversation: /cat <ext> [dir] [tokens], /cat <glob>... [tokens]",
+    description: "Attach file contents: /cat <ext> [dir] [tokens] | /cat <glob>... [tokens] | --fixed pins them across compaction | --reset unpins",
     handler: async (args, ctx) => {
       const invocation = parseCatArgs(args)
+      if (invocation.reset) {
+        await clearFixedPin(cwd)
+        if (ctx.hasUI) ctx.ui.notify("Pinned files cleared; compaction will no longer re-attach them.", "info")
+        return
+      }
+      if (invocation.fixed && !invocation.patterns.length) {
+        if (ctx.hasUI) ctx.ui.notify("Usage: /cat <patterns> --fixed (patterns are required to pin)", "error")
+        return
+      }
       const patterns = resolvePatterns(invocation)
       if (!patterns.length) {
         if (ctx.hasUI) ctx.ui.notify("Usage: /cat <ext> [dir] [tokens] or /cat <glob>... [tokens]", "error")
@@ -74,8 +85,19 @@ export default function catExtension(pi: ExtensionAPI) {
         formatInjection(collected.files),
         ctx.isIdle() ? undefined : { deliverAs: "followUp" },
       )
-      if (collected.skipped.length && ctx.hasUI) {
-        ctx.ui.notify(`Attached ${collected.files.length} files; ${collected.skipped.length} skipped.`, "info")
+      const notices: string[] = []
+      if (collected.skipped.length) notices.push(`${collected.skipped.length} skipped`)
+      if (invocation.fixed) {
+        await saveFixedPin(cwd, {
+          sessionId: ctx.sessionManager.getSessionId() ?? "pi-session",
+          patterns,
+          ...(invocation.tokenBudget !== undefined ? { tokenBudget: invocation.tokenBudget } : {}),
+          pinnedAt: Date.now(),
+        })
+        notices.push("pinned: files are re-attached, updated, after each compaction (/cat --reset to clear)")
+      }
+      if (notices.length && ctx.hasUI) {
+        ctx.ui.notify(`Attached ${collected.files.length} files; ${notices.join("; ")}.`, "info")
       }
     },
   })

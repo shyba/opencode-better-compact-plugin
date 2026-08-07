@@ -6,9 +6,10 @@ import { uuidv7 } from "@earendil-works/pi-ai"
 import { createHash } from "node:crypto"
 import { buildRecoveryLedger, utf8Bytes } from "./ledger.js"
 import { SELECTED_MODEL, parseOptions, resolveOptions, type PluginOptions } from "./options.js"
-import { loadPiOptions, priorPluginSummary, savePiOptions, toMessageRecords, todosFromBranch } from "./pi-adapter.js"
+import { isCatAttachment, loadPiOptions, priorPluginSummary, savePiOptions, toMessageRecords, todosFromBranch } from "./pi-adapter.js"
 import { remapProjection } from "./projection.js"
 import { buildAuthoritativeSummary, buildCompactionPrompt, renderProjectedResponse } from "./validation.js"
+import { collectFiles, formatPinnedBlock, loadCatOptions, loadFixedPin, pinnedPathsOnlyBlock } from "./cat-core.js"
 
 export { loadPiOptions, savePiOptions, toMessageRecords, todosFromBranch, priorPluginSummary } from "./pi-adapter.js"
 export type { PriorPluginSummary } from "./pi-adapter.js"
@@ -21,14 +22,21 @@ type PipelineResult = {
   details: { ledgerDigest: string; ledgerBytes: number }
 }
 
+/** When pinned files alone would consume more than this fraction of the
+ *  context window, embed paths instead of contents so compaction never
+ *  produces an overflowing summary. */
+const PINNED_FILES_MAX_FRACTION = 0.8
+
 export default function piExtension(pi: ExtensionAPI) {
   ensureBunCryptoShim()
   let cwd = process.cwd()
   let resolved = resolveOptions(parseOptions(loadPiOptions(cwd)))
+  let catOptions = loadCatOptions(cwd)
 
   pi.on("session_start", (_event, ctx) => {
     cwd = ctx.cwd
     resolved = resolveOptions(parseOptions(loadPiOptions(cwd)))
+    catOptions = loadCatOptions(cwd)
   })
 
   async function runPipeline(input: {
@@ -40,7 +48,7 @@ export default function piExtension(pi: ExtensionAPI) {
   }): Promise<PipelineResult | undefined> {
     const { messages, branch, sessionID, signal, ctx } = input
     if (signal.aborted) return
-    const records = toMessageRecords(messages, sessionID)
+    const records = toMessageRecords(messages.filter((message) => !isCatAttachment(message)), sessionID)
     const todos = todosFromBranch(branch)
     const prior = priorPluginSummary(branch)
     const ledger = buildRecoveryLedger({
@@ -74,6 +82,24 @@ export default function piExtension(pi: ExtensionAPI) {
     return { summary, usage: response.usage, details: { ledgerDigest: ledger.digest, ledgerBytes: utf8Bytes(ledger.block) } }
   }
 
+  /** When /cat --fixed pinned files for this session, re-collect them fresh and
+   *  embed the block at the front of the summary. The pinned block is
+   *  deterministic, so the files stay loaded across compactions, pick up edits
+   *  made since the last compaction, and form a cacheable fixed prefix. */
+  async function withPinnedFiles(ctx: ExtensionContext, sessionID: string, summary: string): Promise<string> {
+    const pin = loadFixedPin(cwd)
+    if (!pin || pin.sessionId !== sessionID) return summary
+    const collected = collectFiles(pin.patterns, cwd, catOptions, pin.tokenBudget)
+    if (!collected.files.length) return summary
+    const usage = ctx.getContextUsage()
+    const contextWindow = usage?.contextWindow
+    if (contextWindow === undefined || contextWindow <= 0) return summary
+    if (collected.totalTokens > Math.floor(contextWindow * PINNED_FILES_MAX_FRACTION)) {
+      return `${pinnedPathsOnlyBlock(collected.files)}\n\n${summary}`
+    }
+    return `${formatPinnedBlock(collected.files, collected.skipped)}\n\n${summary}`
+  }
+
   pi.on("session_before_compact", async (event, ctx) => {
     const sessionID = ctx.sessionManager.getSessionId() ?? "pi-session"
     try {
@@ -87,7 +113,7 @@ export default function piExtension(pi: ExtensionAPI) {
       if (!result) return
       return {
         compaction: {
-          summary: result.summary,
+          summary: await withPinnedFiles(ctx, sessionID, result.summary),
           firstKeptEntryId: event.preparation.firstKeptEntryId,
           tokensBefore: event.preparation.tokensBefore,
           usage: result.usage,
@@ -113,7 +139,7 @@ export default function piExtension(pi: ExtensionAPI) {
         ctx,
       })
       if (!result) return
-      return { summary: { summary: result.summary, usage: result.usage, details: result.details } }
+      return { summary: { summary: await withPinnedFiles(ctx, sessionID, result.summary), usage: result.usage, details: result.details } }
     } catch (error) {
       warnHook("session_before_tree", sessionID, error)
       return

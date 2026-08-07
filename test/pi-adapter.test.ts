@@ -7,6 +7,7 @@ import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent
 import { canonicalLedger, type RecoveryLedgerData } from "../src/ledger.js"
 import { resolveOptions, parseOptions } from "../src/options.js"
 import {
+  isCatAttachment,
   loadPiOptions,
   priorPluginSummary,
   savePiOptions,
@@ -61,6 +62,33 @@ function toolResultMessage(toolCallId: string, toolName: string, text: string, i
     timestamp: 1,
   } as unknown as AgentMessage
 }
+
+describe("isCatAttachment", () => {
+  test("detects the injection marker in user messages", () => {
+    expect(isCatAttachment(userMessage("<!-- cat-files v1 -->\n<file:a.rs>\nx\n</file>"))).toBe(true)
+    expect(isCatAttachment(userMessage("plain question"))).toBe(false)
+  })
+
+  test("detects the marker in content-array user messages", () => {
+    const message = {
+      role: "user",
+      content: [{ type: "text", text: "<!-- cat-files v1 -->\n<file:a.rs>\nx\n</file>" }],
+      timestamp: 1,
+    }
+    expect(isCatAttachment(message)).toBe(true)
+  })
+
+  test("ignores non-attachment roles", () => {
+    expect(isCatAttachment({ role: "assistant", content: [], timestamp: 1 })).toBe(false)
+    expect(isCatAttachment({ role: "bashExecution", command: "cat a.rs", output: "", timestamp: 1 })).toBe(false)
+    expect(isCatAttachment({ role: "toolResult", toolCallId: "t1", toolName: "read", content: [], timestamp: 1 })).toBe(false)
+  })
+
+  test("detects the marker in summary messages", () => {
+    expect(isCatAttachment({ role: "compactionSummary", summary: "<!-- cat-files v1 -->", tokensBefore: 10, timestamp: 1 })).toBe(true)
+    expect(isCatAttachment({ role: "branchSummary", summary: "no marker", tokensBefore: 10, timestamp: 1 })).toBe(false)
+  })
+})
 
 describe("toMessageRecords", () => {
   test("maps plain user and assistant text", () => {

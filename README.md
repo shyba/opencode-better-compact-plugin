@@ -257,6 +257,8 @@ A `/cat` slash command that attaches full file contents to the conversation, byp
 ```
 /cat <ext> [dir] [tokens]          shorthand: all <ext> files under dir (default .); dot is optional
 /cat <glob>... [tokens]            explicit globs: src/**/*.ts, 'src/**/*.{ts,tsx}'; simple basenames recurse
+/cat <patterns> --fixed            pin the patterns: each compaction re-attaches fresh copies
+/cat --reset                       clear the pinned set
 ```
 
 Examples:
@@ -268,6 +270,8 @@ Examples:
 /cat .md                           all .md files under cwd
 /cat src/main.ts src/util.ts       two literal files
 /cat 'src/**/*.ts' 80000           glob capped at 80k tokens
+/cat .rs src --fixed               pin: compaction keeps these loaded, re-read fresh each time
+/cat --reset                       stop pinning; next compaction stops embedding them
 ```
 
 Behavior:
@@ -278,6 +282,17 @@ Behavior:
 - A trailing integer argument is a token budget: the read stops once cumulative estimates exceed it.
 - A default skip list excludes `node_modules`, `.git`, `dist`, `build`, `out`, `target`, `vendor`, `__pycache__`, `.next`, `.nuxt`, `.turbo`, `.cache`, `.venv`, `venv`, `.idea`, `.vscode`, `.gradle`. Binary files, files over `maxFileBytes` (4 MiB), and results over `maxTotalBytes` (32 MiB) or `maxFileCount` (1000) are skipped with a marker.
 - Settings live in `<cwd>/.pi/cat-files.json` (mode `0600`): `warnThreshold`, `unknownUsageFraction`, `charsPerToken`, `maxFileBytes`, `maxTotalBytes`, `maxFileCount`, `skipDirs`.
+
+#### Keeping files loaded across compaction (`--fixed`)
+
+For review/exploration sessions that read a codebase without editing it, `--fixed` pins the resolved patterns (scoped to the pi session) so files stay loaded no matter how often the conversation is compacted:
+
+- The pin is recorded in `<cwd>/.pi/cat-files.json` as a `fixed` entry (`sessionId`, resolved `patterns`, optional `tokenBudget`). Other sessions in the same cwd do not inherit it.
+- On every compaction, the recovery-ledger extension re-reads the pinned files **fresh from disk** and embeds them, verbatim and deterministic (no model involvement), at the front of the compaction summary. Edited files come back updated; deleted files drop out of the block.
+- The summary therefore stays `[pinned files][conversation summary][ledger]`. The pinned block is byte-identical across turns, so providers cache it as a fixed prefix: after the first turn, the files cost cache reads, not full input tokens. The conversation after them still compacts normally.
+- The old attachment messages are recognized by a marker and excluded from the recovery ledger and the summarization prompt, so compaction never pays input tokens to re-summarize the file contents and the summary never contains stale file descriptions.
+- If the pinned files alone would exceed 80% of the context window, compaction embeds a paths-only block plus a note instead of overflowing. `/cat` itself still refuses attachments over `warnThreshold`.
+- `/cat --reset` clears the pin; the next compaction falls back to the normal bounded summary.
 
 Token counts are approximate (`chars / 4`, matching pi's own estimator). Lower `charsPerToken` (e.g. `3.5`) or `warnThreshold` for pessimistic estimates. There is no confirmation dialog — the command either injects or refuses.
 

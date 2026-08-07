@@ -219,6 +219,28 @@ The parser, walker, formatter, and threshold logic are pure and unit-testable.
 4. **Heuristic multiplier calibration**: with `charsPerToken: 4`, code-heavy content can be off by 20–30 %. We default to the safe side (over-estimate) by also accepting a `< 1.0` multiplier in config (`charsPerToken: 3.5` = pessimistic). Acceptable as a v1 trade-off; not worth shipping a tokenizer.
 5. **No tokenizer shipped**: this means `/cat .md` on a giant Markdown-heavy repo may report a smaller number than the real token cost, because BPE tokenizes differently per model family. Acceptable for a v1 warn-and-cancel tool — we err on the side of false negatives (refusing when it would have fit) via the configurable multiplier. A v2 could ship `gpt-tokenizer` or similar with a per-model-id heuristic.
 
+### Pinning files across compaction (`--fixed` / `--reset`)
+
+Implemented on branch `cat-fixed`. `/cat <patterns> --fixed` records a session-scoped pin
+(`sessionId`, resolved `patterns`, optional `tokenBudget`) in `<cwd>/.pi/cat-files.json`;
+`/cat --reset` clears it. While a pin is active, every compaction re-reads the pinned files
+fresh from disk and embeds them deterministically at the front of the compaction summary:
+
+- The summary stays `[pinned files][conversation summary][ledger]`. The pinned block is
+  byte-identical across turns, so providers cache it as a fixed prefix; the conversation
+after it compacts normally.
+- Old attachment messages carry a marker (`<!-- cat-files v1 -->`) and are excluded from the
+  recovery ledger and the summarization prompt, so compaction never re-bills the file
+  contents as input tokens and the summary never describes stale copies.
+- If the pinned files alone would exceed 80% of the context window, compaction embeds a
+  paths-only block plus a note instead of overflowing.
+
+This replaced the earlier design that re-injected files at the tail after each compaction
+(`session_compact` + `sendUserMessage`): tail re-injection places the files after the
+dynamic conversation, where providers cannot cache them, so every turn would re-bill the
+full file contents as uncached input. Embedding at the front of the summary keeps them in
+the cacheable fixed prefix.
+
 ### Verification
 
 - `bun test` for the argument parser, glob walker, threshold logic (pure, no pi runtime).
