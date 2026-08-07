@@ -273,6 +273,7 @@ Examples:
 Behavior:
 
 - Files are read in full (no truncation), wrapped in `<file:path>` markers, and injected as a single user message via `pi.sendUserMessage`. When the agent is streaming the message is queued as a follow-up.
+- The injected message is a context handoff: the model treats the files as loaded reference context, replies `ok.` and waits when no task is in progress, and otherwise begins with `yes` and continues only when the files are relevant to the existing task.
 - Before injecting, the projected token count (current usage from `ctx.getContextUsage()` plus `chars / 4` per character, the same heuristic pi uses) is compared against the model context window. If it would exceed `warnThreshold` (default `0.95`) of the window, the command refuses and lists the three largest files; run `/compact` first or re-run with a narrower pattern or a `[tokens]` budget.
 - A trailing integer argument is a token budget: the read stops once cumulative estimates exceed it.
 - A default skip list excludes `node_modules`, `.git`, `dist`, `build`, `out`, `target`, `vendor`, `__pycache__`, `.next`, `.nuxt`, `.turbo`, `.cache`, `.venv`, `venv`, `.idea`, `.vscode`, `.gradle`. Binary files, files over `maxFileBytes` (4 MiB), and results over `maxTotalBytes` (32 MiB) or `maxFileCount` (1000) are skipped with a marker.
