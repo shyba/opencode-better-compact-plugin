@@ -88,6 +88,7 @@ export async function discoverJsonl(
   checkpointOrRevision: JsonlCheckpoint | number = 0,
   includeToolOutput = false,
   maxRecords = 500,
+  signal?: AbortSignal,
 ): Promise<JsonlDiscoveryResult> {
   const files = await listJsonlFiles(root)
   const prior = typeof checkpointOrRevision === "number" ? undefined : checkpointOrRevision
@@ -109,7 +110,12 @@ export async function discoverJsonl(
   const inventoryRecords: NormalizedRecord[] = []
   const inventoryNeeded = !checkpoint.inventoryComplete || files.some((file) => !checkpoint.files[file.relativePath]?.sessionID)
   if (inventoryNeeded) {
+    let inventoryComplete = true
     for (const file of files) {
+      if (signal?.aborted) {
+        inventoryComplete = false
+        break
+      }
       const saved = checkpoint.files[file.relativePath]
       if (saved?.sessionID && saved.size === file.size && saved.mtimeMs === file.mtimeMs) continue
       const header = await readSessionHeader(file.filename)
@@ -117,7 +123,7 @@ export async function discoverJsonl(
       checkpoint.files[file.relativePath] = { ...(saved?.lineCount === undefined ? {} : { lineCount: saved.lineCount }), size: file.size, mtimeMs: file.mtimeMs, sessionID }
       inventoryRecords.push(sessionRecord(sourceID, kind, file.relativePath, sessionID, header, header.createdAt || file.mtimeMs, file.mtimeMs))
     }
-    checkpoint.inventoryComplete = true
+    if (inventoryComplete) checkpoint.inventoryComplete = true
   }
 
   const candidates = files.filter((file) => {
@@ -132,6 +138,7 @@ export async function discoverJsonl(
   let sourceUpdatedAt = files.reduce((latest, file) => Math.max(latest, file.mtimeMs), 0)
   let remaining = Math.max(1, Math.floor(maxRecords))
   for (const file of candidates) {
+    if (signal?.aborted) break
     const saved = checkpoint.current?.path === file.relativePath ? checkpoint.current : undefined
     const sameMetadata = saved && saved.size === file.size && saved.mtimeMs === file.mtimeMs
     const startLine = sameMetadata ? saved.line : 0
@@ -150,6 +157,10 @@ export async function discoverJsonl(
     const lines = createInterface({ input, crlfDelay: Infinity })
     try {
       for await (const value of lines) {
+        if (signal?.aborted) {
+          finished = false
+          break
+        }
         const text = String(value)
         const parsed = parseLine(text)
         const persist = shouldPersistLine(kind, parsed.value)
@@ -202,7 +213,7 @@ export async function discoverJsonl(
   }
 }
 
-export async function discoverJsonlSessions(root: string, sourceID: string, kind: string, checkpointOrRevision: JsonlSessionCheckpoint | number = 0) {
+export async function discoverJsonlSessions(root: string, sourceID: string, kind: string, checkpointOrRevision: JsonlSessionCheckpoint | number = 0, signal?: AbortSignal) {
   const prior = typeof checkpointOrRevision === "number" ? undefined : checkpointOrRevision
   const paths = prior?.files && Object.keys(prior.files).length ? await listJsonlPaths(root) : await listJsonlFiles(root)
   const files = paths.map((file) => {
@@ -218,7 +229,12 @@ export async function discoverJsonlSessions(root: string, sourceID: string, kind
     delete checkpoint.files[relativePath]
   }
   const records: NormalizedRecord[] = []
+  let complete = true
   for (const file of files) {
+    if (signal?.aborted) {
+      complete = false
+      break
+    }
     const saved = checkpoint.files[file.relativePath]
     if (saved && saved.size === file.size && saved.mtimeMs === file.mtimeMs) continue
     const header = await readSessionHeader(file.filename)
@@ -228,7 +244,7 @@ export async function discoverJsonlSessions(root: string, sourceID: string, kind
     checkpoint.files[file.relativePath] = { size: metadata.size, mtimeMs: metadata.mtimeMs, sessionID }
     reconcilePrefixes.push({ prefix: naturalPrefix(file.relativePath), lineCount: 1, recordKinds: ["session"] })
   }
-  return { records, sessionRecords: records, checkpoint, complete: true, hasMore: false, reconcilePrefixes, sourceUpdatedAt: files.reduce((latest, file) => Math.max(latest, file.mtimeMs), 0) }
+  return { records, sessionRecords: records, checkpoint, complete, hasMore: !complete, reconcilePrefixes, sourceUpdatedAt: files.reduce((latest, file) => Math.max(latest, file.mtimeMs), 0) }
 }
 
 async function listJsonlFiles(root: string): Promise<JsonlFile[]> {

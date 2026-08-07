@@ -256,15 +256,17 @@ async function syncRun(once: boolean, singlePass = false) {
   }
   await writeFile(path.join(lock, "pid"), `${process.pid}\n`, { mode: 0o600 })
   let stopping = false
-  const stop = () => { stopping = true }
+  const controller = new AbortController()
+  const stop = () => { stopping = true; controller.abort() }
   process.once("SIGTERM", stop)
   process.once("SIGINT", stop)
   try {
     do {
       try {
-        const progress = await syncPass(config)
-        if (singlePass || (once && (!databaseURL || (!progress.progress && progress.pending === 0)))) return 0
+        const progress = await syncPass(config, controller.signal)
+        if (stopping || singlePass || (once && (!databaseURL || (!progress.progress && progress.pending === 0)))) return 0
       } catch (error) {
+        if (stopping) return 0
         console.error(`warning: sync pass failed: ${error instanceof Error ? error.message : String(error)}`)
         if (once || singlePass) return 1
       }
@@ -278,13 +280,14 @@ async function syncRun(once: boolean, singlePass = false) {
   }
 }
 
-async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>) {
+async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>, signal?: AbortSignal) {
   const state = await openSyncState(paths.state)
   let progressed = false
   try {
     state.purgePayloads(config.sync.retention_days * 24 * 60 * 60 * 1000)
     const installation = state.ensureDefaultInstallation()
     for (const source of config.sources) {
+      if (signal?.aborted) break
       if (source.kind !== "opencode-v1-sqlite" && source.kind !== "opencode-v1-sessions" && source.kind !== "codex-jsonl" && source.kind !== "codex-jsonl-sessions" && source.kind !== "pi-jsonl") throw new Error(`unsupported source adapter: ${source.kind}`)
       const filename = path.resolve(source.database.replace(/^~(?=\/|$)/, process.env.HOME ?? "."))
       const sourceID = createHash("sha256").update(`${source.kind}\n${filename}`).digest("hex").slice(0, 32)
@@ -296,13 +299,14 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>) {
       const checkpoint = state.checkpoint(sourceID)
       const result = backpressure
         ? emptyDiscovery(source.kind, checkpoint)
-        : await discoverSource(source.kind, filename, sourceID, checkpoint, config.sync.include_parts, config.sync.include_tool_output, config.sync.batch_size * 5)
+        : await discoverSource(source.kind, filename, sourceID, checkpoint, config.sync.include_parts, config.sync.include_tool_output, config.sync.batch_size * 5, signal)
       const snapshot = source.kind === "opencode-v1-sqlite" || source.kind === "opencode-v1-sessions"
         ? { complete: result.complete, recordKinds: ["session", "message", "part", "todo"] }
         : { prefixes: result.reconcilePrefixes }
       state.enqueue(result.records, sourceID, "messages", result.checkpoint, "postgres", snapshot, config.sync.max_outbox_bytes)
       progressed = progressed || result.records.length > 0 || result.reconcilePrefixes.length > 0
       console.log(`staged ${result.records.length} records from ${filename}${result.complete ? " (reconciled)" : result.hasMore ? " (more pending)" : " (unchanged)"}`)
+      if (signal?.aborted) break
       const databaseURL = databaseURLFor(config)
       if (databaseURL) {
         assertPostgresTLS(databaseURL, config.sync.allow_insecure_remote)
@@ -339,14 +343,14 @@ function emptyDiscovery(kind: string, checkpoint: Record<string, unknown> | unde
   return { records: [], sessionRecords: [], checkpoint: checkpoint as JsonlCheckpoint ?? { version: 1, files: {} }, complete: false, hasMore: true, reconcilePrefixes: [], sourceUpdatedAt: 0 }
 }
 
-async function discoverSource(kind: string, filename: string, sourceID: string, checkpoint: Record<string, unknown> | undefined, includeParts: boolean, includeToolOutput: boolean, maxRecords: number) {
+async function discoverSource(kind: string, filename: string, sourceID: string, checkpoint: Record<string, unknown> | undefined, includeParts: boolean, includeToolOutput: boolean, maxRecords: number, signal?: AbortSignal) {
   if (kind === "opencode-v1-sqlite") {
     const result = discoverOpenCodeV1(filename, sourceID, checkpoint as OpenCodeV1Checkpoint | undefined, includeParts, includeToolOutput)
     return { ...result, sessionRecords: [], hasMore: false, reconcilePrefixes: [] as never[], sourceUpdatedAt: result.checkpoint.sourceUpdatedAt }
   }
   if (kind === "opencode-v1-sessions") return discoverOpenCodeV1Sessions(filename, sourceID)
-  if (kind === "codex-jsonl" || kind === "pi-jsonl") return discoverJsonl(filename, sourceID, kind, checkpoint as JsonlCheckpoint | undefined, includeToolOutput, maxRecords)
-  if (kind === "codex-jsonl-sessions") return discoverJsonlSessions(filename, sourceID, kind, checkpoint as JsonlSessionCheckpoint | undefined)
+  if (kind === "codex-jsonl" || kind === "pi-jsonl") return discoverJsonl(filename, sourceID, kind, checkpoint as JsonlCheckpoint | undefined, includeToolOutput, maxRecords, signal)
+  if (kind === "codex-jsonl-sessions") return discoverJsonlSessions(filename, sourceID, kind, checkpoint as JsonlSessionCheckpoint | undefined, signal)
   throw new Error(`unsupported source adapter: ${kind}`)
 }
 

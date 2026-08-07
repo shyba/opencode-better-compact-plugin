@@ -51,4 +51,16 @@ describe("streaming JSONL adapters", () => {
     expect(deleted.records).toHaveLength(0)
     expect(deleted.reconcilePrefixes).toEqual([{ prefix: "session.jsonl|", lineCount: 0, recordKinds: ["session", "message"] }])
   })
+
+  test("stops a discovery pass at a cooperative cancellation boundary", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "better-compact-jsonl-"))
+    temporary.push(root)
+    await writeFile(path.join(root, "session.jsonl"), `${JSON.stringify({ type: "session", id: "cancelled" })}\n`)
+    const controller = new AbortController()
+    controller.abort()
+    const result = await discoverJsonl(root, "source", "codex-jsonl", 0, false, 10, controller.signal)
+    expect(result.records).toHaveLength(0)
+    expect(result.complete).toBe(false)
+    expect(result.hasMore).toBe(true)
+  })
 })
