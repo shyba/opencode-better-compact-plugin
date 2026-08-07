@@ -200,10 +200,10 @@ The package ships two pi extension entry points alongside the OpenCode V1 plugin
 Install the repository as a Pi package to load both extensions automatically:
 
 ```sh
-pi install git:github.com/shyba/opencode-better-compact-plugin@default
+pi install git:github.com/shyba/opencode-better-compact-plugin
 ```
 
-The package manifest points Pi at the TypeScript sources, so this works from a Git checkout without a checked-in `dist/` directory. For a one-off or source checkout, load either entry point explicitly with `pi -e /abs/path/to/src/pi.ts` or `pi -e /abs/path/to/src/cat.ts`. Built `dist/pi.js` and `dist/cat.js` entry points are also available after `bun run build`.
+The unpinned Git package follows the repository's default branch and can be refreshed with `pi update --extensions`. The package manifest points Pi at the TypeScript sources, so this works from a Git checkout without a checked-in `dist/` directory. For a one-off or source checkout, load either entry point explicitly with `pi -e /abs/path/to/src/pi.ts` or `pi -e /abs/path/to/src/cat.ts`. Built `dist/pi.js` and `dist/cat.js` entry points are also available after `bun run build`.
 
 ### `opencode-safe-compaction/pi` — recovery-ledger compaction
 
