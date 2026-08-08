@@ -367,7 +367,7 @@ async function discoverSource(kind: string, filename: string, sourceID: string, 
     const result = discoverOpenCodeV1(filename, sourceID, checkpoint as OpenCodeV1Checkpoint | undefined, includeParts, includeToolOutput)
     return { ...result, sessionRecords: [], hasMore: false, reconcilePrefixes: [] as never[], sourceUpdatedAt: result.checkpoint.sourceUpdatedAt }
   }
-  if (kind === "opencode-v1-sessions") return discoverOpenCodeV1Sessions(filename, sourceID)
+  if (kind === "opencode-v1-sessions") return discoverOpenCodeV1Sessions(filename, sourceID, checkpoint as OpenCodeV1Checkpoint | undefined)
   if (kind === "codex-jsonl" || kind === "pi-jsonl") return discoverJsonl(filename, sourceID, kind, checkpoint as JsonlCheckpoint | undefined, includeToolOutput, maxRecords, signal)
   if (kind === "codex-jsonl-sessions") return discoverJsonlSessions(filename, sourceID, kind, checkpoint as JsonlSessionCheckpoint | undefined, signal)
   throw new Error(`unsupported source adapter: ${kind}`)

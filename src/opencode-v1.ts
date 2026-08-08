@@ -150,7 +150,7 @@ export function discoverOpenCodeV1(filename: string, sourceID: string, checkpoin
   }
 }
 
-export function discoverOpenCodeV1Sessions(filename: string, sourceID: string): { records: NormalizedRecord[]; checkpoint: OpenCodeV1Checkpoint; complete: true; hasMore: false; reconcilePrefixes: never[]; sourceUpdatedAt: number } {
+export function discoverOpenCodeV1Sessions(filename: string, sourceID: string, prior?: OpenCodeV1Checkpoint): { records: NormalizedRecord[]; checkpoint: OpenCodeV1Checkpoint; complete: true; hasMore: false; reconcilePrefixes: never[]; sourceUpdatedAt: number } {
   const inspection = inspectOpenCodeV1(filename)
   const db = new Database(filename, { readonly: true })
   try {
@@ -163,7 +163,9 @@ export function discoverOpenCodeV1Sessions(filename: string, sourceID: string): 
     })
     const last = sessions.at(-1)
     const sourceUpdatedAt = sessions.reduce((latest, session) => Math.max(latest, Number(session.time_updated ?? session.time_created ?? 0)), 0)
-    return { records, checkpoint: { sourceUpdatedAt, sessionCreatedAt: Number(last?.time_created ?? 0), sessionID: String(last?.id ?? ""), reconcileBefore: Date.now() + 15 * 60_000 }, complete: true, hasMore: false, reconcilePrefixes: [], sourceUpdatedAt }
+    const now = Date.now()
+    if (prior && now < prior.reconcileBefore && sourceUpdatedAt <= prior.sourceUpdatedAt) return { records: [], checkpoint: { ...prior, sourceUpdatedAt }, complete: true, hasMore: false, reconcilePrefixes: [], sourceUpdatedAt }
+    return { records, checkpoint: { sourceUpdatedAt, sessionCreatedAt: Number(last?.time_created ?? 0), sessionID: String(last?.id ?? ""), reconcileBefore: now + 15 * 60_000 }, complete: true, hasMore: false, reconcilePrefixes: [], sourceUpdatedAt }
   } finally {
     db.close()
   }

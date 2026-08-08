@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { Database } from "bun:sqlite"
-import { discoverOpenCodeV1, inspectOpenCodeV1 } from "../src/opencode-v1.js"
+import { discoverOpenCodeV1, discoverOpenCodeV1Sessions, inspectOpenCodeV1 } from "../src/opencode-v1.js"
 
 test("OpenCode V1 adapter validates the migration journal and emits bounded normalized records", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "better-compact-opencode-"))
@@ -32,6 +32,9 @@ test("OpenCode V1 adapter validates the migration journal and emits bounded norm
     expect(result.records.every((record) => !record.payloadJSON?.includes("still-hidden"))).toBe(true)
     expect(result.records.every((record) => !record.payloadJSON?.includes("c2VjcmV0"))).toBe(true)
     expect(result.checkpoint.sessionID).toBe("ses-1")
+    const sessionIndex = discoverOpenCodeV1Sessions(filename, "source-1")
+    const unchangedSessionIndex = discoverOpenCodeV1Sessions(filename, "source-1", sessionIndex.checkpoint)
+    expect(unchangedSessionIndex.records).toHaveLength(0)
     const unchanged = discoverOpenCodeV1(filename, "source-1", result.checkpoint)
     expect(unchanged.records).toHaveLength(0)
     expect(unchanged.complete).toBe(false)
