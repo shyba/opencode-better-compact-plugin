@@ -1,7 +1,13 @@
 import { mkdir, chmod } from "node:fs/promises"
 import path from "node:path"
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { Database } from "bun:sqlite"
+
+export const CONTROL_RECORD_KINDS = {
+  reconcilePrefix: "__better_compact_reconcile_prefix",
+  snapshotBegin: "__better_compact_snapshot_begin",
+  snapshotEnd: "__better_compact_snapshot_end",
+} as const
 
 export type NormalizedRecord = {
   sourceID: string
@@ -32,7 +38,7 @@ export class SyncState {
     this.db.exec(`
       create table if not exists schema_migration (version integer primary key, applied_at integer not null);
       create table if not exists installation (id text primary key, incarnation text not null, created_at integer not null, adopted_at integer);
-      create table if not exists source (id text primary key, installation_id text not null references installation(id) on delete cascade, kind text not null, schema_version integer not null, canonical_locator text not null, fingerprint text, incarnation text not null, remote_revision_high_water integer, created_at integer not null, last_seen_at integer not null);
+      create table if not exists source (id text primary key, installation_id text not null references installation(id) on delete cascade, kind text not null, schema_version integer not null, canonical_locator text not null, fingerprint text, incarnation text not null, remote_revision_high_water integer, local_revision integer not null default 0, records_staged integer not null default 0, records_sent integer not null default 0, bytes_sent integer not null default 0, last_staged_at integer, last_sent_at integer, created_at integer not null, last_seen_at integer not null);
       create table if not exists source_cursor (source_id text not null references source(id) on delete cascade, stream text not null, checkpoint_json text not null, reconcile_before integer, updated_at integer not null, primary key (source_id, stream));
       create table if not exists normalized_record (source_id text not null references source(id) on delete cascade, record_kind text not null, natural_key text not null, source_version text, routing_json text, payload_json text, payload_sha256 text not null, record_revision integer not null, deleted_at integer, observed_at integer not null, primary key (source_id, record_kind, natural_key));
       create table if not exists destination (id text primary key, kind text not null, config_ref text not null, created_at integer not null);
@@ -47,14 +53,21 @@ export class SyncState {
 
   private applyLocalMigrations() {
     const migrations = [
-      [2, "normalized_record", "routing_json"],
-      [3, "outbox", "routing_json"],
+      [2, "normalized_record", "routing_json", "text"],
+      [3, "outbox", "routing_json", "text"],
+      [4, "source", "local_revision", "integer not null default 0"],
+      [5, "source", "records_staged", "integer not null default 0"],
+      [6, "source", "records_sent", "integer not null default 0"],
+      [7, "source", "bytes_sent", "integer not null default 0"],
+      [8, "source", "last_staged_at", "integer"],
+      [9, "source", "last_sent_at", "integer"],
     ] as const
-    for (const [version, table, column] of migrations) {
+    for (const [version, table, column, definition] of migrations) {
       const exists = (this.db.query(`pragma table_info(${table})`).all() as Array<{ name: string }>).some((row) => row.name === column)
-      if (!exists) this.db.exec(`alter table ${table} add column ${column} text`)
+      if (!exists) this.db.exec(`alter table ${table} add column ${column} ${definition}`)
       this.db.query("insert or ignore into schema_migration(version, applied_at) values (?, ?)").run(version, Date.now())
     }
+    this.db.exec("update source set local_revision=max(local_revision, coalesce((select max(record_revision) from normalized_record where normalized_record.source_id=source.id), 0))")
   }
 
   close() { this.db.close() }
@@ -96,8 +109,8 @@ export class SyncState {
   }
 
   nextRevision(sourceID: string) {
-    const row = this.db.query("select coalesce(max(record_revision), 0) as value from normalized_record where source_id=?").get(sourceID) as { value: number }
-    return Number(row.value)
+    const row = this.db.query("select coalesce(local_revision, 0) as value from source where id=?").get(sourceID) as { value: number } | null
+    return Number(row?.value ?? 0)
   }
 
   remoteRevision(sourceID: string) {
@@ -113,6 +126,7 @@ export class SyncState {
     if (this.nextRevision(sourceID) < revision) return false
     this.setRemoteRevision(sourceID, revision)
     this.db.query("delete from outbox where source_id=? and destination_id=? and record_revision<=?").run(sourceID, destinationID, revision)
+    this.releaseAcknowledgedRecords()
     return true
   }
 
@@ -125,40 +139,33 @@ export class SyncState {
   enqueue(records: NormalizedRecord[], sourceID: string, stream: string, checkpoint: unknown, destinationID = "postgres", snapshot?: { complete?: boolean; recordKinds?: string[]; prefixes?: Array<{ prefix: string; lineCount: number; recordKinds: string[] }> }, maxOutboxBytes = Number.POSITIVE_INFINITY) {
     const transaction = this.db.transaction(() => {
       let nextRevision = this.nextRevision(sourceID)
-      for (const record of records) {
-        const previous = this.db.query("select payload_sha256, source_version, deleted_at from normalized_record where source_id=? and record_kind=? and natural_key=?").get(record.sourceID, record.recordKind, record.naturalKey) as { payload_sha256: string; source_version?: string; deleted_at?: number } | null
-        if (previous && previous.payload_sha256 === record.payloadSHA256 && previous.source_version === (record.sourceVersion ?? null) && Boolean(previous.deleted_at) === (record.deletedAt !== undefined)) continue
+      let stagedRecords = 0
+      const snapshotToken = snapshot?.complete && snapshot.recordKinds?.length ? randomUUID() : undefined
+      const snapshotRecordKinds = snapshot?.recordKinds
+      const forceRecords = Boolean(snapshotToken || snapshot?.prefixes?.length)
+      const enqueueRecord = (record: NormalizedRecord, normalized = true) => {
+        const routingJSON = snapshotToken && snapshot?.recordKinds?.includes(record.recordKind)
+          ? JSON.stringify({ ...parseObject(record.routingJSON), __better_compact_snapshot: snapshotToken })
+          : record.routingJSON
         nextRevision++
-        this.db.query(`insert into normalized_record(source_id, record_kind, natural_key, source_version, routing_json, payload_json, payload_sha256, record_revision, deleted_at, observed_at)
+        if (normalized) this.db.query(`insert into normalized_record(source_id, record_kind, natural_key, source_version, routing_json, payload_json, payload_sha256, record_revision, deleted_at, observed_at)
           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          on conflict(source_id, record_kind, natural_key) do update set source_version=excluded.source_version, routing_json=excluded.routing_json, payload_json=excluded.payload_json, payload_sha256=excluded.payload_sha256, record_revision=excluded.record_revision, deleted_at=excluded.deleted_at, observed_at=excluded.observed_at`).run(record.sourceID, record.recordKind, record.naturalKey, record.sourceVersion ?? null, record.routingJSON ?? null, record.payloadJSON ?? null, record.payloadSHA256, nextRevision, record.deletedAt ?? null, record.observedAt)
+          on conflict(source_id, record_kind, natural_key) do update set source_version=excluded.source_version, routing_json=excluded.routing_json, payload_json=excluded.payload_json, payload_sha256=excluded.payload_sha256, record_revision=excluded.record_revision, deleted_at=excluded.deleted_at, observed_at=excluded.observed_at`).run(record.sourceID, record.recordKind, record.naturalKey, record.sourceVersion ?? null, routingJSON ?? null, record.payloadJSON ?? null, record.payloadSHA256, nextRevision, record.deletedAt ?? null, record.observedAt)
         this.db.query(`insert into outbox(destination_id, source_id, record_kind, natural_key, routing_json, payload_json, payload_sha256, record_revision, operation, state, next_attempt_at, created_at)
           values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-          on conflict(destination_id, source_id, record_kind, natural_key, record_revision) do nothing`).run(destinationID, record.sourceID, record.recordKind, record.naturalKey, record.routingJSON ?? null, record.payloadJSON ?? null, record.payloadSHA256, nextRevision, record.deletedAt === undefined ? "upsert" : "delete", Date.now(), Date.now())
+          on conflict(destination_id, source_id, record_kind, natural_key, record_revision) do nothing`).run(destinationID, record.sourceID, record.recordKind, record.naturalKey, routingJSON ?? null, record.payloadJSON ?? null, record.payloadSHA256, nextRevision, record.deletedAt === undefined ? "upsert" : "delete", Date.now(), Date.now())
+        stagedRecords++
       }
-      if (snapshot?.complete && snapshot.recordKinds?.length) {
-        const seen = new Set(records.filter((record) => snapshot.recordKinds?.includes(record.recordKind)).map((record) => `${record.recordKind}\u0000${record.naturalKey}`))
-        const placeholders = snapshot.recordKinds.map(() => "?").join(",")
-        const existing = this.db.query(`select record_kind, natural_key, routing_json from normalized_record where source_id=? and record_kind in (${placeholders}) and deleted_at is null`).all(sourceID, ...snapshot.recordKinds) as Array<{ record_kind: string; natural_key: string; routing_json?: string }>
-        for (const row of existing) {
-          if (seen.has(`${row.record_kind}\u0000${row.natural_key}`)) continue
-          nextRevision = this.enqueueTombstone(nextRevision, destinationID, sourceID, row)
-        }
+      for (const prefix of snapshot?.prefixes ?? []) enqueueRecord(controlRecord(sourceID, CONTROL_RECORD_KINDS.reconcilePrefix, prefix.prefix, { lineCount: prefix.lineCount, recordKinds: prefix.recordKinds }), false)
+      if (snapshotToken) enqueueRecord(controlRecord(sourceID, CONTROL_RECORD_KINDS.snapshotBegin, snapshotToken, { token: snapshotToken, recordKinds: snapshotRecordKinds }), false)
+      for (const record of records) {
+        const previous = this.db.query("select payload_sha256, source_version, deleted_at from normalized_record where source_id=? and record_kind=? and natural_key=?").get(record.sourceID, record.recordKind, record.naturalKey) as { payload_sha256: string; source_version?: string; deleted_at?: number } | null
+        if (!forceRecords && previous && previous.payload_sha256 === record.payloadSHA256 && previous.source_version === (record.sourceVersion ?? null) && Boolean(previous.deleted_at) === (record.deletedAt !== undefined)) continue
+        enqueueRecord(record)
       }
-      for (const prefix of snapshot?.prefixes ?? []) {
-        const pattern = `${escapeLike(prefix.prefix)}%`
-        const placeholders = prefix.recordKinds.map(() => "?").join(",")
-        const existing = this.db.query(`select record_kind, natural_key, routing_json from normalized_record where source_id=? and record_kind in (${placeholders}) and natural_key like ? escape '\\' and deleted_at is null`).all(sourceID, ...prefix.recordKinds, pattern) as Array<{ record_kind: string; natural_key: string; routing_json?: string }>
-        for (const row of existing) {
-          if (prefix.lineCount > 0 && row.record_kind === "session" && row.natural_key === `${prefix.prefix}session`) continue
-          if (prefix.lineCount > 0 && row.record_kind === "message") {
-            const match = row.natural_key.match(/\|line:(\d+)$/)
-            if (match && Number(match[1]) < prefix.lineCount) continue
-          }
-          nextRevision = this.enqueueTombstone(nextRevision, destinationID, sourceID, row)
-        }
-      }
+      if (snapshotToken) enqueueRecord(controlRecord(sourceID, CONTROL_RECORD_KINDS.snapshotEnd, snapshotToken, { token: snapshotToken, recordKinds: snapshotRecordKinds }), false)
       if (this.outboxBytes(destinationID) > maxOutboxBytes) throw new Error(`better-compact outbox exceeds configured limit of ${maxOutboxBytes} bytes`)
+      this.db.query("update source set local_revision=?, records_staged=records_staged+?, last_staged_at=? where id=?").run(nextRevision, stagedRecords, Date.now(), sourceID)
       this.db.query("insert into source_cursor(source_id, stream, checkpoint_json, updated_at) values (?, ?, ?, ?) on conflict(source_id, stream) do update set checkpoint_json=excluded.checkpoint_json, updated_at=excluded.updated_at").run(sourceID, stream, JSON.stringify(checkpoint), Date.now())
     })
     transaction()
@@ -193,10 +200,38 @@ export class SyncState {
     return claimed.map((row) => ({ ...row, id: Number(row.id), sourceID: String(row.source_id), recordKind: String(row.record_kind), naturalKey: String(row.natural_key), routingJSON: typeof row.routing_json === "string" ? row.routing_json : undefined, payloadJSON: typeof row.payload_json === "string" ? row.payload_json : undefined, payloadSHA256: String(row.payload_sha256), recordRevision: Number(row.record_revision), attempts: Number(row.attempts) + 1, destinationID: String(row.destination_id), operation: row.operation as "upsert" | "delete" })) as OutboxRow[]
   }
 
-  acknowledge(ids: number[]) { if (ids.length) this.db.query(`delete from outbox where id in (${ids.map(() => "?").join(",")})`).run(...ids) }
-  adoptThrough(sourceID: string, revision: number, destinationID = "postgres") { this.db.query("delete from outbox where source_id=? and destination_id=? and record_revision<=?").run(sourceID, destinationID, revision) }
+  acknowledge(ids: number[]) {
+    if (!ids.length) return
+    const transaction = this.db.transaction(() => {
+      const placeholders = ids.map(() => "?").join(",")
+      const rows = this.db.query(`select source_id, record_kind, natural_key, length(coalesce(payload_json,'') || coalesce(routing_json,'')) as bytes from outbox where id in (${placeholders})`).all(...ids) as Array<{ source_id: string; record_kind: string; natural_key: string; bytes: number }>
+      this.db.query(`delete from outbox where id in (${placeholders})`).run(...ids)
+      this.releaseAcknowledgedRecords()
+      const sent = new Map<string, { records: number; bytes: number }>()
+      for (const row of rows) {
+        const current = sent.get(row.source_id) ?? { records: 0, bytes: 0 }
+        current.records++
+        current.bytes += Number(row.bytes ?? 0)
+        sent.set(row.source_id, current)
+      }
+      for (const [sourceID, value] of sent) this.db.query("update source set records_sent=records_sent+?, bytes_sent=bytes_sent+?, last_sent_at=? where id=?").run(value.records, value.bytes, Date.now(), sourceID)
+    })
+    transaction()
+  }
+  adoptThrough(sourceID: string, revision: number, destinationID = "postgres") {
+    this.db.query("delete from outbox where source_id=? and destination_id=? and record_revision<=?").run(sourceID, destinationID, revision)
+    this.releaseAcknowledgedRecords()
+  }
   fail(ids: number[], error: string, nextAttemptAt = Date.now() + 30_000) { if (ids.length) this.db.query(`update outbox set state='failed', lease_until=null, last_error=?, next_attempt_at=? where id in (${ids.map(() => "?").join(",")})`).run(error.slice(0, 1000), nextAttemptAt, ...ids) }
   pendingCount(destinationID = "postgres") { const row = this.db.query("select count(*) as value from outbox where destination_id=?").get(destinationID) as { value: number }; return Number(row.value) }
+  releaseAcknowledgedRecords(limit = 50_000) {
+    const result = this.db.query(`delete from normalized_record where rowid in (
+      select normalized_record.rowid from normalized_record
+      where not exists (select 1 from outbox where outbox.source_id=normalized_record.source_id and outbox.record_kind=normalized_record.record_kind and outbox.natural_key=normalized_record.natural_key)
+      limit ?
+    )`).run(limit) as { changes?: number }
+    return Number(result.changes ?? 0)
+  }
   purgePayloads(retentionMs: number, limit = 500) {
     this.db.query(`update normalized_record set payload_json=null where rowid in (
       select normalized_record.rowid from normalized_record
@@ -205,11 +240,25 @@ export class SyncState {
       limit ?
     )`).run(Date.now() - retentionMs, limit)
   }
-  outboxBytes(destinationID = "postgres") { const rows = this.db.query("select payload_json, routing_json from outbox where destination_id=?").all(destinationID) as Array<{ payload_json?: string; routing_json?: string }>; return rows.reduce((total, row) => total + new TextEncoder().encode(`${row.payload_json ?? ""}${row.routing_json ?? ""}`).byteLength, 0) }
+  outboxBytes(destinationID = "postgres") {
+    const row = this.db.query("select coalesce(sum(length(coalesce(payload_json,'') || coalesce(routing_json,''))), 0) as value from outbox where destination_id=?").get(destinationID) as { value: number }
+    return Number(row.value)
+  }
 }
 
-function escapeLike(value: string) {
-  return value.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_")
+function controlRecord(sourceID: string, recordKind: string, naturalKey: string, value: Record<string, unknown>): NormalizedRecord {
+  const payloadJSON = JSON.stringify(value)
+  return { sourceID, recordKind, naturalKey, payloadJSON, payloadSHA256: createHash("sha256").update(payloadJSON).digest("hex"), observedAt: Date.now() }
+}
+
+function parseObject(value?: string) {
+  if (!value) return {}
+  try {
+    const parsed = JSON.parse(value)
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {}
+  } catch {
+    return {}
+  }
 }
 
 export async function openSyncState(filename: string) {

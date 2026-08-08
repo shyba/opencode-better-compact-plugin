@@ -57,7 +57,8 @@ if (command === "sync") {
   if (action === "migrate") process.exit(await syncMigrate())
   if (action === "install") process.exit(await syncInstall())
   if (action === "uninstall") process.exit(await syncUninstall())
-  console.error("Usage: better-compact sync run [--once] | status | install | uninstall")
+  if (action === "compact") process.exit(await syncCompact(process.argv.includes("--yes")))
+  console.error("Usage: better-compact sync run [--once] | status | migrate | install | uninstall | compact --yes")
   process.exit(2)
 }
 console.error(`Unknown command: ${command}`)
@@ -76,6 +77,7 @@ Usage:
   better-compact sync status Show local outbox status
   better-compact sync migrate Apply the remote schema using explicit admin credentials
   better-compact sync install|uninstall Manage a systemd user service
+  better-compact sync compact --yes  Remove acknowledged local cache rows and compact SQLite
   better-compact installation reset|adopt --yes  Explicitly recover or replace sync identity
   better-compact help     Show this help
 
@@ -285,6 +287,7 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>, signal?:
   const state = await openSyncState(paths.state)
   let progressed = false
   try {
+    state.releaseAcknowledgedRecords(100_000)
     state.purgePayloads(config.sync.retention_days * 24 * 60 * 60 * 1000)
     const installation = state.ensureDefaultInstallation()
     for (const source of config.sources) {
@@ -427,6 +430,8 @@ async function syncStatus() {
     const bytes = db.query("select coalesce(sum(length(coalesce(payload_json,'') || coalesce(routing_json,''))), 0) as value from outbox").get() as { value: number }
     console.log(`pending outbox: ${Number(pending.value)}`)
     console.log(`outbox bytes: ${Number(bytes.value)}`)
+    const cache = db.query("select count(*) as rows, coalesce(sum(length(coalesce(payload_json,'') || coalesce(routing_json,''))), 0) as bytes from normalized_record").get() as { rows: number; bytes: number }
+    console.log(`staged local cache: ${Number(cache.rows)} rows / ${Number(cache.bytes)} bytes`)
     const sources = db.query("select id, remote_revision_high_water, last_seen_at from source order by id").all() as Array<{ id: string; remote_revision_high_water?: number; last_seen_at: number }>
     for (const source of sources) console.log(`source ${source.id}: remote_revision=${Number(source.remote_revision_high_water ?? 0)} last_seen=${source.last_seen_at}`)
     return 0
@@ -438,6 +443,33 @@ async function syncStatus() {
     }
     throw error
   } finally { db.close() }
+}
+
+async function syncCompact(confirmed: boolean) {
+  if (!confirmed) {
+    console.error(`This removes acknowledged local cache rows and compacts ${paths.state}. Unsent outbox rows are preserved. Re-run with --yes.`)
+    return 2
+  }
+  const lock = `${paths.state}.lock`
+  const lockPID = await readFile(path.join(lock, "pid"), "utf8").catch(() => "")
+  if (/^\d+$/.test(lockPID.trim())) {
+    try { process.kill(Number(lockPID.trim()), 0); console.error("sync is running; stop it before compacting state"); return 2 } catch {}
+  }
+  const state = await openSyncState(paths.state)
+  let removed = 0
+  try {
+    let batch = state.releaseAcknowledgedRecords(100_000)
+    while (batch) {
+      removed += batch
+      batch = state.releaseAcknowledgedRecords(100_000)
+    }
+  } finally { state.close() }
+  const db = new Database(paths.state)
+  try {
+    db.exec("pragma journal_mode=delete; pragma wal_checkpoint(truncate); vacuum")
+  } finally { db.close() }
+  console.log(`removed ${removed} acknowledged cache rows and compacted ${paths.state}`)
+  return 0
 }
 
 async function syncMigrate() {

@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { configPaths, validateConfig } from "../src/config.js"
-import { openSyncState } from "../src/sync-state.js"
+import { CONTROL_RECORD_KINDS, openSyncState } from "../src/sync-state.js"
 
 const temporary: string[] = []
 afterEach(async () => {
@@ -77,7 +77,8 @@ describe("portable better-compact state", () => {
     state.enqueue([record], "source-1", "messages", { cursor: "1" })
     state.enqueue([], "source-1", "messages", { cursor: "2" }, "postgres", { complete: true, recordKinds: ["message"] })
     const rows = state.claim("postgres", 10, 3)
-    expect(rows.some((row) => row.operation === "delete" && row.naturalKey === "m1")).toBe(true)
+    expect(rows.some((row) => row.recordKind === CONTROL_RECORD_KINDS.snapshotBegin)).toBe(true)
+    expect(rows.some((row) => row.recordKind === CONTROL_RECORD_KINDS.snapshotEnd)).toBe(true)
     state.close()
   })
 
@@ -91,8 +92,7 @@ describe("portable better-compact state", () => {
     state.enqueue(records, "source-1", "messages", { cursor: 3 })
     state.enqueue([], "source-1", "messages", { cursor: 2 }, "postgres", { prefixes: [{ prefix: "session.jsonl|", lineCount: 2, recordKinds: ["session", "message"] }] })
     const rows = state.claim("postgres", 10, 3)
-    expect(rows.some((row) => row.operation === "delete" && row.naturalKey === "session.jsonl|line:2")).toBe(true)
-    expect(rows.some((row) => row.operation === "delete" && row.naturalKey === "session.jsonl|line:1")).toBe(false)
+    expect(rows.some((row) => row.recordKind === CONTROL_RECORD_KINDS.reconcilePrefix && row.naturalKey === "session.jsonl|")).toBe(true)
     state.close()
   })
 

@@ -1,4 +1,4 @@
-import type { OutboxRow } from "./sync-state.js"
+import { CONTROL_RECORD_KINDS, type OutboxRow } from "./sync-state.js"
 
 type SQLClient = {
   unsafe<T = unknown>(query: string, values?: unknown[]): Promise<T>
@@ -91,6 +91,22 @@ export async function uploadFenced(client: SQLClient, source: PostgresSource, ro
 }
 
 async function upsertRecords(client: SQLClient, source: PostgresSource, rows: OutboxRow[]) {
+  let records: OutboxRow[] = []
+  for (const row of rows) {
+    if (isControl(row)) {
+      if (records.length) {
+        await upsertDataRecords(client, source, records)
+        records = []
+      }
+      await applyControl(client, source, row)
+      continue
+    }
+    records.push(row)
+  }
+  if (records.length) await upsertDataRecords(client, source, records)
+}
+
+async function upsertDataRecords(client: SQLClient, source: PostgresSource, rows: OutboxRow[]) {
   const groups = new Map<string, OutboxRow[]>()
   for (const row of deduplicateRemoteKeys(rows)) {
     if (!["session", "message", "part", "todo"].includes(row.recordKind)) throw new Error(`unsupported remote record kind: ${row.recordKind}`)
@@ -103,7 +119,61 @@ async function upsertRecords(client: SQLClient, source: PostgresSource, rows: Ou
     if (table === "message") await upsertMessages(client, source, group)
     if (table === "part") await upsertParts(client, source, group)
     if (table === "todo") await upsertTodos(client, source, group)
+    await markSnapshotSeen(client, source, group)
   }
+}
+
+async function applyControl(client: SQLClient, source: PostgresSource, row: OutboxRow) {
+  const value = parseObject(row.payloadJSON)
+  if (row.recordKind === CONTROL_RECORD_KINDS.reconcilePrefix) return reconcilePrefix(client, source, row, value)
+  if (row.recordKind === CONTROL_RECORD_KINDS.snapshotBegin) {
+    await client.unsafe("delete from opencode.sync_snapshot_seen where installation_id=$1 and source_id=$2", [source.installationID, source.sourceID])
+    return
+  }
+  if (row.recordKind === CONTROL_RECORD_KINDS.snapshotEnd) return reconcileSnapshot(client, source, row, value)
+  throw new Error(`unsupported control record kind: ${row.recordKind}`)
+}
+
+async function reconcilePrefix(client: SQLClient, source: PostgresSource, row: OutboxRow, value: Record<string, unknown>) {
+  const prefix = row.naturalKey
+  const recordKinds = Array.isArray(value.recordKinds) ? value.recordKinds.filter((kind): kind is string => typeof kind === "string") : []
+  if (recordKinds.includes("session")) await tombstonePrefix(client, "session", "session_id", source, prefix, row.recordRevision)
+  if (recordKinds.includes("message")) await tombstonePrefix(client, "message", "message_id", source, prefix, row.recordRevision)
+}
+
+async function tombstonePrefix(client: SQLClient, table: string, keyColumn: string, source: PostgresSource, prefix: string, revision: number) {
+  await client.unsafe(`update opencode.${table} set deleted_at=now(), record_revision=$1, synced_at=now()
+    where installation_id=$2 and source_id=$3 and deleted_at is null and left(${keyColumn}, length($4))=$4`, [revision, source.installationID, source.sourceID, prefix])
+}
+
+async function markSnapshotSeen(client: SQLClient, source: PostgresSource, rows: OutboxRow[]) {
+  const seen = rows.flatMap((row) => {
+    const token = snapshotToken(row)
+    return token ? [{ token, recordKind: row.recordKind, naturalKey: remoteKey(row) }] : []
+  })
+  if (!seen.length) return
+  const args: unknown[] = []
+  const values = seen.map((row) => tuple(args, [source.installationID, source.sourceID, row.token, row.recordKind, row.naturalKey]))
+  await client.unsafe(`insert into opencode.sync_snapshot_seen(installation_id, source_id, snapshot_token, record_kind, natural_key)
+    values ${values.join(",")} on conflict do nothing`, args)
+}
+
+async function reconcileSnapshot(client: SQLClient, source: PostgresSource, row: OutboxRow, value: Record<string, unknown>) {
+  const token = typeof value.token === "string" ? value.token : row.naturalKey
+  const recordKinds = Array.isArray(value.recordKinds) ? value.recordKinds.filter((kind): kind is string => typeof kind === "string") : []
+  const tables = [
+    ["session", "session_id"],
+    ["message", "session_id || chr(0) || message_id"],
+    ["part", "session_id || chr(0) || message_id || chr(0) || part_id"],
+    ["todo", "session_id || chr(0) || position::text"],
+  ] as const
+  for (const [kind, keyExpression] of tables) {
+    if (!recordKinds.includes(kind)) continue
+    await client.unsafe(`update opencode.${kind} as target set deleted_at=now(), record_revision=$1, synced_at=now()
+      where target.installation_id=$2 and target.source_id=$3 and target.deleted_at is null
+        and not exists (select 1 from opencode.sync_snapshot_seen seen where seen.installation_id=$2 and seen.source_id=$3 and seen.snapshot_token=$4 and seen.record_kind=$5 and seen.natural_key=${keyExpression})`, [row.recordRevision, source.installationID, source.sourceID, token, kind])
+  }
+  await client.unsafe("delete from opencode.sync_snapshot_seen where installation_id=$1 and source_id=$2 and snapshot_token=$3", [source.installationID, source.sourceID, token])
 }
 
 function deduplicateRemoteKeys(rows: OutboxRow[]) {
@@ -172,9 +242,29 @@ async function upsertTodos(client: SQLClient, source: PostgresSource, rows: Outb
 }
 
 function mergePayload(row: OutboxRow) {
-  const payload = row.payloadJSON ? JSON.parse(row.payloadJSON) as Record<string, unknown> : {}
-  const routing = row.routingJSON ? JSON.parse(row.routingJSON) as Record<string, unknown> : {}
+  const payload = parseObject(row.payloadJSON)
+  const routing = parseObject(row.routingJSON)
+  delete routing.__better_compact_snapshot
   return sanitizeJSONValue({ ...routing, ...payload }) as Record<string, unknown>
+}
+
+function snapshotToken(row: OutboxRow) {
+  const routing = parseObject(row.routingJSON)
+  return typeof routing.__better_compact_snapshot === "string" ? routing.__better_compact_snapshot : undefined
+}
+
+function isControl(row: OutboxRow) {
+  return Object.values(CONTROL_RECORD_KINDS).includes(row.recordKind as typeof CONTROL_RECORD_KINDS[keyof typeof CONTROL_RECORD_KINDS])
+}
+
+function parseObject(value?: string) {
+  if (!value) return {}
+  try {
+    const parsed = JSON.parse(value)
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {}
+  } catch {
+    return {}
+  }
 }
 
 function sanitizeJSONValue(value: unknown): unknown {
