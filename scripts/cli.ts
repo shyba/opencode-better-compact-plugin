@@ -17,6 +17,9 @@ const installDir = path.resolve(process.env.OPENCODE_SAFE_COMPACTION_DIR ?? path
 const configDir = path.resolve(process.env.OPENCODE_SAFE_COMPACTION_CONFIG_DIR ?? process.env.OPENCODE_CONFIG_DIR ?? path.join(process.env.XDG_CONFIG_HOME ?? path.join(process.env.HOME ?? ".", ".config"), "opencode"))
 const databasePath = path.resolve(process.env.OPENCODE_DB ?? path.join(process.env.XDG_DATA_HOME ?? path.join(process.env.HOME ?? ".", ".local/share"), "opencode", "opencode.db"))
 const maxUploadBatchesPerSource = 8
+const idleCompactionMinBytes = 8 * 1024 * 1024
+const idleCompactionMinFreePages = 1024
+const idleCompactionMinFreeRatio = 0.2
 const configFlag = flagValue("--config")
 const stateFlag = flagValue("--state")
 if (configFlag) process.env.BETTER_COMPACT_CONFIG = path.resolve(configFlag)
@@ -286,10 +289,15 @@ async function syncRun(once: boolean, singlePass = false) {
 
 async function compactStateIfIdle() {
   const metadata = await stat(paths.state).catch(() => undefined)
-  if (!metadata || metadata.size < 64 * 1024 * 1024) return
+  if (!metadata || metadata.size < idleCompactionMinBytes) return
   try {
     const db = new Database(paths.state)
-    try { db.exec("pragma journal_mode=delete; pragma wal_checkpoint(truncate); vacuum") } finally { db.close() }
+    try {
+      const pageCount = Number((db.query("pragma page_count").get() as { page_count?: number } | null)?.page_count ?? 0)
+      const freePages = Number((db.query("pragma freelist_count").get() as { freelist_count?: number } | null)?.freelist_count ?? 0)
+      if (freePages < idleCompactionMinFreePages || freePages / Math.max(pageCount, 1) < idleCompactionMinFreeRatio) return
+      db.exec("pragma journal_mode=delete; pragma wal_checkpoint(truncate); vacuum")
+    } finally { db.close() }
     console.log(`compacted idle sync state (${metadata.size} bytes before vacuum)`)
   } catch (error) {
     console.error(`warning: idle state compaction failed: ${error instanceof Error ? error.message : String(error)}`)
