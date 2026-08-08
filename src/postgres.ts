@@ -162,16 +162,16 @@ async function reconcileSnapshot(client: SQLClient, source: PostgresSource, row:
   const token = typeof value.token === "string" ? value.token : row.naturalKey
   const recordKinds = Array.isArray(value.recordKinds) ? value.recordKinds.filter((kind): kind is string => typeof kind === "string") : []
   const tables = [
-    ["session", "json_build_array(session_id)::text"],
-    ["message", "json_build_array(session_id, message_id)::text"],
-    ["part", "json_build_array(session_id, message_id, part_id)::text"],
-    ["todo", "json_build_array(session_id, position)::text"],
+    ["session", "json_build_array(session_id)::jsonb"],
+    ["message", "json_build_array(session_id, message_id)::jsonb"],
+    ["part", "json_build_array(session_id, message_id, part_id)::jsonb"],
+    ["todo", "json_build_array(session_id, position)::jsonb"],
   ] as const
   for (const [kind, keyExpression] of tables) {
     if (!recordKinds.includes(kind)) continue
     await client.unsafe(`update opencode.${kind} as target set deleted_at=now(), record_revision=$1, synced_at=now()
       where target.installation_id=$2 and target.source_id=$3 and target.deleted_at is null
-        and not exists (select 1 from opencode.sync_snapshot_seen seen where seen.installation_id=$2 and seen.source_id=$3 and seen.snapshot_token=$4 and seen.record_kind=$5 and seen.natural_key=${keyExpression})`, [row.recordRevision, source.installationID, source.sourceID, token, kind])
+        and not exists (select 1 from opencode.sync_snapshot_seen seen where seen.installation_id=$2 and seen.source_id=$3 and seen.snapshot_token=$4 and seen.record_kind=$5 and seen.natural_key::jsonb=${keyExpression})`, [row.recordRevision, source.installationID, source.sourceID, token, kind])
   }
   await client.unsafe("delete from opencode.sync_snapshot_seen where installation_id=$1 and source_id=$2 and snapshot_token=$3", [source.installationID, source.sourceID, token])
 }
