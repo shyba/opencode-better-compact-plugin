@@ -267,6 +267,7 @@ async function syncRun(once: boolean, singlePass = false) {
     do {
       try {
         const progress = await syncPass(config, controller.signal)
+        if (progress.pending === 0) await compactStateIfIdle()
         if (stopping || singlePass || (once && (!databaseURL || (!progress.progress && progress.pending === 0)))) return 0
       } catch (error) {
         if (stopping) return 0
@@ -280,6 +281,18 @@ async function syncRun(once: boolean, singlePass = false) {
     process.off("SIGTERM", stop)
     process.off("SIGINT", stop)
     await rm(lock, { recursive: true, force: true })
+  }
+}
+
+async function compactStateIfIdle() {
+  const metadata = await stat(paths.state).catch(() => undefined)
+  if (!metadata || metadata.size < 64 * 1024 * 1024) return
+  try {
+    const db = new Database(paths.state)
+    try { db.exec("pragma journal_mode=delete; pragma wal_checkpoint(truncate); vacuum") } finally { db.close() }
+    console.log(`compacted idle sync state (${metadata.size} bytes before vacuum)`)
+  } catch (error) {
+    console.error(`warning: idle state compaction failed: ${error instanceof Error ? error.message : String(error)}`)
   }
 }
 
