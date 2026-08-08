@@ -56,6 +56,17 @@ describe("Postgres delivery fences", () => {
     expect(serialized.includes("\\u0000")).toBe(true)
   })
 
+  test("uses indexed JSONB keys for snapshot reconciliation", async () => {
+    const client = fakeClient()
+    await uploadFenced(client, source, [
+      { ...row(1), recordKind: "__better_compact_snapshot_begin", naturalKey: "token", payloadJSON: JSON.stringify({ token: "token", recordKinds: ["message"] }) },
+      { ...row(2), recordKind: "__better_compact_snapshot_end", naturalKey: "token", payloadJSON: JSON.stringify({ token: "token", recordKinds: ["message"] }) },
+    ])
+    const query = client.calls.find((value) => value.includes("update opencode.message as target"))
+    expect(query).toContain("seen.natural_key=json_build_array(session_id, message_id)::jsonb")
+    expect(query).not.toContain("seen.natural_key::jsonb")
+  })
+
   test("rejects a revision gap before applying the later record", async () => {
     await expect(uploadFenced(fakeClient(), source, [row(1), row(3)])).rejects.toThrow("non-contiguous")
   })

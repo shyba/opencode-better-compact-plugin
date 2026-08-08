@@ -115,7 +115,7 @@ create table if not exists opencode.sync_snapshot_seen (
   source_id text not null,
   snapshot_token text not null,
   record_kind text not null,
-  natural_key text not null,
+  natural_key jsonb not null,
   seen_at timestamptz not null default now(),
   primary key (installation_id, source_id, snapshot_token, record_kind, natural_key),
   foreign key (installation_id, source_id) references opencode.source(installation_id, source_id) on delete cascade
@@ -128,5 +128,20 @@ create index if not exists sync_snapshot_seen_source_idx on opencode.sync_snapsh
 
 alter table opencode.source add column if not exists lease_owner text;
 alter table opencode.source add column if not exists lease_until timestamptz;
+do $$
+begin
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema = 'opencode'
+      and table_name = 'sync_snapshot_seen'
+      and column_name = 'natural_key'
+      and data_type <> 'jsonb'
+  ) then
+    alter table opencode.sync_snapshot_seen
+      alter column natural_key type jsonb using natural_key::jsonb;
+  end if;
+end
+$$;
 insert into opencode.schema_migration(version) values (1) on conflict (version) do nothing;
 insert into opencode.schema_migration(version) values (2) on conflict (version) do nothing;
+insert into opencode.schema_migration(version) values (3) on conflict (version) do nothing;

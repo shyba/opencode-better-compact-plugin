@@ -171,7 +171,7 @@ async function reconcileSnapshot(client: SQLClient, source: PostgresSource, row:
     if (!recordKinds.includes(kind)) continue
     await client.unsafe(`update opencode.${kind} as target set deleted_at=now(), record_revision=$1, synced_at=now()
       where target.installation_id=$2 and target.source_id=$3 and target.deleted_at is null
-        and not exists (select 1 from opencode.sync_snapshot_seen seen where seen.installation_id=$2 and seen.source_id=$3 and seen.snapshot_token=$4 and seen.record_kind=$5 and seen.natural_key::jsonb=${keyExpression})`, [row.recordRevision, source.installationID, source.sourceID, token, kind])
+        and not exists (select 1 from opencode.sync_snapshot_seen seen where seen.installation_id=$2 and seen.source_id=$3 and seen.snapshot_token=$4 and seen.record_kind=$5 and seen.natural_key=${keyExpression})`, [row.recordRevision, source.installationID, source.sourceID, token, kind])
   }
   await client.unsafe("delete from opencode.sync_snapshot_seen where installation_id=$1 and source_id=$2 and snapshot_token=$3", [source.installationID, source.sourceID, token])
 }
