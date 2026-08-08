@@ -149,7 +149,7 @@ async function tombstonePrefix(client: SQLClient, table: string, keyColumn: stri
 async function markSnapshotSeen(client: SQLClient, source: PostgresSource, rows: OutboxRow[]) {
   const seen = rows.flatMap((row) => {
     const token = snapshotToken(row)
-    return token ? [{ token, recordKind: row.recordKind, naturalKey: remoteKey(row) }] : []
+    return token ? [{ token, recordKind: row.recordKind, naturalKey: snapshotSeenKey(row) }] : []
   })
   if (!seen.length) return
   const args: unknown[] = []
@@ -162,10 +162,10 @@ async function reconcileSnapshot(client: SQLClient, source: PostgresSource, row:
   const token = typeof value.token === "string" ? value.token : row.naturalKey
   const recordKinds = Array.isArray(value.recordKinds) ? value.recordKinds.filter((kind): kind is string => typeof kind === "string") : []
   const tables = [
-    ["session", "session_id"],
-    ["message", "session_id || chr(0) || message_id"],
-    ["part", "session_id || chr(0) || message_id || chr(0) || part_id"],
-    ["todo", "session_id || chr(0) || position::text"],
+    ["session", "json_build_array(session_id)::text"],
+    ["message", "json_build_array(session_id, message_id)::text"],
+    ["part", "json_build_array(session_id, message_id, part_id)::text"],
+    ["todo", "json_build_array(session_id, position)::text"],
   ] as const
   for (const [kind, keyExpression] of tables) {
     if (!recordKinds.includes(kind)) continue
@@ -251,6 +251,15 @@ function mergePayload(row: OutboxRow) {
 function snapshotToken(row: OutboxRow) {
   const routing = parseObject(row.routingJSON)
   return typeof routing.__better_compact_snapshot === "string" ? routing.__better_compact_snapshot : undefined
+}
+
+function snapshotSeenKey(row: OutboxRow) {
+  const payload = mergePayload(row)
+  if (row.recordKind === "session") return JSON.stringify([row.naturalKey])
+  if (row.recordKind === "message") return JSON.stringify([stringValue(payload.session_id) ?? "", row.naturalKey])
+  if (row.recordKind === "part") return JSON.stringify([stringValue(payload.session_id) ?? "", stringValue(payload.message_id) ?? "", row.naturalKey.split(":").at(-1) ?? ""])
+  if (row.recordKind === "todo") return JSON.stringify([stringValue(payload.session_id) ?? "", Number(payload.position ?? 0)])
+  return JSON.stringify([row.naturalKey])
 }
 
 function isControl(row: OutboxRow) {
