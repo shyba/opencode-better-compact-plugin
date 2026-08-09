@@ -1,10 +1,10 @@
 #!/usr/bin/env bun
-import { access, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
+import { access, chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
 import { readFileSync } from "node:fs"
 import { spawn } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
 import path from "node:path"
-import { configPaths, loadConfig } from "../src/config.js"
+import { configPaths, loadConfig, saveConfig } from "../src/config.js"
 import { Database } from "bun:sqlite"
 import { discoverOpenCodeV1, discoverOpenCodeV1Sessions, inspectOpenCodeV1 } from "../src/opencode-v1.js"
 import type { OpenCodeV1Checkpoint } from "../src/opencode-v1.js"
@@ -20,6 +20,13 @@ const maxUploadBatchesPerSource = 8
 const idleCompactionMinBytes = 8 * 1024 * 1024
 const idleCompactionMinFreePages = 1024
 const idleCompactionMinFreeRatio = 0.2
+const defaultSyncSources = [
+  { kind: "opencode-v1-sqlite", database: "~/.local/share/opencode/opencode.db" },
+  { kind: "opencode-v1-sessions", database: "~/.local/share/opencode/opencode.db" },
+  { kind: "codex-jsonl", database: "~/.codex/sessions" },
+  { kind: "codex-jsonl-sessions", database: "~/.codex/sessions" },
+  { kind: "pi-jsonl", database: "~/.pi/agent/sessions" },
+] as const
 const configFlag = flagValue("--config")
 const stateFlag = flagValue("--state")
 if (configFlag) process.env.BETTER_COMPACT_CONFIG = path.resolve(configFlag)
@@ -56,12 +63,13 @@ if (command === "installation") {
 if (command === "sync") {
   const action = process.argv[3]
   if (action === "run") process.exit(await syncRun(process.argv.includes("--once"), process.argv.includes("--pass")))
+  if (action === "setup") process.exit(await syncSetup())
   if (action === "status") process.exit(await syncStatus())
   if (action === "migrate") process.exit(await syncMigrate())
   if (action === "install") process.exit(await syncInstall())
   if (action === "uninstall") process.exit(await syncUninstall())
   if (action === "compact") process.exit(await syncCompact(process.argv.includes("--yes")))
-  console.error("Usage: better-compact sync run [--once] | status | migrate | install | uninstall | compact --yes")
+  console.error("Usage: better-compact sync setup [--url URL|--url-stdin] [--allow-insecure-remote] [--install] | run [--once] | status | migrate | install | uninstall | compact --yes")
   process.exit(2)
 }
 console.error(`Unknown command: ${command}`)
@@ -76,6 +84,7 @@ Usage:
   better-compact install pi  Register both extensions with Pi
   better-compact update   Update the managed checkout and verify configuration
   better-compact doctor   Check installation, OpenCode, configuration, and SQLite access
+  better-compact sync setup [--url URL|--url-stdin] [--allow-insecure-remote] [--install] Configure the Postgres destination
   better-compact sync run [--once|--pass] [--config FILE] [--state FILE] Discover sources and deliver redacted records
   better-compact sync status Show local outbox status
   better-compact sync migrate Apply the remote schema using explicit admin credentials
@@ -378,6 +387,65 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>, signal?:
   } finally { state.close() }
 }
 
+async function syncSetup() {
+  try {
+    const existing = await loadConfig(paths)
+    const databaseURL = await setupDatabaseURL(existing)
+    const allowInsecureRemote = existing.sync.allow_insecure_remote || process.argv.includes("--allow-insecure-remote")
+    assertPostgresURL(databaseURL, allowInsecureRemote)
+    const sources = existing.sources.length ? existing.sources : await availableDefaultSyncSources()
+    const environmentFile = await writeSyncEnvironment(databaseURL, allowInsecureRemote)
+    await saveConfig({
+      ...existing,
+      sync: { ...existing.sync, enabled: true, allow_insecure_remote: allowInsecureRemote },
+      sources,
+    }, paths)
+    console.log(`configured sync in ${paths.config}`)
+    console.log(`stored the writer URL in ${environmentFile} (mode 0600)`)
+    if (sources.length) console.log(`configured ${sources.length} session source${sources.length === 1 ? "" : "s"}`)
+    else console.error(`warning: no standard session source was found; add sources to ${paths.config} before running sync`)
+    if (process.argv.includes("--install")) return syncInstall(databaseURL)
+    console.log("next: run better-compact sync migrate once with admin credentials, then better-compact sync install")
+    return 0
+  } catch (error) {
+    console.error(`sync setup failed: ${error instanceof Error ? error.message : String(error)}`)
+    return 2
+  }
+}
+
+async function setupDatabaseURL(config: Awaited<ReturnType<typeof loadConfig>>) {
+  const environmentName = config.sync.database_url_env
+  const fromFlag = process.argv.includes("--url")
+  const fromStdin = process.argv.includes("--url-stdin")
+  if (fromFlag && fromStdin) throw new Error("choose either --url or --url-stdin, not both")
+  if (fromFlag) {
+    const value = flagValue("--url")
+    if (!value || value.startsWith("--")) throw new Error("--url requires a Postgres URL")
+    return value.trim()
+  }
+  if (fromStdin) {
+    const value = (await Bun.stdin.text()).trim()
+    if (!value) throw new Error("--url-stdin received an empty value")
+    return value
+  }
+  const value = process.env[environmentName]?.trim() || syncEnvironmentValue(environmentName)?.trim() || databaseURLFor(config)
+  if (!value) throw new Error(`no Postgres URL supplied; use --url, --url-stdin, or set ${environmentName}`)
+  return value
+}
+
+async function availableDefaultSyncSources() {
+  const openCodeDatabase = process.env.OPENCODE_DB ?? (process.env.XDG_DATA_HOME
+    ? path.join(process.env.XDG_DATA_HOME, "opencode", "opencode.db")
+    : "~/.local/share/opencode/opencode.db")
+  const candidates = await Promise.all(defaultSyncSources.map(async (source) => {
+    const database = source.kind.startsWith("opencode-") ? openCodeDatabase : source.database
+    const filename = path.resolve(database.replace(/^~(?=\/|$)/, process.env.HOME ?? "."))
+    if (!(await exists(filename))) return undefined
+    return { kind: source.kind, database }
+  }))
+  return candidates.flatMap((source) => source ? [source] : [])
+}
+
 function emptyDiscovery(kind: string, checkpoint: Record<string, unknown> | undefined): JsonlDiscoveryResult | { records: never[]; sessionRecords: never[]; checkpoint: OpenCodeV1Checkpoint; complete: false; hasMore: boolean; reconcilePrefixes: never[]; sourceUpdatedAt: number } {
   if (kind === "opencode-v1-sqlite" || kind === "opencode-v1-sessions") return { records: [], sessionRecords: [], checkpoint: checkpoint as OpenCodeV1Checkpoint ?? { sourceUpdatedAt: 0, sessionCreatedAt: 0, sessionID: "", reconcileBefore: Date.now() }, complete: false, hasMore: false, reconcilePrefixes: [], sourceUpdatedAt: 0 }
   return { records: [], sessionRecords: [], checkpoint: checkpoint as JsonlCheckpoint ?? { version: 1, files: {} }, complete: false, hasMore: true, reconcilePrefixes: [], sourceUpdatedAt: 0 }
@@ -397,6 +465,8 @@ async function discoverSource(kind: string, filename: string, sourceID: string, 
 function databaseURLFor(config: Awaited<ReturnType<typeof loadConfig>>) {
   const explicit = process.env[config.sync.database_url_env]
   if (explicit) return explicit
+  const stored = syncEnvironmentValue(config.sync.database_url_env)
+  if (stored) return stored
   const host = process.env.POSTGRES_HOST
   const port = process.env.POSTGRES_PORT ?? "5432"
   const database = process.env.POSTGRES_DB
@@ -431,10 +501,19 @@ function buildDatabaseURL(host: string, port: string, database: string, user: st
 
 function assertPostgresTLS(url: string, allowInsecureRemote = false) {
   const parsed = new URL(url)
+  if (parsed.protocol !== "postgres:" && parsed.protocol !== "postgresql:") throw new Error("sync database URL must use postgres:// or postgresql://")
   const local = parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1" || parsed.hostname === "::1"
   const sslmode = parsed.searchParams.get("sslmode")
   if (!local && sslmode !== "verify-full" && !allowInsecureRemote) throw new Error("refusing non-local Postgres without sslmode=verify-full; set sync.allow_insecure_remote only on a trusted network when the server has no TLS")
   if (!local && sslmode === "disable" && allowInsecureRemote) console.error("warning: Postgres credentials/session data use plaintext transport to a non-local host because sync.allow_insecure_remote=true")
+}
+
+function assertPostgresURL(url: string, allowInsecureRemote: boolean) {
+  if (!url || /[\r\n]/.test(url)) throw new Error("Postgres URL must be a single non-empty line")
+  let parsed: URL
+  try { parsed = new URL(url) } catch { throw new Error("invalid Postgres URL") }
+  if (!parsed.hostname || !parsed.pathname || parsed.pathname === "/") throw new Error("Postgres URL must include a host and database")
+  assertPostgresTLS(url, allowInsecureRemote)
 }
 
 async function syncStatus() {
@@ -568,7 +647,7 @@ async function installationAdopt(confirmed: boolean) {
   } finally { await client.close(); state.close() }
 }
 
-async function syncInstall() {
+async function syncInstall(databaseURL?: string) {
   const mode = await installationMode()
   if (mode !== "git" && mode !== "npm") {
     console.error("refusing to install a persistent service from an ephemeral package path; materialize the package first")
@@ -588,7 +667,7 @@ async function syncInstall() {
   }
   await mkdir(serviceDirectory, { recursive: true, mode: 0o700 })
   const command = executable ? `${quoteSystemd(executable)} sync run` : `${quoteSystemd(process.execPath)} ${quoteSystemd(process.argv[1] ?? "")} sync run`
-  const environmentFile = await writeSyncEnvironment()
+  const environmentFile = await writeSyncEnvironment(databaseURL)
   await writeFile(`${service}.tmp-${process.pid}`, `[Unit]\nDescription=Better Compact session sync\nAfter=default.target\n\n[Service]\nExecStart=${command}\n${environmentFile ? `EnvironmentFile=-${systemdEnvironmentFilePath(environmentFile)}\n` : ""}Restart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n`, { mode: 0o644 })
   await rename(`${service}.tmp-${process.pid}`, service)
   const reload = await run("systemctl", ["--user", "daemon-reload"], process.env)
@@ -615,14 +694,39 @@ async function launchdInstall(mode: string) {
   return result
 }
 
-async function writeSyncEnvironment() {
+async function writeSyncEnvironment(databaseURL?: string, allowInsecureRemote?: boolean) {
   const config = await loadConfig(paths)
-  const value = databaseURLFor(config)
+  const value = databaseURL ?? databaseURLFor(config)
   if (!value) return undefined
+  assertPostgresURL(value, allowInsecureRemote ?? config.sync.allow_insecure_remote)
   await mkdir(paths.home, { recursive: true, mode: 0o700 })
+  await chmod(paths.home, 0o700)
   const file = path.join(paths.home, "sync.env")
-  await writeFile(file, `${config.sync.database_url_env}=${value.replaceAll("\\", "\\\\").replaceAll("\n", "")}\n`, { mode: 0o600 })
+  const temporary = `${file}.tmp-${process.pid}`
+  try {
+    await writeFile(temporary, `${config.sync.database_url_env}=${quoteSystemd(value)}\n`, { mode: 0o600 })
+    await chmod(temporary, 0o600)
+    await rename(temporary, file)
+  } finally { await rm(temporary, { force: true }) }
+  await chmod(file, 0o600)
   return file
+}
+
+function syncEnvironmentValue(name: string) {
+  try {
+    const line = readFileSync(path.join(paths.home, "sync.env"), "utf8")
+      .split(/\r?\n/)
+      .find((entry) => entry.startsWith(`${name}=`))
+    if (!line) return undefined
+    const value = line.slice(name.length + 1)
+    if (value.startsWith('"') && value.endsWith('"')) {
+      try {
+        const decoded: unknown = JSON.parse(value)
+        return typeof decoded === "string" ? decoded : undefined
+      } catch { return undefined }
+    }
+    return value
+  } catch { return undefined }
 }
 
 function xml(value: string) {

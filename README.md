@@ -62,6 +62,7 @@ better-compact help
 better-compact doctor
 better-compact update
 better-compact install pi
+better-compact sync setup --url-stdin
 better-compact sync run --once
 better-compact sync status
 better-compact sync migrate
@@ -80,6 +81,19 @@ The generated wrapper points at the persistent checkout and also falls back to t
 `doctor` checks the managed checkout, both OpenCode configuration surfaces, the OpenCode and Bun executables, and performs a read-only SQLite probe. `update` runs the same rollback-safe checkout/configuration transaction as the installer. If Bun was bootstrapped temporarily during installation, install Bun separately or invoke the CLI with `OPENCODE_SAFE_COMPACTION_BUN=/path/to/bun`.
 
 The sync runner reads configured OpenCode V1 SQLite, Codex JSONL, and Pi JSONL sources read-only, stages redacted records in the stable local state database, and uploads bounded batches when the configured Postgres environment variable is present. The `*-sessions` adapters provide a fast, session-only index; pair them with the full-history adapters when message and part records are also wanted. `--once` drains discovery and the local outbox until no work remains; without it, the runner continues polling. Postgres failures leave leased outbox rows for retry and do not affect OpenCode. JSONL discovery is resumable by file and byte/line cursor, and completed files reconcile only their own natural-key prefix. Acknowledged payloads are released from local SQLite immediately; the durable local state is limited to cursors, source counters, revisions, and the currently pending outbox. `better-compact sync status` reports the staged cache, and `better-compact sync compact --yes` removes any legacy acknowledged cache rows and runs SQLite vacuum while preserving unsent rows.
+
+Use `better-compact sync setup --url-stdin` to configure a server without putting the database password in shell history:
+
+```sh
+IFS= read -r -s DATABASE_URL
+printf '%s\n' "$DATABASE_URL" | better-compact sync setup --url-stdin
+unset DATABASE_URL
+# Run this once with admin credentials, then start the writer-only worker.
+better-compact sync migrate
+better-compact sync install
+```
+
+The command enables sync, stores the writer URL only in the mode-`0600` `~/.local/state/better-compact/sync.env`, and preserves an existing source list. If no sources are configured yet, it adds whichever standard OpenCode, Codex, and Pi paths already exist on that server. Use `--url URL` for a convenient non-interactive invocation, or omit the URL when the configured environment variable is already exported. `--allow-insecure-remote` is required for a trusted LAN Postgres server without certificate-verifying TLS. Setup does not run the privileged schema migration: run `better-compact sync migrate` once with admin credentials, then use `--install` (or `better-compact sync install`) to start the per-user worker. Manual `sync run` commands also read the stored `sync.env` value, so no separate `export` is needed.
 
 Remote Postgres URLs must use certificate-verifying TLS (`sslmode=verify-full`) unless the host is loopback. If a trusted LAN server genuinely has no TLS, `sync.allow_insecure_remote=true` is an explicit opt-in and emits a warning; it must not be enabled on an untrusted network. When no URL variable is set, the runner can compose one from `POSTGRES_*` plus `DB_WRITER_*` environment variables. Run `better-compact sync migrate` once with explicit admin credentials before starting the worker; the long-running sync process is deliberately DDL-free and uses only writer privileges. Credentials stay in the environment or a separate mode-`0600` service environment file; they are never written to the JSON configuration. `better-compact sync install` installs the opt-in per-user service and preserves the same local state/outbox across restarts.
 
