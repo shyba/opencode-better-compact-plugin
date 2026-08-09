@@ -68,9 +68,9 @@ if (command === "sync") {
   if (action === "migrate") process.exit(await syncMigrate())
   if (action === "install") process.exit(await syncInstall())
   if (action === "uninstall") process.exit(await syncUninstall())
-  if (action === "prune") process.exit(await syncPrune(process.argv.includes("--yes"), process.argv.includes("--missing-directories")))
+  if (action === "prune") process.exit(await syncPrune(process.argv.includes("--yes"), process.argv.includes("--missing-directories"), process.argv.includes("--blank-directories")))
   if (action === "compact") process.exit(await syncCompact(process.argv.includes("--yes")))
-  console.error("Usage: better-compact sync setup [--url URL|--url-stdin] [--allow-insecure-remote] [--install] | run [--once] | status | migrate | install | uninstall | prune --missing-directories --yes | compact --yes")
+  console.error("Usage: better-compact sync setup [--url URL|--url-stdin] [--allow-insecure-remote] [--install] | run [--once] | status | migrate | install | uninstall | prune (--missing-directories|--blank-directories) --yes | compact --yes")
   process.exit(2)
 }
 console.error(`Unknown command: ${command}`)
@@ -90,7 +90,7 @@ Usage:
   better-compact sync status Show local outbox status
   better-compact sync migrate Apply the remote schema using explicit admin credentials
   better-compact sync install|uninstall Manage a systemd user service
-  better-compact sync prune --missing-directories --yes Delete local Codex files while retaining remote rows
+  better-compact sync prune (--missing-directories|--blank-directories) --yes Delete local Codex files while retaining remote rows
   better-compact sync compact --yes  Remove acknowledged local cache rows and compact SQLite
   better-compact installation reset|adopt --yes  Explicitly recover or replace sync identity
   better-compact help     Show this help
@@ -547,9 +547,10 @@ async function syncStatus() {
   } finally { db.close() }
 }
 
-async function syncPrune(confirmed: boolean, missingDirectories: boolean) {
-  if (!confirmed || !missingDirectories) {
-    console.error("This removes locally present Codex JSONL files whose recorded project directory is missing while retaining their remote rows. Stop the sync service and re-run with --missing-directories --yes.")
+async function syncPrune(confirmed: boolean, missingDirectories: boolean, blankDirectories: boolean) {
+  const mode = missingDirectories && !blankDirectories ? "missing" : blankDirectories && !missingDirectories ? "blank" : undefined
+  if (!confirmed || !mode) {
+    console.error("This removes locally present Codex JSONL files while retaining their remote rows. Choose exactly one of --missing-directories or --blank-directories, stop the sync service, and re-run with --yes.")
     return 2
   }
   const lock = `${paths.state}.lock`
@@ -585,22 +586,25 @@ async function syncPrune(confirmed: boolean, missingDirectories: boolean) {
     const client = openPostgres(databaseURL)
     let remoteRows: Array<{ source_path?: string; directory?: string }>
     try {
-      remoteRows = await client.unsafe<Array<{ source_path?: string; directory?: string }>>(
-        "select metadata->>'source_path' as source_path, directory from opencode.session where installation_id=$1 and source_id=$2 and deleted_at is null",
-        [installation.id, source.id],
-      )
+      const query = mode === "blank"
+        ? "select metadata->>$3 as source_path, directory from opencode.session where installation_id=$1 and source_id=$2 and deleted_at is null and coalesce(trim(directory),$4)=$4"
+        : "select metadata->>$3 as source_path, directory from opencode.session where installation_id=$1 and source_id=$2 and deleted_at is null"
+      const values = mode === "blank" ? [installation.id, source.id, "source_path", ""] : [installation.id, source.id, "source_path"]
+      remoteRows = await client.unsafe<Array<{ source_path?: string; directory?: string }>>(query, values)
     } finally { await client.close() }
     const resolvedRoot = path.resolve(root)
     const targets = new Map<string, { filename: string; size: number; mtimeMs: number }>()
     for (const row of remoteRows) {
-      const directory = typeof row.directory === "string" ? row.directory.trim() : ""
-      if (!directory) continue
-      try {
-        if ((await stat(directory)).isDirectory()) continue
-      } catch (error) {
-        const code = error && typeof error === "object" && "code" in error ? String(error.code) : ""
-        if (code === "EACCES" || code === "EPERM") throw new Error(`cannot verify project directory permissions: ${directory}`)
-        if (code !== "ENOENT" && code !== "ENOTDIR") continue
+      if (mode === "missing") {
+        const directory = typeof row.directory === "string" ? row.directory.trim() : ""
+        if (!directory) continue
+        try {
+          if ((await stat(directory)).isDirectory()) continue
+        } catch (error) {
+          const code = error && typeof error === "object" && "code" in error ? String(error.code) : ""
+          if (code === "EACCES" || code === "EPERM") throw new Error(`cannot verify project directory permissions: ${directory}`)
+          if (code !== "ENOENT" && code !== "ENOTDIR") continue
+        }
       }
       if (!row.source_path) continue
       const filename = path.resolve(resolvedRoot, row.source_path)
@@ -612,7 +616,8 @@ async function syncPrune(confirmed: boolean, missingDirectories: boolean) {
       } catch {}
     }
     const targetList = [...targets.values()]
-    if (!targetList.length) { console.log("no locally present orphan Codex files found"); return 0 }
+    const description = mode === "missing" ? "orphan" : "blank-directory"
+    if (!targetList.length) { console.log(`no locally present ${description} Codex files found`); return 0 }
     for (const target of targetList) {
       const metadata = await lstat(target.filename).catch(() => undefined)
       if (!metadata?.isFile() || metadata.size !== target.size || metadata.mtimeMs !== target.mtimeMs) {
@@ -624,7 +629,7 @@ async function syncPrune(confirmed: boolean, missingDirectories: boolean) {
     }
     for (const target of targetList) await rm(target.filename)
     const bytes = targetList.reduce((total, target) => total + target.size, 0)
-    console.log(`pruned ${targetList.length} local Codex files (${bytes} bytes); remote rows are retained by sync.keep_remote_on_missing`)
+    console.log(`pruned ${targetList.length} local ${description} Codex files (${bytes} bytes); remote rows are retained by sync.keep_remote_on_missing`)
     return 0
   } catch (error) {
     console.error(`sync prune failed: ${error instanceof Error ? error.message : String(error)}`)
