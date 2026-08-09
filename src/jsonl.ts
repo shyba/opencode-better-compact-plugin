@@ -89,6 +89,7 @@ export async function discoverJsonl(
   includeToolOutput = false,
   maxRecords = 500,
   signal?: AbortSignal,
+  keepRemoteOnMissing = false,
 ): Promise<JsonlDiscoveryResult> {
   const files = await listJsonlFiles(root)
   const prior = typeof checkpointOrRevision === "number" ? undefined : checkpointOrRevision
@@ -102,7 +103,7 @@ export async function discoverJsonl(
   const reconcilePrefixes: JsonlReconcilePrefix[] = []
   for (const relativePath of Object.keys(checkpoint.files).sort()) {
     if (currentFiles.has(relativePath)) continue
-    reconcilePrefixes.push({ prefix: naturalPrefix(relativePath), lineCount: 0, recordKinds: ["session", "message"] })
+    if (!keepRemoteOnMissing) reconcilePrefixes.push({ prefix: naturalPrefix(relativePath), lineCount: 0, recordKinds: ["session", "message"] })
     delete checkpoint.files[relativePath]
     if (checkpoint.current?.path === relativePath) delete checkpoint.current
   }
@@ -213,7 +214,7 @@ export async function discoverJsonl(
   }
 }
 
-export async function discoverJsonlSessions(root: string, sourceID: string, kind: string, checkpointOrRevision: JsonlSessionCheckpoint | number = 0, signal?: AbortSignal) {
+export async function discoverJsonlSessions(root: string, sourceID: string, kind: string, checkpointOrRevision: JsonlSessionCheckpoint | number = 0, signal?: AbortSignal, keepRemoteOnMissing = false) {
   const prior = typeof checkpointOrRevision === "number" ? undefined : checkpointOrRevision
   const paths = prior?.files && Object.keys(prior.files).length ? await listJsonlPaths(root) : await listJsonlFiles(root)
   const files = paths.map((file) => {
@@ -225,7 +226,7 @@ export async function discoverJsonlSessions(root: string, sourceID: string, kind
   const reconcilePrefixes: JsonlReconcilePrefix[] = []
   for (const relativePath of Object.keys(checkpoint.files).sort()) {
     if (current.has(relativePath)) continue
-    reconcilePrefixes.push({ prefix: naturalPrefix(relativePath), lineCount: 0, recordKinds: ["session"] })
+    if (!keepRemoteOnMissing) reconcilePrefixes.push({ prefix: naturalPrefix(relativePath), lineCount: 0, recordKinds: ["session"] })
     delete checkpoint.files[relativePath]
   }
   const records: NormalizedRecord[] = []

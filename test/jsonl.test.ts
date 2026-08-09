@@ -52,6 +52,20 @@ describe("streaming JSONL adapters", () => {
     expect(deleted.reconcilePrefixes).toEqual([{ prefix: "session.jsonl|", lineCount: 0, recordKinds: ["session", "message"] }])
   })
 
+  test("can retain remote rows when a local file is intentionally pruned", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "better-compact-jsonl-"))
+    temporary.push(root)
+    const filename = path.join(root, "session.jsonl")
+    await writeFile(filename, `${JSON.stringify({ type: "session", id: "retained" })}\n`)
+    const first = await discoverJsonl(root, "source", "codex-jsonl", 0, false, 10)
+    await rm(filename)
+    const retained = await discoverJsonl(root, "source", "codex-jsonl", first.checkpoint, false, 10, undefined, true)
+    expect(retained.records).toHaveLength(0)
+    expect(retained.reconcilePrefixes).toHaveLength(0)
+    expect(retained.complete).toBe(true)
+    expect(retained.hasMore).toBe(false)
+  })
+
   test("stops a discovery pass at a cooperative cancellation boundary", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "better-compact-jsonl-"))
     temporary.push(root)

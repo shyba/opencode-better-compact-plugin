@@ -67,6 +67,7 @@ better-compact sync run --once
 better-compact sync status
 better-compact sync migrate
 better-compact sync install
+better-compact sync prune --missing-directories --yes
 better-compact sync compact --yes
 better-compact installation reset --yes
 better-compact installation adopt --yes
@@ -95,6 +96,8 @@ better-compact sync install
 
 The command enables sync, stores the writer URL only in the mode-`0600` `~/.local/state/better-compact/sync.env`, and preserves an existing source list. If no sources are configured yet, it adds whichever standard OpenCode, Codex, and Pi paths already exist on that server. Use `--url URL` for a convenient non-interactive invocation, or omit the URL when the configured environment variable is already exported. `--allow-insecure-remote` is required for a trusted LAN Postgres server without certificate-verifying TLS. Setup does not run the privileged schema migration: run `better-compact sync migrate` once with admin credentials, then use `--install` (or `better-compact sync install`) to start the per-user worker. Manual `sync run` commands also read the stored `sync.env` value, so no separate `export` is needed.
 
+If local Codex history has become large, stop the sync service and run `better-compact sync prune --missing-directories --yes`. It only removes files whose synced session metadata points at a missing project directory, after requiring the Codex source to be fully uploaded and confirming the files are unchanged. It enables `sync.keep_remote_on_missing`, so later scans retain those Postgres rows instead of interpreting the intentional local cleanup as a remote deletion. This command does not classify sessions with blank directory metadata as orphans.
+
 Remote Postgres URLs must use certificate-verifying TLS (`sslmode=verify-full`) unless the host is loopback. If a trusted LAN server genuinely has no TLS, `sync.allow_insecure_remote=true` is an explicit opt-in and emits a warning; it must not be enabled on an untrusted network. When no URL variable is set, the runner can compose one from `POSTGRES_*` plus `DB_WRITER_*` environment variables. Run `better-compact sync migrate` once with explicit admin credentials before starting the worker; the long-running sync process is deliberately DDL-free and uses only writer privileges. Credentials stay in the environment or a separate mode-`0600` service environment file; they are never written to the JSON configuration. `better-compact sync install` installs the opt-in per-user service and preserves the same local state/outbox across restarts.
 
 Example source configuration:
@@ -102,7 +105,7 @@ Example source configuration:
 ```json
 {
   "version": 1,
-  "sync": { "enabled": true, "allow_insecure_remote": false },
+  "sync": { "enabled": true, "allow_insecure_remote": false, "keep_remote_on_missing": false },
   "sources": [
     { "kind": "opencode-v1-sqlite", "database": "~/.local/share/opencode/opencode.db" },
     { "kind": "opencode-v1-sessions", "database": "~/.local/share/opencode/opencode.db" },

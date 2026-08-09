@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { access, chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
+import { access, chmod, lstat, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
 import { readFileSync } from "node:fs"
 import { spawn } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
@@ -68,8 +68,9 @@ if (command === "sync") {
   if (action === "migrate") process.exit(await syncMigrate())
   if (action === "install") process.exit(await syncInstall())
   if (action === "uninstall") process.exit(await syncUninstall())
+  if (action === "prune") process.exit(await syncPrune(process.argv.includes("--yes"), process.argv.includes("--missing-directories")))
   if (action === "compact") process.exit(await syncCompact(process.argv.includes("--yes")))
-  console.error("Usage: better-compact sync setup [--url URL|--url-stdin] [--allow-insecure-remote] [--install] | run [--once] | status | migrate | install | uninstall | compact --yes")
+  console.error("Usage: better-compact sync setup [--url URL|--url-stdin] [--allow-insecure-remote] [--install] | run [--once] | status | migrate | install | uninstall | prune --missing-directories --yes | compact --yes")
   process.exit(2)
 }
 console.error(`Unknown command: ${command}`)
@@ -89,6 +90,7 @@ Usage:
   better-compact sync status Show local outbox status
   better-compact sync migrate Apply the remote schema using explicit admin credentials
   better-compact sync install|uninstall Manage a systemd user service
+  better-compact sync prune --missing-directories --yes Delete local Codex files while retaining remote rows
   better-compact sync compact --yes  Remove acknowledged local cache rows and compact SQLite
   better-compact installation reset|adopt --yes  Explicitly recover or replace sync identity
   better-compact help     Show this help
@@ -334,7 +336,7 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>, signal?:
       const checkpoint = state.checkpoint(sourceID)
       const result = backpressure
         ? emptyDiscovery(source.kind, checkpoint)
-        : await discoverSource(source.kind, filename, sourceID, checkpoint, config.sync.include_parts, config.sync.include_tool_output, config.sync.batch_size * 5, signal)
+        : await discoverSource(source.kind, filename, sourceID, checkpoint, config.sync.include_parts, config.sync.include_tool_output, config.sync.batch_size * 5, signal, config.sync.keep_remote_on_missing)
       const snapshot = source.kind === "opencode-v1-sqlite" || source.kind === "opencode-v1-sessions"
         ? { complete: result.complete, recordKinds: ["session", "message", "part", "todo"] }
         : { prefixes: result.reconcilePrefixes }
@@ -451,14 +453,14 @@ function emptyDiscovery(kind: string, checkpoint: Record<string, unknown> | unde
   return { records: [], sessionRecords: [], checkpoint: checkpoint as JsonlCheckpoint ?? { version: 1, files: {} }, complete: false, hasMore: true, reconcilePrefixes: [], sourceUpdatedAt: 0 }
 }
 
-async function discoverSource(kind: string, filename: string, sourceID: string, checkpoint: Record<string, unknown> | undefined, includeParts: boolean, includeToolOutput: boolean, maxRecords: number, signal?: AbortSignal) {
+async function discoverSource(kind: string, filename: string, sourceID: string, checkpoint: Record<string, unknown> | undefined, includeParts: boolean, includeToolOutput: boolean, maxRecords: number, signal?: AbortSignal, keepRemoteOnMissing = false) {
   if (kind === "opencode-v1-sqlite") {
     const result = discoverOpenCodeV1(filename, sourceID, checkpoint as OpenCodeV1Checkpoint | undefined, includeParts, includeToolOutput)
     return { ...result, sessionRecords: [], hasMore: false, reconcilePrefixes: [] as never[], sourceUpdatedAt: result.checkpoint.sourceUpdatedAt }
   }
   if (kind === "opencode-v1-sessions") return discoverOpenCodeV1Sessions(filename, sourceID, checkpoint as OpenCodeV1Checkpoint | undefined)
-  if (kind === "codex-jsonl" || kind === "pi-jsonl") return discoverJsonl(filename, sourceID, kind, checkpoint as JsonlCheckpoint | undefined, includeToolOutput, maxRecords, signal)
-  if (kind === "codex-jsonl-sessions") return discoverJsonlSessions(filename, sourceID, kind, checkpoint as JsonlSessionCheckpoint | undefined, signal)
+  if (kind === "codex-jsonl" || kind === "pi-jsonl") return discoverJsonl(filename, sourceID, kind, checkpoint as JsonlCheckpoint | undefined, includeToolOutput, maxRecords, signal, keepRemoteOnMissing)
+  if (kind === "codex-jsonl-sessions") return discoverJsonlSessions(filename, sourceID, kind, checkpoint as JsonlSessionCheckpoint | undefined, signal, keepRemoteOnMissing)
   throw new Error(`unsupported source adapter: ${kind}`)
 }
 
@@ -543,6 +545,91 @@ async function syncStatus() {
     }
     throw error
   } finally { db.close() }
+}
+
+async function syncPrune(confirmed: boolean, missingDirectories: boolean) {
+  if (!confirmed || !missingDirectories) {
+    console.error("This removes locally present Codex JSONL files whose recorded project directory is missing while retaining their remote rows. Stop the sync service and re-run with --missing-directories --yes.")
+    return 2
+  }
+  const lock = `${paths.state}.lock`
+  const lockPID = await readFile(path.join(lock, "pid"), "utf8").catch(() => "")
+  if (/^\d+$/.test(lockPID.trim())) {
+    try {
+      process.kill(Number(lockPID.trim()), 0)
+      console.error("sync is running; stop it before pruning local session files")
+      return 2
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error
+    }
+  }
+  const config = await loadConfig(paths)
+  if (!config.sync.enabled) { console.error("sync is disabled; configure sync before pruning"); return 2 }
+  const sourceConfig = config.sources.find((source) => source.kind === "codex-jsonl")
+  if (!sourceConfig) { console.error("no codex-jsonl source is configured"); return 2 }
+  const root = path.resolve(sourceConfig.database.replace(/^~(?=\/|$)/, process.env.HOME ?? "."))
+  const state = new Database(paths.state, { readonly: true })
+  try {
+    const installation = state.query("select id from installation order by created_at limit 1").get() as { id: string } | null
+    const source = state.query("select id, local_revision, coalesce(remote_revision_high_water, 0) as remote_revision_high_water from source where kind=? and canonical_locator=? limit 1").get(sourceConfig.kind, root) as { id: string; local_revision: number; remote_revision_high_water: number } | null
+    if (!installation || !source) { console.error("Codex source has not been synced yet"); return 2 }
+    const pending = Number((state.query("select count(*) as value from outbox where source_id=? and state in ('pending', 'leased', 'failed')").get(source.id) as { value: number } | null)?.value ?? 0)
+    if (pending) { console.error(`Codex source still has ${pending} local outbox rows; drain sync before pruning`); return 2 }
+    if (Number(source.local_revision) !== Number(source.remote_revision_high_water)) {
+      console.error(`Codex source is not fully uploaded (local revision ${source.local_revision}, remote revision ${source.remote_revision_high_water})`)
+      return 2
+    }
+    const databaseURL = databaseURLFor(config)
+    if (!databaseURL) { console.error(`missing ${config.sync.database_url_env}`); return 2 }
+    assertPostgresTLS(databaseURL, config.sync.allow_insecure_remote)
+    const client = openPostgres(databaseURL)
+    let remoteRows: Array<{ source_path?: string; directory?: string }>
+    try {
+      remoteRows = await client.unsafe<Array<{ source_path?: string; directory?: string }>>(
+        "select metadata->>'source_path' as source_path, directory from opencode.session where installation_id=$1 and source_id=$2 and deleted_at is null",
+        [installation.id, source.id],
+      )
+    } finally { await client.close() }
+    const resolvedRoot = path.resolve(root)
+    const targets = new Map<string, { filename: string; size: number; mtimeMs: number }>()
+    for (const row of remoteRows) {
+      const directory = typeof row.directory === "string" ? row.directory.trim() : ""
+      if (!directory) continue
+      try {
+        if ((await stat(directory)).isDirectory()) continue
+      } catch (error) {
+        const code = error && typeof error === "object" && "code" in error ? String(error.code) : ""
+        if (code === "EACCES" || code === "EPERM") throw new Error(`cannot verify project directory permissions: ${directory}`)
+        if (code !== "ENOENT" && code !== "ENOTDIR") continue
+      }
+      if (!row.source_path) continue
+      const filename = path.resolve(resolvedRoot, row.source_path)
+      if (!filename.startsWith(`${resolvedRoot}${path.sep}`)) throw new Error(`remote source path escapes the configured Codex root: ${row.source_path}`)
+      try {
+        const metadata = await lstat(filename)
+        if (!metadata.isFile()) continue
+        targets.set(filename, { filename, size: metadata.size, mtimeMs: metadata.mtimeMs })
+      } catch {}
+    }
+    const targetList = [...targets.values()]
+    if (!targetList.length) { console.log("no locally present orphan Codex files found"); return 0 }
+    for (const target of targetList) {
+      const metadata = await lstat(target.filename).catch(() => undefined)
+      if (!metadata?.isFile() || metadata.size !== target.size || metadata.mtimeMs !== target.mtimeMs) {
+        throw new Error(`a target changed during prune planning: ${target.filename}`)
+      }
+    }
+    if (!config.sync.keep_remote_on_missing) {
+      await saveConfig({ ...config, sync: { ...config.sync, keep_remote_on_missing: true } }, paths)
+    }
+    for (const target of targetList) await rm(target.filename)
+    const bytes = targetList.reduce((total, target) => total + target.size, 0)
+    console.log(`pruned ${targetList.length} local Codex files (${bytes} bytes); remote rows are retained by sync.keep_remote_on_missing`)
+    return 0
+  } catch (error) {
+    console.error(`sync prune failed: ${error instanceof Error ? error.message : String(error)}`)
+    return 2
+  } finally { state.close() }
 }
 
 async function syncCompact(confirmed: boolean) {

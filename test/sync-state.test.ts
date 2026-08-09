@@ -19,7 +19,7 @@ describe("portable better-compact state", () => {
   })
 
   test("validates the versioned config and rejects unknown keys", () => {
-    expect(validateConfig({ version: 1, sync: {}, sources: [], installation: { name: "server" } }).installation.name).toBe("server")
+    expect(validateConfig({ version: 1, sync: {}, sources: [], installation: { name: "server" } })).toMatchObject({ installation: { name: "server" }, sync: { keep_remote_on_missing: false } })
     expect(() => validateConfig({ version: 1, sync: { unknown: true }, sources: [] })).toThrow("unknown key")
     expect(() => validateConfig({ version: 1, sync: {}, sources: [{ kind: "fixture", database: "db", extra: true }] })).toThrow("source contains an unknown key")
   })
