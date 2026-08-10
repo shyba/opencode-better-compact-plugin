@@ -70,6 +70,8 @@ better-compact sync install
 better-compact sync prune --missing-directories --yes
 better-compact sync prune --blank-directories --yes
 better-compact sync compact --yes
+better-compact rag migrate
+better-compact rag status
 better-compact installation reset --yes
 better-compact installation adopt --yes
 ```
@@ -100,6 +102,8 @@ The command enables sync, stores the writer URL only in the mode-`0600` `~/.loca
 If local Codex history has become large, stop the sync service and run `better-compact sync prune --missing-directories --yes`. It only removes files whose synced session metadata points at a missing project directory, after requiring the Codex source to be fully uploaded and confirming the files are unchanged. It enables `sync.keep_remote_on_missing`, so later scans retain those Postgres rows instead of interpreting the intentional local cleanup as a remote deletion. Sessions with blank directory metadata are not classified as missing-directory orphans; if the local client cannot resume those sessions either, use the separately explicit `better-compact sync prune --blank-directories --yes` mode. It applies the same upload-fence and race checks, and only removes files whose remote session row has no directory metadata.
 
 Remote Postgres URLs must use certificate-verifying TLS (`sslmode=verify-full`) unless the host is loopback. If a trusted LAN server genuinely has no TLS, `sync.allow_insecure_remote=true` is an explicit opt-in and emits a warning; it must not be enabled on an untrusted network. When no URL variable is set, the runner can compose one from `POSTGRES_*` plus `DB_WRITER_*` environment variables. Run `better-compact sync migrate` once with explicit admin credentials before starting the worker; the long-running sync process is deliberately DDL-free and uses only writer privileges. Credentials stay in the environment or a separate mode-`0600` service environment file; they are never written to the JSON configuration. `better-compact sync install` installs the opt-in per-user service and preserves the same local state/outbox across restarts.
+
+The optional RAG projection is separate from the existing 4096-dimensional Qwen table. Run `better-compact rag migrate` once with the admin environment variables to create `rag.embedding_current_384`, then use `better-compact rag status` to inspect model, dimension, row, and table-size metadata. The first evaluated projection uses `BAAI/bge-small-en-v1.5`; embedding generation remains an offline, separately reviewed job and is never performed on the compaction request path.
 
 Example source configuration:
 

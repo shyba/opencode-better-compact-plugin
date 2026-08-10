@@ -73,6 +73,13 @@ if (command === "sync") {
   console.error("Usage: better-compact sync setup [--url URL|--url-stdin] [--allow-insecure-remote] [--install] | run [--once] | status | migrate | install | uninstall | prune (--missing-directories|--blank-directories) --yes | compact --yes")
   process.exit(2)
 }
+if (command === "rag") {
+  const action = process.argv[3]
+  if (action === "migrate") process.exit(await ragMigrate())
+  if (action === "status") process.exit(await ragStatus())
+  console.error("Usage: better-compact rag migrate | status")
+  process.exit(2)
+}
 console.error(`Unknown command: ${command}`)
 printHelp()
 process.exit(2)
@@ -92,6 +99,8 @@ Usage:
   better-compact sync install|uninstall Manage a systemd user service
   better-compact sync prune (--missing-directories|--blank-directories) --yes Delete local Codex files while retaining remote rows
   better-compact sync compact --yes  Remove acknowledged local cache rows and compact SQLite
+  better-compact rag migrate       Create the additive 384-dimensional RAG projection (admin credentials)
+  better-compact rag status        Show model, row, dimension, and size metadata
   better-compact installation reset|adopt --yes  Explicitly recover or replace sync identity
   better-compact help     Show this help
 
@@ -676,6 +685,58 @@ async function syncMigrate() {
   try {
     await applyRemoteMigration(client, await readFile(path.resolve(path.dirname(process.argv[1] ?? "."), "..", "db/migrations/001_init.sql"), "utf8"))
     console.log("applied better-compact Postgres schema migration")
+    return 0
+  } finally {
+    await client.close()
+  }
+}
+
+async function ragMigrate() {
+  const databaseURL = adminDatabaseURLFor()
+  if (!databaseURL) {
+    console.error("missing POSTGRES_SUPERUSER_USER/POSTGRES_SUPERUSER_PASSWORD (or OPENCODE_SYNC_ADMIN_DATABASE_URL)")
+    return 2
+  }
+  const config = await loadConfig(paths)
+  assertPostgresTLS(databaseURL, config.sync.allow_insecure_remote)
+  const client = openPostgres(databaseURL)
+  try {
+    await applyRemoteMigration(client, await readFile(path.resolve(path.dirname(process.argv[1] ?? "."), "..", "db/migrations/002_rag_embedding_384.sql"), "utf8"))
+    console.log("applied the 384-dimensional RAG projection migration")
+    return 0
+  } finally {
+    await client.close()
+  }
+}
+
+async function ragStatus() {
+  const config = await loadConfig(paths)
+  const databaseURL = databaseURLFor(config)
+  if (!databaseURL) {
+    console.error("missing the configured Postgres writer URL")
+    return 2
+  }
+  assertPostgresTLS(databaseURL, config.sync.allow_insecure_remote)
+  const client = openPostgres(databaseURL)
+  try {
+    const table = await client.unsafe<Array<{ relation: string | null }>>("select to_regclass('rag.embedding_current_384')::text as relation")
+    if (!table[0]?.relation) {
+      console.error("rag.embedding_current_384 is not installed; run better-compact rag migrate with admin credentials")
+      return 2
+    }
+    const rows = await client.unsafe<Array<{ model: string; count: number; min_dimension: number; max_dimension: number; size: string }>>(`
+      select embedding_model as model, count(*)::bigint as count,
+        min(vector_dims(embedding_vec)) as min_dimension,
+        max(vector_dims(embedding_vec)) as max_dimension,
+        pg_size_pretty(pg_total_relation_size('rag.embedding_current_384')) as size
+      from rag.embedding_current_384
+      group by embedding_model
+      order by embedding_model`)
+    if (!rows.length) {
+      console.log("rag.embedding_current_384: installed, empty")
+      return 0
+    }
+    for (const row of rows) console.log(`rag.embedding_current_384: model=${row.model} rows=${Number(row.count)} dimensions=${row.min_dimension}-${row.max_dimension} size=${row.size}`)
     return 0
   } finally {
     await client.close()
