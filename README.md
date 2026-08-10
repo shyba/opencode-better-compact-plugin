@@ -295,6 +295,7 @@ A `/cat` slash command that attaches full file contents to the conversation, byp
 ```
 /cat <ext> [dir] [tokens]          shorthand: all <ext> files under dir (default .); dot is optional
 /cat <glob>... [tokens]            explicit globs: src/**/*.ts, 'src/**/*.{ts,tsx}'; simple basenames recurse
+/cat <patterns> --exclude-git-ignored  omit files ignored by Git (opt-in)
 /cat <patterns> --fixed            pin the patterns: each compaction re-attaches fresh copies
 /cat --reset                       clear the pinned set
 ```
@@ -305,6 +306,7 @@ Examples:
 /cat rs src                        all .rs files under src (".rs" also works)
 /cat .rs src                       all .rs files under src
 /cat '*rs'                         all files whose basename ends in "rs" (find -name style)
+/cat rs --exclude-git-ignored       Rust files except paths ignored by Git
 /cat .md                           all .md files under cwd
 /cat src/main.ts src/util.ts       two literal files
 /cat 'src/**/*.ts' 80000           glob capped at 80k tokens

@@ -90,7 +90,7 @@ export default function piExtension(pi: ExtensionAPI) {
   async function withPinnedFiles(ctx: ExtensionContext, sessionID: string, summary: string): Promise<string> {
     const pin = loadFixedPin(ctx.cwd, sessionID)
     if (!pin || pin.sessionId !== sessionID) return summary
-    const collected = collectFiles(pin.patterns, ctx.cwd, loadCatOptions(ctx.cwd), pin.tokenBudget)
+    const collected = collectFiles(pin.patterns, ctx.cwd, loadCatOptions(ctx.cwd), pin.tokenBudget, pin.excludeGitIgnored)
     if (!collected.files.length) return summary
     const usage = ctx.getContextUsage()
     const contextWindow = usage?.contextWindow

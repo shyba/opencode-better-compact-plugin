@@ -26,7 +26,7 @@ export default function catExtension(pi: ExtensionAPI) {
   })
 
   pi.registerCommand("cat", {
-    description: "Attach file contents: /cat <ext> [dir] [tokens] | /cat <glob>... [tokens] | --fixed pins them across compaction | --reset unpins",
+    description: "Attach file contents: /cat <ext> [dir] [tokens] | /cat <glob>... [tokens] | --exclude-git-ignored | --fixed | --reset",
     handler: async (args, ctx) => {
       const invocation = parseCatArgs(args)
       if (invocation.reset) {
@@ -48,7 +48,7 @@ export default function catExtension(pi: ExtensionAPI) {
         if (ctx.hasUI) ctx.ui.notify("Usage: /cat <ext> [dir] [tokens] or /cat <glob>... [tokens]", "error")
         return
       }
-      const collected = collectFiles(patterns, cwd, options, invocation.tokenBudget)
+      const collected = collectFiles(patterns, cwd, options, invocation.tokenBudget, invocation.excludeGitIgnored)
       if (!collected.files.length) {
         if (ctx.hasUI) {
           ctx.ui.notify(
@@ -92,6 +92,7 @@ export default function catExtension(pi: ExtensionAPI) {
             sessionId: ctx.sessionManager.getSessionId() ?? "pi-session",
             patterns,
             ...(invocation.tokenBudget !== undefined ? { tokenBudget: invocation.tokenBudget } : {}),
+            ...(invocation.excludeGitIgnored ? { excludeGitIgnored: true } : {}),
             pinnedAt: Date.now(),
           })
         } catch {

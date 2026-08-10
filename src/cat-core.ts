@@ -1,4 +1,5 @@
 import { readdirSync, readFileSync, statSync } from "node:fs"
+import { spawnSync } from "node:child_process"
 import { mkdir, rename, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent"
@@ -35,6 +36,8 @@ export const DEFAULT_CAT_OPTIONS: CatOptions = {
 export type CatInvocation = {
   patterns: string[]
   tokenBudget?: number
+  /** Exclude files ignored by the repository's Git rules. */
+  excludeGitIgnored?: boolean
   /** Pin these patterns so each compaction re-attaches fresh copies. */
   fixed?: boolean
   /** Clear the pinned set. */
@@ -47,6 +50,7 @@ export type CatFixedPin = {
   sessionId: string
   patterns: string[]
   tokenBudget?: number
+  excludeGitIgnored?: boolean
   pinnedAt: number
 }
 
@@ -67,7 +71,7 @@ export type CatCollectResult = {
   totalTokens: number
 }
 
-/** Parse the /cat argument string. --fixed and --reset are recognized anywhere
+/** Parse the /cat argument string. Flags are recognized anywhere
  *  (after a leading `--` everything is literal). The last non-flag token, when
  *  a positive integer, is the token budget. Everything else is a pattern. */
 export function parseCatArgs(args: string): CatInvocation {
@@ -75,6 +79,7 @@ export function parseCatArgs(args: string): CatInvocation {
   let literal = false
   let fixed = false
   let reset = false
+  let excludeGitIgnored = false
   const rest: string[] = []
   for (const token of tokens) {
     if (!literal && token === "--") {
@@ -89,6 +94,10 @@ export function parseCatArgs(args: string): CatInvocation {
       reset = true
       continue
     }
+    if (!literal && token === "--exclude-git-ignored") {
+      excludeGitIgnored = true
+      continue
+    }
     rest.push(token)
   }
   const result: CatInvocation = { patterns: [...rest] }
@@ -99,6 +108,7 @@ export function parseCatArgs(args: string): CatInvocation {
   }
   if (fixed) result.fixed = true
   if (reset) result.reset = true
+  if (excludeGitIgnored) result.excludeGitIgnored = true
   return result
 }
 
@@ -130,6 +140,7 @@ export function collectFiles(
   cwd: string,
   options: CatOptions,
   tokenBudget?: number,
+  excludeGitIgnored = false,
 ): CatCollectResult {
   const seen = new Set<string>()
   const files: CatFile[] = []
@@ -139,6 +150,9 @@ export function collectFiles(
   let budgetExhausted = false
 
   const candidates = listFiles(cwd, options.skipDirs)
+  const ignored = excludeGitIgnored ? gitIgnoredFiles(cwd, candidates) : undefined
+  if (ignored && "error" in ignored) return { files, skipped: [`gitignore: ${ignored.error}`], totalBytes, totalTokens }
+  const ignoredPaths = ignored && "paths" in ignored ? ignored.paths : undefined
   for (const pattern of patterns) {
     if (budgetExhausted) break
     const matcher = compileGlob(stripLeadingDotSlash(pattern))
@@ -146,6 +160,10 @@ export function collectFiles(
       if (budgetExhausted) break
       if (!matcher(match)) continue
       if (isSkippedDir(match, options.skipDirs)) continue
+      if (ignoredPaths?.has(match)) {
+        skipped.push(`${match}: git-ignored`)
+        continue
+      }
       const absolute = path.resolve(cwd, match)
       if (seen.has(absolute)) continue
       seen.add(absolute)
@@ -357,6 +375,7 @@ function readFixedPins(value: unknown): CatFixedPin[] {
     if (typeof pin.pinnedAt !== "number" || !Number.isFinite(pin.pinnedAt)) return []
     const result: CatFixedPin = { sessionId: pin.sessionId, patterns: [...pin.patterns], pinnedAt: pin.pinnedAt }
     if (typeof pin.tokenBudget === "number" && Number.isFinite(pin.tokenBudget) && pin.tokenBudget > 0) result.tokenBudget = pin.tokenBudget
+    if (pin.excludeGitIgnored === true) result.excludeGitIgnored = true
     return [result]
   })
 }
@@ -439,6 +458,19 @@ function looksLikeGlob(value: string): boolean {
 
 function isRecursiveBasenameGlob(value: string): boolean {
   return !value.includes("/") && /[*?[{]/.test(value)
+}
+
+function gitIgnoredFiles(cwd: string, candidates: readonly string[]): { paths: Set<string> } | { error: string } {
+  if (!candidates.length) return { paths: new Set() }
+  const result = spawnSync("git", ["check-ignore", "--no-index", "--stdin", "-z"], {
+    cwd,
+    input: Buffer.from(`${candidates.join("\0")}\0`),
+    stdio: ["pipe", "pipe", "pipe"],
+  })
+  if (result.error) return { error: "git check-ignore is unavailable" }
+  if (result.status === 128 && result.stderr.toString().toLowerCase().includes("not a git repository")) return { paths: new Set() }
+  if (result.status !== 0 && result.status !== 1) return { error: "git check-ignore failed" }
+  return { paths: new Set(result.stdout.toString().split("\0").filter(Boolean)) }
 }
 
 function isSkippedDir(relative: string, skipDirs: readonly string[]): boolean {

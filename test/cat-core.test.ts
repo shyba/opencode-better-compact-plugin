@@ -1,4 +1,5 @@
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises"
+import { spawnSync } from "node:child_process"
 import os from "node:os"
 import path from "node:path"
 import { describe, expect, test } from "bun:test"
@@ -52,6 +53,10 @@ describe("parseCatArgs", () => {
 
   test("recognizes --reset", () => {
     expect(parseCatArgs("--reset")).toEqual({ patterns: [], reset: true })
+  })
+
+  test("recognizes Git-ignore exclusion", () => {
+    expect(parseCatArgs("rs --exclude-git-ignored")).toEqual({ patterns: ["rs"], excludeGitIgnored: true })
   })
 
   test("treats flags after -- as literal patterns", () => {
@@ -125,6 +130,20 @@ describe("collectFiles", () => {
     try {
       const result = collectFiles(["**/*.rs"], dir, DEFAULT_CAT_OPTIONS)
       expect(result.files.map((file) => file.path)).toEqual(["src/a.rs"])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("excludes Git-ignored files only when requested", async () => {
+    const dir = await fixture({ "src/kept.rs": "kept", "src/ignored.rs": "ignored", ".gitignore": "src/ignored.rs\n" })
+    try {
+      expect(spawnSync("git", ["init", "--quiet"], { cwd: dir }).status).toBe(0)
+      const ordinary = collectFiles(["**/*.rs"], dir, DEFAULT_CAT_OPTIONS)
+      expect(ordinary.files.map((file) => file.path)).toEqual(["src/ignored.rs", "src/kept.rs"])
+      const excluded = collectFiles(["**/*.rs"], dir, DEFAULT_CAT_OPTIONS, undefined, true)
+      expect(excluded.files.map((file) => file.path)).toEqual(["src/kept.rs"])
+      expect(excluded.skipped).toContain("src/ignored.rs: git-ignored")
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
@@ -308,6 +327,16 @@ describe("fixed pin persistence", () => {
     try {
       await saveFixedPin(dir, { ...pin, tokenBudget: undefined })
       expect(loadFixedPin(dir)).toEqual({ sessionId: "session-1", patterns: ["src/**/*.rs"], pinnedAt: 1234 })
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("persists Git-ignore exclusion on a fixed pin", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "sc-cat-"))
+    try {
+      await saveFixedPin(dir, { ...pin, excludeGitIgnored: true })
+      expect(loadFixedPin(dir)).toEqual({ ...pin, excludeGitIgnored: true })
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
