@@ -729,30 +729,36 @@ async function ragStatus() {
     console.error("missing the configured Postgres writer URL")
     return 2
   }
-  assertPostgresTLS(databaseURL, config.sync.allow_insecure_remote)
-  const client = openPostgres(databaseURL)
   try {
-    const table = await client.unsafe<Array<{ relation: string | null }>>("select to_regclass('rag.embedding_current_384')::text as relation")
-    if (!table[0]?.relation) {
-      console.error("rag.embedding_current_384 is not installed; run better-compact rag migrate with admin credentials")
-      return 2
-    }
-    const rows = await client.unsafe<Array<{ model: string; count: number; min_dimension: number; max_dimension: number; size: string }>>(`
-      select embedding_model as model, count(*)::bigint as count,
-        min(vector_dims(embedding_vec)) as min_dimension,
-        max(vector_dims(embedding_vec)) as max_dimension,
-        pg_size_pretty(pg_total_relation_size('rag.embedding_current_384')) as size
-      from rag.embedding_current_384
-      group by embedding_model
-      order by embedding_model`)
-    if (!rows.length) {
-      console.log("rag.embedding_current_384: installed, empty")
+    assertPostgresTLS(databaseURL, config.sync.allow_insecure_remote)
+    const client = openPostgres(databaseURL)
+    try {
+      const table = await client.unsafe<Array<{ relation: string | null }>>("select to_regclass('rag.embedding_current_384')::text as relation")
+      if (!table[0]?.relation) {
+        console.error("rag.embedding_current_384 is not installed; run better-compact rag migrate with admin credentials")
+        return 2
+      }
+      const rows = await client.unsafe<Array<{ model: string; count: number; min_dimension: number; max_dimension: number; size: string }>>(`
+        select embedding_model as model, count(*)::bigint as count,
+          min(vector_dims(embedding_vec)) as min_dimension,
+          max(vector_dims(embedding_vec)) as max_dimension,
+          pg_size_pretty(pg_total_relation_size('rag.embedding_current_384')) as size
+        from rag.embedding_current_384
+        group by embedding_model
+        order by embedding_model`)
+      if (!rows.length) {
+        console.log("rag.embedding_current_384: installed, empty")
+        return 0
+      }
+      for (const row of rows) console.log(`rag.embedding_current_384: model=${row.model} rows=${Number(row.count)} dimensions=${row.min_dimension}-${row.max_dimension} size=${row.size}`)
       return 0
+    } finally {
+      await client.close()
     }
-    for (const row of rows) console.log(`rag.embedding_current_384: model=${row.model} rows=${Number(row.count)} dimensions=${row.min_dimension}-${row.max_dimension} size=${row.size}`)
-    return 0
-  } finally {
-    await client.close()
+  } catch (error) {
+    console.error(`warning: RAG database status unavailable: ${error instanceof Error ? error.message : String(error)}`)
+    console.error("the embedding service may be holding the configured writer connection; use systemctl --user status better-compact-rag.service")
+    return 1
   }
 }
 
