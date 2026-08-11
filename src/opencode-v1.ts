@@ -23,6 +23,7 @@ export type OpenCodeV1Checkpoint = {
   sessionCreatedAt: number
   sessionID: string
   reconcileBefore: number
+  sourceFingerprint?: string
   sessionWatermarks?: Record<string, number>
   messageCursors?: Record<string, { timeCreated: number; id: string }>
 }
@@ -64,8 +65,14 @@ export function discoverOpenCodeV1(filename: string, sourceID: string, checkpoin
     db.exec("begin")
     const prior = typeof checkpointOrRevision === "number" ? undefined : checkpointOrRevision
     const sourceUpdatedAt = Number((db.query("select max(value) as value from (select coalesce(max(time_updated),0) value from session union all select coalesce(max(time_updated),0) from message union all select coalesce(max(time_updated),0) from part union all select coalesce(max(time_updated),0) from todo)").get() as { value: number | null }).value ?? 0)
+    const sourceCounts = db.query("select (select count(*) from session) as sessions, (select count(*) from message) as messages, (select count(*) from part) as parts, (select count(*) from todo) as todos").get() as { sessions: number; messages: number; parts: number; todos: number }
+    const sourceFingerprint = `${sourceUpdatedAt}:${sourceCounts.sessions}:${sourceCounts.messages}:${sourceCounts.parts}:${sourceCounts.todos}`
     const now = Date.now()
     const fullReconcile = !prior || now >= prior.reconcileBefore
+    if (prior && fullReconcile && prior.sourceFingerprint === sourceFingerprint) {
+      db.exec("commit")
+      return { records: [], checkpoint: { ...prior, sourceUpdatedAt, sourceFingerprint, reconcileBefore: now + 15 * 60_000 }, complete: false }
+    }
     const priorWatermarks = prior?.sessionWatermarks ?? {}
     const priorMessageCursors = prior?.messageCursors ?? {}
     const messageMarkers = db.query("select session_id, id, time_created, time_updated from message order by session_id, time_created, id").all() as Array<{ session_id: string; id: string; time_created: number; time_updated: number }>
@@ -82,7 +89,7 @@ export function discoverOpenCodeV1(filename: string, sourceID: string, checkpoin
     ])
     if (prior && !fullReconcile && !changedSessionIDs?.size) {
       db.exec("commit")
-      return { records: [], checkpoint: { ...prior, sourceUpdatedAt }, complete: false }
+      return { records: [], checkpoint: { ...prior, sourceUpdatedAt, sourceFingerprint }, complete: false }
     }
     const ids = changedSessionIDs ? [...changedSessionIDs] : []
     const placeholders = ids.map(() => "?").join(",")
@@ -141,7 +148,7 @@ export function discoverOpenCodeV1(filename: string, sourceID: string, checkpoin
       nextWatermarks[sessionID] = Math.max(...values)
     }
     const last = sessionRows.at(-1)
-    return { records, checkpoint: { sourceUpdatedAt, sessionCreatedAt: Number(last?.time_created ?? 0), sessionID: String(last?.id ?? ""), reconcileBefore: now + 15 * 60_000, sessionWatermarks: nextWatermarks, messageCursors: nextMessageCursors }, complete: fullReconcile }
+    return { records, checkpoint: { sourceUpdatedAt, sourceFingerprint, sessionCreatedAt: Number(last?.time_created ?? 0), sessionID: String(last?.id ?? ""), reconcileBefore: now + 15 * 60_000, sessionWatermarks: nextWatermarks, messageCursors: nextMessageCursors }, complete: fullReconcile }
   } catch (error) {
     try { db.exec("rollback") } catch {}
     throw error
