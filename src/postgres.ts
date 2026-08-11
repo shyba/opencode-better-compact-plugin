@@ -153,7 +153,11 @@ async function markSnapshotSeen(client: SQLClient, source: PostgresSource, rows:
   })
   if (!seen.length) return
   const args: unknown[] = []
-  const values = seen.map((row) => tuple(args, [source.installationID, source.sourceID, row.token, row.recordKind, row.naturalKey]))
+  const values = seen.map((row) => {
+    const start = args.length + 1
+    args.push(source.installationID, source.sourceID, row.token, row.recordKind, row.naturalKey)
+    return `($${start},$${start + 1},$${start + 2},$${start + 3},$${start + 4}::jsonb)`
+  })
   await client.unsafe(`insert into opencode.sync_snapshot_seen(installation_id, source_id, snapshot_token, record_kind, natural_key)
     values ${values.join(",")} on conflict do nothing`, args)
 }

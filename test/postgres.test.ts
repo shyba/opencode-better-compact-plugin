@@ -67,6 +67,15 @@ describe("Postgres delivery fences", () => {
     expect(query).not.toContain("seen.natural_key::jsonb")
   })
 
+  test("binds snapshot seen keys as JSONB arrays rather than JSON strings", async () => {
+    const client = fakeClient()
+    await uploadFenced(client, source, [
+      { ...row(1), recordKind: "message", naturalKey: "m1", routingJSON: JSON.stringify({ session_id: "s1", __better_compact_snapshot: "token" }) },
+    ])
+    const query = client.calls.find((value) => value.includes("sync_snapshot_seen"))
+    expect(query).toContain("::jsonb")
+  })
+
   test("rejects a revision gap before applying the later record", async () => {
     await expect(uploadFenced(fakeClient(), source, [row(1), row(3)])).rejects.toThrow("non-contiguous")
   })
