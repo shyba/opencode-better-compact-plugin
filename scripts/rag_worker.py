@@ -237,6 +237,10 @@ def main() -> int:
                     backlog_rows = fetch_candidates(connection, state, backlog_limit, chunker_version, model_name, lookback_seconds)
                     rows = merge_candidates(live_rows, backlog_rows)
                     cursor_rows = backlog_rows
+                # Candidate discovery uses an implicit read transaction in
+                # psycopg. Close it before embedding or sleeping so a quiet
+                # pass cannot hold a stale snapshot while new rows arrive.
+                connection.commit()
                 if not rows:
                     if not state.get("caught_up"):
                         state["caught_up"] = True
