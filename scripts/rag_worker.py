@@ -66,7 +66,7 @@ with records as (
     and m.deleted_at is null
     and p.deleted_at is null
     and p.part_type in ('text', 'reasoning')
-    and coalesce(nullif(trim(p.data->>'text'), ''), '') <> ''
+    and coalesce(nullif(regexp_replace(p.data->>'text', '[[:space:]]', '', 'g'), ''), '') <> ''
   group by m.installation_id, m.source_id, m.session_id, m.message_id,
     m.source_updated_at, m.source_created_at
 )
@@ -75,7 +75,7 @@ select
   encode(digest(records.content_text, 'sha256'), 'hex') as content_hash
 from records
 where records.content_text is not null
-  and btrim(records.content_text) <> ''
+  and regexp_replace(records.content_text, '[[:space:]]', '', 'g') <> ''
   and (
     %s = false
     or %s = true
@@ -135,7 +135,7 @@ with records as (
     and m.deleted_at is null
     and p.deleted_at is null
     and p.part_type in ('text', 'reasoning')
-    and coalesce(nullif(trim(p.data->>'text'), ''), '') <> ''
+    and coalesce(nullif(regexp_replace(p.data->>'text', '[[:space:]]', '', 'g'), ''), '') <> ''
   group by m.installation_id, m.source_id, m.session_id, m.message_id
 ), documents as (
   select records.*,
