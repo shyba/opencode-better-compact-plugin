@@ -298,7 +298,7 @@ def fetch_candidates(connection: psycopg.Connection, state: dict[str, Any], limi
         live,
         full_sweep,
         cursor["updated_at"],
-        not bool(state.get("caught_up")),
+        not bool(state.get("caught_up")) and not full_sweep,
         cursor["updated_at"],
         cursor["installation_id"],
         cursor["source_id"],
