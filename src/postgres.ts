@@ -259,11 +259,11 @@ function snapshotToken(row: OutboxRow) {
 
 function snapshotSeenKey(row: OutboxRow) {
   const payload = mergePayload(row)
-  if (row.recordKind === "session") return JSON.stringify([row.naturalKey])
-  if (row.recordKind === "message") return JSON.stringify([stringValue(payload.session_id) ?? "", row.naturalKey])
-  if (row.recordKind === "part") return JSON.stringify([stringValue(payload.session_id) ?? "", stringValue(payload.message_id) ?? "", row.naturalKey.split(":").at(-1) ?? ""])
-  if (row.recordKind === "todo") return JSON.stringify([stringValue(payload.session_id) ?? "", Number(payload.position ?? 0)])
-  return JSON.stringify([row.naturalKey])
+  if (row.recordKind === "session") return [row.naturalKey]
+  if (row.recordKind === "message") return [stringValue(payload.session_id) ?? "", row.naturalKey]
+  if (row.recordKind === "part") return [stringValue(payload.session_id) ?? "", stringValue(payload.message_id) ?? "", row.naturalKey.split(":").at(-1) ?? ""]
+  if (row.recordKind === "todo") return [stringValue(payload.session_id) ?? "", Number(payload.position ?? 0)]
+  return [row.naturalKey]
 }
 
 function isControl(row: OutboxRow) {

@@ -74,6 +74,7 @@ describe("Postgres delivery fences", () => {
     ])
     const query = client.calls.find((value) => value.includes("sync_snapshot_seen"))
     expect(query).toContain("::jsonb")
+    expect(client.values.some((parameters) => parameters.some((value) => Array.isArray(value) && value[0] === "s1" && value[1] === "m1"))).toBe(true)
   })
 
   test("rejects a revision gap before applying the later record", async () => {
