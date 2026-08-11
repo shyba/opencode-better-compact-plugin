@@ -354,7 +354,7 @@ def embed_batch(connection: psycopg.Connection, rows: list[dict[str, Any]], mode
             for index, (chunk, token_count) in enumerate(chunks):
                 chunk_hash = hashlib.sha256(chunk.encode("utf-8")).hexdigest()
                 cursor.execute(
-                    "insert into rag.chunk(doc_id,chunk_index,chunk_text,token_count,chunk_hash,chunking_mode,chunker_version) values(%s,%s,%s,%s,%s,%s,%s) on conflict (doc_id,chunk_index,chunk_hash) do nothing",
+                    "insert into rag.chunk(doc_id,chunk_index,chunk_text,token_count,chunk_hash,chunking_mode,chunker_version) values(%s,%s,%s,%s,%s,%s,%s) on conflict (doc_id,chunk_index,chunk_hash,chunking_mode,chunker_version) do nothing",
                     (document_id, index, chunk, token_count, chunk_hash, CHUNK_MODE, chunker_version),
                 )
             cursor.execute(

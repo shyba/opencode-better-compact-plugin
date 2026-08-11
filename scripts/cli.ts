@@ -743,7 +743,8 @@ async function ragMigrate() {
   const client = openPostgres(databaseURL)
   try {
     await applyRemoteMigration(client, await readFile(path.resolve(path.dirname(process.argv[1] ?? "."), "..", "db/migrations/002_rag_embedding_384.sql"), "utf8"))
-    console.log("applied the 384-dimensional RAG projection migration")
+    await applyRemoteMigration(client, await readFile(path.resolve(path.dirname(process.argv[1] ?? "."), "..", "db/migrations/003_rag_chunk_version.sql"), "utf8"))
+    console.log("applied the 384-dimensional RAG projection and version-aware chunk migrations")
     return 0
   } finally {
     await client.close()
