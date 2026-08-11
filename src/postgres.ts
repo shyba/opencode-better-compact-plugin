@@ -143,7 +143,11 @@ async function reconcilePrefix(client: SQLClient, source: PostgresSource, row: O
 
 async function tombstonePrefix(client: SQLClient, table: string, keyColumn: string, source: PostgresSource, prefix: string, revision: number) {
   await client.unsafe(`update opencode.${table} set deleted_at=now(), record_revision=$1, synced_at=now()
-    where installation_id=$2 and source_id=$3 and deleted_at is null and left(${keyColumn}, length($4))=$4`, [revision, source.installationID, source.sourceID, prefix])
+    where installation_id=$2 and source_id=$3 and deleted_at is null and ${keyColumn} like $4 || '%' escape E'\\\\'`, [revision, source.installationID, source.sourceID, escapeLikePrefix(prefix)])
+}
+
+function escapeLikePrefix(value: string) {
+  return value.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_")
 }
 
 async function markSnapshotSeen(client: SQLClient, source: PostgresSource, rows: OutboxRow[]) {

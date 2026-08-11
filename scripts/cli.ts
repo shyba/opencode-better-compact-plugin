@@ -725,7 +725,8 @@ async function syncMigrate() {
   const client = openPostgres(databaseURL)
   try {
     await applyRemoteMigration(client, await readFile(path.resolve(path.dirname(process.argv[1] ?? "."), "..", "db/migrations/001_init.sql"), "utf8"))
-    console.log("applied better-compact Postgres schema migration")
+    await applyRemoteMigration(client, await readFile(path.resolve(path.dirname(process.argv[1] ?? "."), "..", "db/migrations/004_reconcile_prefix_index.sql"), "utf8"))
+    console.log("applied better-compact Postgres schema and prefix-reconcile index migrations")
     return 0
   } finally {
     await client.close()
