@@ -136,6 +136,30 @@ export class SyncState {
     try { return JSON.parse(row.checkpoint_json) as Record<string, unknown> } catch { return undefined }
   }
 
+  forceReconcile(sourceIDs: string[], stream = "messages") {
+    if (!sourceIDs.length) return 0
+    const placeholders = sourceIDs.map(() => "?").join(",")
+    const transaction = this.db.transaction(() => {
+      const rows = this.db.query(`select source_id, checkpoint_json from source_cursor where stream=? and source_id in (${placeholders})`).all(stream, ...sourceIDs) as Array<{ source_id: string; checkpoint_json: string }>
+      let changed = 0
+      for (const row of rows) {
+        let checkpoint: Record<string, unknown>
+        try {
+          const parsed = JSON.parse(row.checkpoint_json)
+          checkpoint = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {}
+        } catch {
+          checkpoint = {}
+        }
+        checkpoint.forceReconcile = true
+        checkpoint.reconcileBefore = 0
+        this.db.query("update source_cursor set checkpoint_json=?, reconcile_before=0, updated_at=? where source_id=? and stream=?").run(JSON.stringify(checkpoint), Date.now(), row.source_id, stream)
+        changed++
+      }
+      return changed
+    })
+    return transaction()
+  }
+
   enqueue(records: NormalizedRecord[], sourceID: string, stream: string, checkpoint: unknown, destinationID = "postgres", snapshot?: { complete?: boolean; recordKinds?: string[]; prefixes?: Array<{ prefix: string; lineCount: number; recordKinds: string[] }> }, maxOutboxBytes = Number.POSITIVE_INFINITY) {
     const transaction = this.db.transaction(() => {
       let nextRevision = this.nextRevision(sourceID)

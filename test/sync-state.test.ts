@@ -19,7 +19,7 @@ describe("portable better-compact state", () => {
   })
 
   test("validates the versioned config and rejects unknown keys", () => {
-  expect(validateConfig({ version: 1, sync: {}, sources: [], installation: { name: "server" } })).toMatchObject({ installation: { name: "server" }, sync: { keep_remote_on_missing: false }, rag: { model: "BAAI/bge-small-en-v1.5", chunk_tokens: 512, overlap: 64, enabled: false } })
+  expect(validateConfig({ version: 1, sync: {}, sources: [], installation: { name: "server" } })).toMatchObject({ installation: { name: "server" }, sync: { keep_remote_on_missing: false, allow_source_shrink: false }, rag: { model: "BAAI/bge-small-en-v1.5", chunk_tokens: 512, overlap: 64, enabled: false } })
   expect(() => validateConfig({ version: 1, sync: { unknown: true }, sources: [] })).toThrow("unknown key")
   expect(() => validateConfig({ version: 1, sync: {}, rag: { overlap: 512 }, sources: [] })).toThrow("rag.overlap")
     expect(() => validateConfig({ version: 1, sync: {}, sources: [{ kind: "fixture", database: "db", extra: true }] })).toThrow("source contains an unknown key")
@@ -147,5 +147,17 @@ describe("portable better-compact state", () => {
     state.adoptInstallationIncarnation("remote-incarnation")
     expect(state.ensureDefaultInstallation()).toEqual({ id: installation.id, incarnation: "remote-incarnation" })
     state.close()
+  })
+
+  test("forces OpenCode checkpoints to rebuild without dropping the saved source counts", async () => {
+    const filename = path.join(await mkdtemp(path.join(os.tmpdir(), "better-compact-state-")), "state.sqlite")
+    const state = await openSyncState(filename)
+    state.ensureInstallation("installation-1", "incarnation-1")
+    state.upsertSource({ id: "source-1", installationID: "installation-1", kind: "opencode-v1-sqlite", schemaVersion: 1, locator: "/tmp/opencode.db", incarnation: "source-incarnation-1" })
+    state.enqueue([], "source-1", "messages", { sourceFingerprint: "10:2:3:4:5", sourceCounts: { sessions: 2, messages: 3, parts: 4, todos: 5 }, reconcileBefore: 123 }, "postgres")
+    expect(state.forceReconcile(["source-1"])).toBe(1)
+    expect(state.checkpoint("source-1")).toMatchObject({ sourceFingerprint: "10:2:3:4:5", sourceCounts: { sessions: 2, messages: 3, parts: 4, todos: 5 }, reconcileBefore: 0, forceReconcile: true })
+    state.close()
+    await rm(path.dirname(filename), { recursive: true, force: true })
   })
 })

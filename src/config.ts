@@ -12,6 +12,7 @@ export type SyncConfig = {
   retention_days: number
   allow_insecure_remote: boolean
   keep_remote_on_missing: boolean
+  allow_source_shrink: boolean
 }
 
 export type RagConfig = {
@@ -68,6 +69,7 @@ const defaults: BetterCompactConfig = {
     retention_days: 90,
     allow_insecure_remote: false,
     keep_remote_on_missing: false,
+    allow_source_shrink: false,
   },
   rag: {
     enabled: false,
@@ -159,7 +161,7 @@ export function validateConfig(value: unknown): BetterCompactConfig {
   for (const key of ["poll_interval_ms", "batch_size", "max_outbox_bytes", "retention_days"] as const) {
     if (!Number.isSafeInteger(result.sync[key]) || result.sync[key] <= 0) throw new TypeError(`sync.${key} must be a positive integer`)
   }
-  if (typeof result.sync.include_parts !== "boolean" || typeof result.sync.include_tool_output !== "boolean" || typeof result.sync.allow_insecure_remote !== "boolean" || typeof result.sync.keep_remote_on_missing !== "boolean") throw new TypeError("sync include flags must be boolean")
+  if (typeof result.sync.include_parts !== "boolean" || typeof result.sync.include_tool_output !== "boolean" || typeof result.sync.allow_insecure_remote !== "boolean" || typeof result.sync.keep_remote_on_missing !== "boolean" || typeof result.sync.allow_source_shrink !== "boolean") throw new TypeError("sync include flags must be boolean")
   const rag = object.rag === undefined ? {} : object.rag
   if (!rag || typeof rag !== "object" || Array.isArray(rag)) throw new TypeError("config.rag must be an object")
   const ragObject = rag as Record<string, unknown>

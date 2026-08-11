@@ -47,9 +47,24 @@ describe("streaming JSONL adapters", () => {
     const first = await discoverJsonl(root, "source", "codex-jsonl", 0, false, 10)
     expect(first.records.some((record) => record.payloadJSON?.includes("invalid_json"))).toBe(true)
     await rm(filename)
-    const deleted = await discoverJsonl(root, "source", "codex-jsonl", first.checkpoint, false, 10)
+    const deleted = await discoverJsonl(root, "source", "codex-jsonl", first.checkpoint, false, 10, undefined, false, true)
     expect(deleted.records).toHaveLength(0)
     expect(deleted.reconcilePrefixes).toEqual([{ prefix: "session.jsonl|", lineCount: 0, recordKinds: ["session", "message"] }])
+  })
+
+  test("blocks an empty JSONL inventory without inferring remote deletion", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "better-compact-jsonl-"))
+    temporary.push(root)
+    const filename = path.join(root, "session.jsonl")
+    await writeFile(filename, `${JSON.stringify({ type: "session", id: "retained" })}\n`)
+    const first = await discoverJsonl(root, "source", "codex-jsonl", 0, false, 10)
+    await rm(filename)
+    const blocked = await discoverJsonl(root, "source", "codex-jsonl", first.checkpoint, false, 10)
+    expect(blocked.records).toHaveLength(0)
+    expect(blocked.reconcilePrefixes).toHaveLength(0)
+    expect(blocked.complete).toBe(false)
+    expect(typeof blocked.reconcileBlocked).toBe("string")
+    expect(blocked.reconcileBlocked ?? "").toContain("JSONL source shrank")
   })
 
   test("can retain remote rows when a local file is intentionally pruned", async () => {

@@ -35,6 +35,7 @@ test("OpenCode V1 adapter validates the migration journal and emits bounded norm
     const sessionIndex = discoverOpenCodeV1Sessions(filename, "source-1")
     const unchangedSessionIndex = discoverOpenCodeV1Sessions(filename, "source-1", sessionIndex.checkpoint)
     expect(unchangedSessionIndex.records).toHaveLength(0)
+    expect(unchangedSessionIndex.complete).toBe(false)
     const unchanged = discoverOpenCodeV1(filename, "source-1", result.checkpoint)
     expect(unchanged.records).toHaveLength(0)
     expect(unchanged.complete).toBe(false)
@@ -42,6 +43,9 @@ test("OpenCode V1 adapter validates the migration journal and emits bounded norm
     expect(unchangedFull.records).toHaveLength(0)
     expect(unchangedFull.complete).toBe(false)
     expect(unchangedFull.checkpoint.sourceFingerprint).toBe(result.checkpoint.sourceFingerprint)
+    const forcedFull = discoverOpenCodeV1(filename, "source-1", { ...result.checkpoint, reconcileBefore: 0, forceReconcile: true })
+    expect(forcedFull.complete).toBe(true)
+    expect(forcedFull.records).toHaveLength(result.records.length)
     const changedDB = new Database(filename)
     changedDB.query("update message set time_updated=?, data=? where id=?").run(9, JSON.stringify({ role: "assistant" }), "msg-1")
     changedDB.close()
@@ -83,6 +87,36 @@ describe("OpenCode V1 adapter safety", () => {
     db.close()
     try {
       expect(() => inspectOpenCodeV1(filename)).toThrow("missing table message")
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  test("blocks a shrinking full snapshot without inferring remote deletion", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "better-compact-opencode-"))
+    const filename = path.join(directory, "opencode.db")
+    const db = new Database(filename)
+    db.exec(`
+      create table migration (id text primary key, time_completed integer not null);
+      insert into migration values ('001', 1);
+      create table session (id text primary key, time_created integer, time_updated integer, title text, directory text, metadata text);
+      create table message (id text primary key, session_id text, time_created integer, time_updated integer, data text);
+      create table part (id text primary key, message_id text, session_id text, time_created integer, time_updated integer, data text);
+      create table todo (session_id text, position integer, time_created integer, time_updated integer, content text, status text, priority text);
+      insert into session values ('ses-1', 1, 2, 'Keep', '/tmp/project', '{}');
+      insert into message values ('msg-1', 'ses-1', 3, 4, '{"role":"assistant"}');
+      insert into part values ('part-1', 'msg-1', 'ses-1', 5, 6, '{"type":"text","text":"keep"}');
+    `)
+    db.close()
+    try {
+      const initial = discoverOpenCodeV1(filename, "source-1")
+      const changedDB = new Database(filename)
+      changedDB.query("delete from part where id=?").run("part-1")
+      changedDB.close()
+      const blocked = discoverOpenCodeV1(filename, "source-1", { ...initial.checkpoint, reconcileBefore: 0 })
+      expect(blocked.complete).toBe(false)
+      expect(blocked.reconcileBlocked).toContain("parts")
+      expect(blocked.checkpoint.sourceCounts).toEqual(initial.checkpoint.sourceCounts)
     } finally {
       await rm(directory, { recursive: true, force: true })
     }

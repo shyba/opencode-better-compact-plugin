@@ -18,12 +18,21 @@ export type OpenCodeV1Inspection = {
   tables: string[]
 }
 
+export type OpenCodeV1SourceCounts = {
+  sessions: number
+  messages: number
+  parts: number
+  todos: number
+}
+
 export type OpenCodeV1Checkpoint = {
   sourceUpdatedAt: number
   sessionCreatedAt: number
   sessionID: string
   reconcileBefore: number
   sourceFingerprint?: string
+  sourceCounts?: Partial<OpenCodeV1SourceCounts>
+  forceReconcile?: boolean
   sessionWatermarks?: Record<string, number>
   messageCursors?: Record<string, { timeCreated: number; id: string }>
 }
@@ -57,7 +66,7 @@ export function inspectOpenCodeV1(filename: string): OpenCodeV1Inspection {
   }
 }
 
-export function discoverOpenCodeV1(filename: string, sourceID: string, checkpointOrRevision: OpenCodeV1Checkpoint | number = 0, includeParts = true, includeToolOutput = false): { records: NormalizedRecord[]; checkpoint: OpenCodeV1Checkpoint; complete: boolean } {
+export function discoverOpenCodeV1(filename: string, sourceID: string, checkpointOrRevision: OpenCodeV1Checkpoint | number = 0, includeParts = true, includeToolOutput = false, allowSourceShrink = false): { records: NormalizedRecord[]; checkpoint: OpenCodeV1Checkpoint; complete: boolean; reconcileBlocked?: string } {
   const inspection = inspectOpenCodeV1(filename)
   const db = new Database(filename, { readonly: true })
   try {
@@ -69,10 +78,12 @@ export function discoverOpenCodeV1(filename: string, sourceID: string, checkpoin
     const sourceFingerprint = `${sourceUpdatedAt}:${sourceCounts.sessions}:${sourceCounts.messages}:${sourceCounts.parts}:${sourceCounts.todos}`
     const now = Date.now()
     const fullReconcile = !prior || now >= prior.reconcileBefore
-    if (prior && fullReconcile && prior.sourceFingerprint === sourceFingerprint) {
+    const trustedCounts = prior?.sourceCounts ?? parseSourceCounts(prior?.sourceFingerprint)
+    if (prior && fullReconcile && !prior.forceReconcile && prior.sourceFingerprint === sourceFingerprint && countsEqual(trustedCounts, sourceCounts)) {
       db.exec("commit")
-      return { records: [], checkpoint: { ...prior, sourceUpdatedAt, sourceFingerprint, reconcileBefore: now + 15 * 60_000 }, complete: false }
+      return { records: [], checkpoint: { ...prior, sourceUpdatedAt, sourceFingerprint, ...(trustedCounts ? { sourceCounts: trustedCounts } : {}), reconcileBefore: now + 15 * 60_000 }, complete: false }
     }
+    const reconcileBlocked = Boolean(prior && fullReconcile && trustedCounts && countsDecreased(trustedCounts, sourceCounts) && !allowSourceShrink)
     const priorWatermarks = prior?.sessionWatermarks ?? {}
     const priorMessageCursors = prior?.messageCursors ?? {}
     const messageMarkers = db.query("select session_id, id, time_created, time_updated from message order by session_id, time_created, id").all() as Array<{ session_id: string; id: string; time_created: number; time_updated: number }>
@@ -89,7 +100,7 @@ export function discoverOpenCodeV1(filename: string, sourceID: string, checkpoin
     ])
     if (prior && !fullReconcile && !changedSessionIDs?.size) {
       db.exec("commit")
-      return { records: [], checkpoint: { ...prior, sourceUpdatedAt, sourceFingerprint }, complete: false }
+      return { records: [], checkpoint: { ...prior, sourceUpdatedAt, sourceFingerprint, ...(trustedCounts ? { sourceCounts: trustedCounts } : {}) }, complete: false }
     }
     const ids = changedSessionIDs ? [...changedSessionIDs] : []
     const placeholders = ids.map(() => "?").join(",")
@@ -132,8 +143,8 @@ export function discoverOpenCodeV1(filename: string, sourceID: string, checkpoin
       }
     }
     db.exec("commit")
-    const nextWatermarks = fullReconcile ? {} : { ...priorWatermarks }
-    const nextMessageCursors = fullReconcile ? {} : { ...priorMessageCursors }
+    const nextWatermarks = fullReconcile && !reconcileBlocked ? {} : { ...priorWatermarks }
+    const nextMessageCursors = fullReconcile && !reconcileBlocked ? {} : { ...priorMessageCursors }
     for (const row of messageMarkers) {
       const key = String(row.session_id)
       const priorCursor = nextMessageCursors[key]
@@ -148,7 +159,7 @@ export function discoverOpenCodeV1(filename: string, sourceID: string, checkpoin
       nextWatermarks[sessionID] = Math.max(...values)
     }
     const last = sessionRows.at(-1)
-    return { records, checkpoint: { sourceUpdatedAt, sourceFingerprint, sessionCreatedAt: Number(last?.time_created ?? 0), sessionID: String(last?.id ?? ""), reconcileBefore: now + 15 * 60_000, sessionWatermarks: nextWatermarks, messageCursors: nextMessageCursors }, complete: fullReconcile }
+    return { records, checkpoint: { sourceUpdatedAt, sourceFingerprint, sourceCounts: fullReconcile && !reconcileBlocked ? sourceCounts : trustedCounts ?? sourceCounts, ...(reconcileBlocked ? { forceReconcile: true } : {}), sessionCreatedAt: Number(last?.time_created ?? 0), sessionID: String(last?.id ?? ""), reconcileBefore: now + (reconcileBlocked ? 60_000 : 15 * 60_000), sessionWatermarks: nextWatermarks, messageCursors: nextMessageCursors }, complete: fullReconcile && !reconcileBlocked, ...(reconcileBlocked ? { reconcileBlocked: `source counts shrank from ${formatCounts(trustedCounts)} to ${formatCounts(sourceCounts)}` } : {}) }
   } catch (error) {
     try { db.exec("rollback") } catch {}
     throw error
@@ -157,12 +168,13 @@ export function discoverOpenCodeV1(filename: string, sourceID: string, checkpoin
   }
 }
 
-export function discoverOpenCodeV1Sessions(filename: string, sourceID: string, prior?: OpenCodeV1Checkpoint): { records: NormalizedRecord[]; checkpoint: OpenCodeV1Checkpoint; complete: true; hasMore: false; reconcilePrefixes: never[]; sourceUpdatedAt: number } {
+export function discoverOpenCodeV1Sessions(filename: string, sourceID: string, prior?: OpenCodeV1Checkpoint, allowSourceShrink = false): { records: NormalizedRecord[]; checkpoint: OpenCodeV1Checkpoint; complete: boolean; hasMore: false; reconcilePrefixes: never[]; sourceUpdatedAt: number; reconcileBlocked?: string } {
   const inspection = inspectOpenCodeV1(filename)
   const db = new Database(filename, { readonly: true })
   try {
     db.exec("PRAGMA query_only=ON; PRAGMA busy_timeout=1000;")
     const sessions = db.query("select id, time_created, time_updated, title, directory, metadata from session order by time_created, id").all() as Array<Record<string, unknown>>
+    const sourceCounts = { sessions: sessions.length }
     const records = sessions.map((session) => {
       const createdAt = Number(session.time_created ?? 0)
       const updatedAt = Number(session.time_updated ?? createdAt)
@@ -171,11 +183,33 @@ export function discoverOpenCodeV1Sessions(filename: string, sourceID: string, p
     const last = sessions.at(-1)
     const sourceUpdatedAt = sessions.reduce((latest, session) => Math.max(latest, Number(session.time_updated ?? session.time_created ?? 0)), 0)
     const now = Date.now()
-    if (prior && now < prior.reconcileBefore && sourceUpdatedAt <= prior.sourceUpdatedAt) return { records: [], checkpoint: { ...prior, sourceUpdatedAt }, complete: true, hasMore: false, reconcilePrefixes: [], sourceUpdatedAt }
-    return { records, checkpoint: { sourceUpdatedAt, sessionCreatedAt: Number(last?.time_created ?? 0), sessionID: String(last?.id ?? ""), reconcileBefore: now + 15 * 60_000 }, complete: true, hasMore: false, reconcilePrefixes: [], sourceUpdatedAt }
+    if (prior && !prior.forceReconcile && now < prior.reconcileBefore && sourceUpdatedAt <= prior.sourceUpdatedAt) return { records: [], checkpoint: { ...prior, sourceUpdatedAt, sourceCounts: prior.sourceCounts ?? sourceCounts }, complete: false, hasMore: false, reconcilePrefixes: [], sourceUpdatedAt }
+    const trustedCounts = prior?.sourceCounts ?? parseSourceCounts(prior?.sourceFingerprint) ?? { sessions: sessions.length }
+    const reconcileBlocked = Boolean(prior && now >= prior.reconcileBefore && sessions.length < Number(trustedCounts.sessions ?? sessions.length) && !allowSourceShrink)
+    return { records, checkpoint: { sourceUpdatedAt, sourceCounts: reconcileBlocked ? trustedCounts : sourceCounts, ...(reconcileBlocked ? { forceReconcile: true } : {}), sessionCreatedAt: Number(last?.time_created ?? 0), sessionID: String(last?.id ?? ""), reconcileBefore: now + (reconcileBlocked ? 60_000 : 15 * 60_000) }, complete: !reconcileBlocked, hasMore: false, reconcilePrefixes: [], sourceUpdatedAt, ...(reconcileBlocked ? { reconcileBlocked: `session count shrank from ${trustedCounts.sessions} to ${sessions.length}` } : {}) }
   } finally {
     db.close()
   }
+}
+
+function parseSourceCounts(value?: string): OpenCodeV1SourceCounts | undefined {
+  const parts = value?.split(":")
+  if (!parts || parts.length !== 5 || parts.some((part) => !/^\d+$/.test(part))) return undefined
+  return { sessions: Number(parts[1]), messages: Number(parts[2]), parts: Number(parts[3]), todos: Number(parts[4]) }
+}
+
+function countsEqual(previous: Partial<OpenCodeV1SourceCounts> | undefined, current: OpenCodeV1SourceCounts) {
+  if (!previous) return false
+  return Object.entries(previous).every(([key, value]) => current[key as keyof OpenCodeV1SourceCounts] === value)
+}
+
+function countsDecreased(previous: Partial<OpenCodeV1SourceCounts>, current: OpenCodeV1SourceCounts) {
+  return Object.entries(previous).some(([key, value]) => current[key as keyof OpenCodeV1SourceCounts] < Number(value))
+}
+
+function formatCounts(value: Partial<OpenCodeV1SourceCounts> | undefined) {
+  if (!value) return "unknown"
+  return ["sessions", "messages", "parts", "todos"].map((key) => `${key}=${value[key as keyof OpenCodeV1SourceCounts] ?? "?"}`).join(",")
 }
 
 function groupBy(values: Array<Record<string, unknown>>, key: (value: Record<string, unknown>) => string) {

@@ -16,6 +16,8 @@ export type JsonlFileCheckpoint = {
 export type JsonlCheckpoint = {
   version: 1
   inventoryComplete?: boolean
+  sourceCounts?: { files: number; bytes: number }
+  reconcileBlocked?: string
   files: Record<string, JsonlFileCheckpoint>
   current?: {
     path: string
@@ -49,10 +51,13 @@ export type JsonlDiscoveryResult = {
   hasMore: boolean
   reconcilePrefixes: JsonlReconcilePrefix[]
   sourceUpdatedAt: number
+  reconcileBlocked?: string
 }
 
 export type JsonlSessionCheckpoint = {
   version: 1
+  sourceCounts?: { files: number; bytes: number }
+  reconcileBlocked?: string
   files: Record<string, { size: number; mtimeMs: number; sessionID: string }>
 }
 
@@ -90,20 +95,30 @@ export async function discoverJsonl(
   maxRecords = 500,
   signal?: AbortSignal,
   keepRemoteOnMissing = false,
+  allowSourceShrink = false,
 ): Promise<JsonlDiscoveryResult> {
   const files = await listJsonlFiles(root)
   const prior = typeof checkpointOrRevision === "number" ? undefined : checkpointOrRevision
+  const currentFiles = new Map(files.map((file) => [file.relativePath, file]))
+  const previousCounts = prior?.sourceCounts ?? { files: Object.keys(prior?.files ?? {}).length, bytes: Object.values(prior?.files ?? {}).reduce((total, file) => total + file.size, 0) }
+  const currentBytes = files.reduce((total, file) => total + file.size, 0)
+  const shrinkingPaths = files.filter((file) => {
+    const saved = prior?.files[file.relativePath]
+    return saved !== undefined && file.size < saved.size
+  }).map((file) => file.relativePath)
+  const missingPaths = Object.keys(prior?.files ?? {}).filter((relativePath) => !currentFiles.has(relativePath))
+  const shrinkBlocked = Boolean(prior && !keepRemoteOnMissing && !allowSourceShrink && ((previousCounts.files > 0 && files.length === 0) || currentBytes < previousCounts.bytes || shrinkingPaths.length > 0 || missingPaths.length > 0 && currentBytes <= previousCounts.bytes))
   const checkpoint: JsonlCheckpoint = {
     version: 1,
     ...(prior?.inventoryComplete ? { inventoryComplete: true } : {}),
+    sourceCounts: shrinkBlocked ? previousCounts : { files: files.length, bytes: currentBytes },
     files: { ...(prior?.files ?? {}) },
     ...(prior?.current ? { current: prior.current } : {}),
   }
-  const currentFiles = new Map(files.map((file) => [file.relativePath, file]))
   const reconcilePrefixes: JsonlReconcilePrefix[] = []
   for (const relativePath of Object.keys(checkpoint.files).sort()) {
     if (currentFiles.has(relativePath)) continue
-    if (!keepRemoteOnMissing) reconcilePrefixes.push({ prefix: naturalPrefix(relativePath), lineCount: 0, recordKinds: ["session", "message"] })
+    if (!keepRemoteOnMissing && !shrinkBlocked) reconcilePrefixes.push({ prefix: naturalPrefix(relativePath), lineCount: 0, recordKinds: ["session", "message"] })
     delete checkpoint.files[relativePath]
     if (checkpoint.current?.path === relativePath) delete checkpoint.current
   }
@@ -194,7 +209,7 @@ export async function discoverJsonl(
 
     checkpoint.files[file.relativePath] = { size: file.size, mtimeMs: file.mtimeMs, lineCount: line, sessionID }
     if (checkpoint.current?.path === file.relativePath) delete checkpoint.current
-    reconcilePrefixes.push({ prefix: naturalPrefix(file.relativePath), lineCount: line, recordKinds: ["session", "message"] })
+    if (!shrinkBlocked || !shrinkingPaths.includes(file.relativePath)) reconcilePrefixes.push({ prefix: naturalPrefix(file.relativePath), lineCount: line, recordKinds: ["session", "message"] })
     sourceUpdatedAt = Math.max(sourceUpdatedAt, file.mtimeMs)
     if (remaining <= 0) break
   }
@@ -203,30 +218,40 @@ export async function discoverJsonl(
     const saved = checkpoint.files[file.relativePath]
     return !saved || saved.size !== file.size || saved.mtimeMs !== file.mtimeMs || saved.lineCount === undefined
   })
+  const reconcileBlocked = shrinkBlocked ? `JSONL source shrank from ${previousCounts.files} files/${previousCounts.bytes} bytes to ${files.length} files/${currentBytes} bytes` : undefined
   return {
     records,
     sessionRecords,
-    checkpoint,
-    complete: !hasMore,
+    checkpoint: { ...checkpoint, ...(reconcileBlocked ? { reconcileBlocked } : {}) },
+    complete: !hasMore && !shrinkBlocked,
     hasMore,
     reconcilePrefixes,
     sourceUpdatedAt,
+    ...(reconcileBlocked ? { reconcileBlocked } : {}),
   }
 }
 
-export async function discoverJsonlSessions(root: string, sourceID: string, kind: string, checkpointOrRevision: JsonlSessionCheckpoint | number = 0, signal?: AbortSignal, keepRemoteOnMissing = false) {
+export async function discoverJsonlSessions(root: string, sourceID: string, kind: string, checkpointOrRevision: JsonlSessionCheckpoint | number = 0, signal?: AbortSignal, keepRemoteOnMissing = false, allowSourceShrink = false) {
   const prior = typeof checkpointOrRevision === "number" ? undefined : checkpointOrRevision
   const paths = prior?.files && Object.keys(prior.files).length ? await listJsonlPaths(root) : await listJsonlFiles(root)
   const files = paths.map((file) => {
     const saved = prior?.files[file.relativePath]
     return { ...file, size: saved?.size ?? -1, mtimeMs: saved?.mtimeMs ?? -1 }
   })
-  const checkpoint: JsonlSessionCheckpoint = { version: 1, files: { ...(prior?.files ?? {}) } }
+  const previousCounts = prior?.sourceCounts ?? { files: Object.keys(prior?.files ?? {}).length, bytes: Object.values(prior?.files ?? {}).reduce((total, file) => total + file.size, 0) }
+  const currentBytes = files.reduce((total, file) => total + file.size, 0)
+  const shrinkingPaths = files.filter((file) => {
+    const saved = prior?.files[file.relativePath]
+    return saved !== undefined && file.size < saved.size
+  }).map((file) => file.relativePath)
   const current = new Map(files.map((file) => [file.relativePath, file]))
+  const missingPaths = Object.keys(prior?.files ?? {}).filter((relativePath) => !current.has(relativePath))
+  const shrinkBlocked = Boolean(prior && !keepRemoteOnMissing && !allowSourceShrink && ((previousCounts.files > 0 && files.length === 0) || currentBytes < previousCounts.bytes || shrinkingPaths.length > 0 || missingPaths.length > 0 && currentBytes <= previousCounts.bytes))
+  const checkpoint: JsonlSessionCheckpoint = { version: 1, sourceCounts: shrinkBlocked ? previousCounts : { files: files.length, bytes: currentBytes }, files: { ...(prior?.files ?? {}) } }
   const reconcilePrefixes: JsonlReconcilePrefix[] = []
   for (const relativePath of Object.keys(checkpoint.files).sort()) {
     if (current.has(relativePath)) continue
-    if (!keepRemoteOnMissing) reconcilePrefixes.push({ prefix: naturalPrefix(relativePath), lineCount: 0, recordKinds: ["session"] })
+    if (!keepRemoteOnMissing && !shrinkBlocked) reconcilePrefixes.push({ prefix: naturalPrefix(relativePath), lineCount: 0, recordKinds: ["session"] })
     delete checkpoint.files[relativePath]
   }
   const records: NormalizedRecord[] = []
@@ -243,9 +268,10 @@ export async function discoverJsonlSessions(root: string, sourceID: string, kind
     const sessionID = header.sessionID || stableSessionID(sourceID, file.relativePath)
     records.push(sessionRecord(sourceID, kind, file.relativePath, sessionID, header, header.createdAt || metadata.mtimeMs, metadata.mtimeMs))
     checkpoint.files[file.relativePath] = { size: metadata.size, mtimeMs: metadata.mtimeMs, sessionID }
-    reconcilePrefixes.push({ prefix: naturalPrefix(file.relativePath), lineCount: 1, recordKinds: ["session"] })
+    if (!shrinkBlocked || !shrinkingPaths.includes(file.relativePath)) reconcilePrefixes.push({ prefix: naturalPrefix(file.relativePath), lineCount: 1, recordKinds: ["session"] })
   }
-  return { records, sessionRecords: records, checkpoint, complete, hasMore: !complete, reconcilePrefixes, sourceUpdatedAt: files.reduce((latest, file) => Math.max(latest, file.mtimeMs), 0) }
+  const reconcileBlocked = shrinkBlocked ? `JSONL source shrank from ${previousCounts.files} files/${previousCounts.bytes} bytes to ${files.length} files/${currentBytes} bytes` : undefined
+  return { records, sessionRecords: records, checkpoint: { ...checkpoint, ...(reconcileBlocked ? { reconcileBlocked } : {}) }, complete: complete && !shrinkBlocked, hasMore: !complete, reconcilePrefixes, sourceUpdatedAt: files.reduce((latest, file) => Math.max(latest, file.mtimeMs), 0), ...(reconcileBlocked ? { reconcileBlocked } : {}) }
 }
 
 async function listJsonlFiles(root: string): Promise<JsonlFile[]> {

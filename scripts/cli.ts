@@ -70,7 +70,8 @@ if (command === "sync") {
   if (action === "uninstall") process.exit(await syncUninstall())
   if (action === "prune") process.exit(await syncPrune(process.argv.includes("--yes"), process.argv.includes("--missing-directories"), process.argv.includes("--blank-directories")))
   if (action === "compact") process.exit(await syncCompact(process.argv.includes("--yes")))
-  console.error("Usage: better-compact sync setup [--url URL|--url-stdin] [--allow-insecure-remote] [--install] | run [--once] | status | migrate | install | uninstall | prune (--missing-directories|--blank-directories) --yes | compact --yes")
+  if (action === "reconcile") process.exit(await syncReconcile())
+  console.error("Usage: better-compact sync setup [--url URL|--url-stdin] [--allow-insecure-remote] [--install] | run [--once] | status | migrate | install | uninstall | prune (--missing-directories|--blank-directories) --yes | compact --yes | reconcile")
   process.exit(2)
 }
 if (command === "rag") {
@@ -105,6 +106,7 @@ Usage:
   better-compact sync install|uninstall Manage a systemd user service
   better-compact sync prune (--missing-directories|--blank-directories) --yes Delete local Codex files while retaining remote rows
   better-compact sync compact --yes  Remove acknowledged local cache rows and compact SQLite
+  better-compact sync reconcile    Force the next OpenCode source pass to rebuild a complete snapshot
   better-compact rag setup         Enable the BGE-small embedding worker and configure its model/runtime
   better-compact rag run [--once]  Run the streaming BGE-small worker in the foreground
   better-compact rag status        Show model, row, dimension, and size metadata
@@ -302,6 +304,7 @@ async function syncRun(once: boolean, singlePass = false) {
       try {
         const progress = await syncPass(config, controller.signal)
         if (progress.pending === 0) await compactStateIfIdle()
+        if (progress.failed && (once || singlePass)) return 1
         if (stopping || singlePass || (once && (!databaseURL || (!progress.progress && progress.pending === 0)))) return 0
       } catch (error) {
         if (stopping) return 0
@@ -316,6 +319,24 @@ async function syncRun(once: boolean, singlePass = false) {
     process.off("SIGINT", stop)
     await rm(lock, { recursive: true, force: true })
   }
+}
+
+async function syncReconcile() {
+  const lock = `${paths.state}.lock`
+  const lockPID = await readFile(path.join(lock, "pid"), "utf8").catch(() => "")
+  if (/^\d+$/.test(lockPID.trim())) {
+    try { process.kill(Number(lockPID.trim()), 0); console.error("sync is running; stop better-compact-sync.service before forcing a reconcile"); return 2 } catch {}
+  }
+  const config = await loadConfig(paths)
+  const sourceIDs = config.sources
+    .filter((source) => source.kind === "opencode-v1-sqlite" || source.kind === "opencode-v1-sessions")
+    .map((source) => createHash("sha256").update(`${source.kind}\n${path.resolve(source.database.replace(/^~(?=\/|$)/, process.env.HOME ?? "."))}`).digest("hex").slice(0, 32))
+  const state = await openSyncState(paths.state)
+  try {
+    const changed = state.forceReconcile(sourceIDs)
+    console.log(`scheduled ${changed} OpenCode source${changed === 1 ? "" : "s"} for a complete reconcile`)
+    return 0
+  } finally { state.close() }
 }
 
 async function compactStateIfIdle() {
@@ -338,14 +359,16 @@ async function compactStateIfIdle() {
 async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>, signal?: AbortSignal) {
   const state = await openSyncState(paths.state)
   let progressed = false
+  let failed = false
   try {
     state.releaseAcknowledgedRecords(100_000)
     state.purgePayloads(config.sync.retention_days * 24 * 60 * 60 * 1000)
     const installation = state.ensureDefaultInstallation()
     for (const source of config.sources) {
       if (signal?.aborted) break
-      if (source.kind !== "opencode-v1-sqlite" && source.kind !== "opencode-v1-sessions" && source.kind !== "codex-jsonl" && source.kind !== "codex-jsonl-sessions" && source.kind !== "pi-jsonl") throw new Error(`unsupported source adapter: ${source.kind}`)
-      const filename = path.resolve(source.database.replace(/^~(?=\/|$)/, process.env.HOME ?? "."))
+      try {
+        if (source.kind !== "opencode-v1-sqlite" && source.kind !== "opencode-v1-sessions" && source.kind !== "codex-jsonl" && source.kind !== "codex-jsonl-sessions" && source.kind !== "pi-jsonl") throw new Error(`unsupported source adapter: ${source.kind}`)
+        const filename = path.resolve(source.database.replace(/^~(?=\/|$)/, process.env.HOME ?? "."))
       const sourceID = createHash("sha256").update(`${source.kind}\n${filename}`).digest("hex").slice(0, 32)
       const inspection = source.kind === "opencode-v1-sqlite" || source.kind === "opencode-v1-sessions" ? inspectOpenCodeV1(filename) : await inspectJsonl(filename)
       const sourceIncarnation = state.sourceIncarnation(sourceID)
@@ -356,16 +379,19 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>, signal?:
       const checkpoint = state.checkpoint(sourceID)
       const result = backpressure
         ? emptyDiscovery(source.kind, checkpoint)
-        : await discoverSource(source.kind, filename, sourceID, checkpoint, config.sync.include_parts, config.sync.include_tool_output, config.sync.batch_size * 5, signal, config.sync.keep_remote_on_missing)
-      const snapshot = source.kind === "opencode-v1-sqlite" || source.kind === "opencode-v1-sessions"
+      : await discoverSource(source.kind, filename, sourceID, checkpoint, config.sync.include_parts, config.sync.include_tool_output, config.sync.batch_size * 5, signal, config.sync.keep_remote_on_missing, config.sync.allow_source_shrink)
+      if ("reconcileBlocked" in result && result.reconcileBlocked) console.error(`warning: ${filename}: ${result.reconcileBlocked}; retaining remote rows`)
+      const snapshot = source.kind === "opencode-v1-sqlite"
         ? { complete: result.complete, recordKinds: ["session", "message", "part", "todo"] }
+        : source.kind === "opencode-v1-sessions"
+          ? { complete: result.complete, recordKinds: ["session"] }
         : { prefixes: result.reconcilePrefixes }
       state.enqueue(result.records, sourceID, "messages", result.checkpoint, "postgres", snapshot, config.sync.max_outbox_bytes)
       progressed = progressed || result.records.length > 0 || result.reconcilePrefixes.length > 0
       console.log(`staged ${result.records.length} records from ${filename}${result.complete ? " (reconciled)" : result.hasMore ? " (more pending)" : " (unchanged)"}`)
       if (signal?.aborted) break
       const databaseURL = databaseURLFor(config)
-      if (databaseURL) {
+        if (databaseURL) {
         assertPostgresTLS(databaseURL, config.sync.allow_insecure_remote)
         const client = openPostgres(databaseURL)
         let rows: ReturnType<typeof state.claim> = []
@@ -403,9 +429,13 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>, signal?:
         } finally {
           await client.close()
         }
+        }
+      } catch (error) {
+        failed = true
+        console.error(`warning: sync source ${source.kind} failed: ${error instanceof Error ? error.message : String(error)}`)
       }
     }
-    return { progress: progressed, pending: state.pendingCount() }
+    return { progress: progressed, pending: state.pendingCount(), failed }
   } finally { state.close() }
 }
 
@@ -473,14 +503,14 @@ function emptyDiscovery(kind: string, checkpoint: Record<string, unknown> | unde
   return { records: [], sessionRecords: [], checkpoint: checkpoint as JsonlCheckpoint ?? { version: 1, files: {} }, complete: false, hasMore: true, reconcilePrefixes: [], sourceUpdatedAt: 0 }
 }
 
-async function discoverSource(kind: string, filename: string, sourceID: string, checkpoint: Record<string, unknown> | undefined, includeParts: boolean, includeToolOutput: boolean, maxRecords: number, signal?: AbortSignal, keepRemoteOnMissing = false) {
+async function discoverSource(kind: string, filename: string, sourceID: string, checkpoint: Record<string, unknown> | undefined, includeParts: boolean, includeToolOutput: boolean, maxRecords: number, signal?: AbortSignal, keepRemoteOnMissing = false, allowSourceShrink = false) {
   if (kind === "opencode-v1-sqlite") {
-    const result = discoverOpenCodeV1(filename, sourceID, checkpoint as OpenCodeV1Checkpoint | undefined, includeParts, includeToolOutput)
+    const result = discoverOpenCodeV1(filename, sourceID, checkpoint as OpenCodeV1Checkpoint | undefined, includeParts, includeToolOutput, allowSourceShrink)
     return { ...result, sessionRecords: [], hasMore: false, reconcilePrefixes: [] as never[], sourceUpdatedAt: result.checkpoint.sourceUpdatedAt }
   }
-  if (kind === "opencode-v1-sessions") return discoverOpenCodeV1Sessions(filename, sourceID, checkpoint as OpenCodeV1Checkpoint | undefined)
-  if (kind === "codex-jsonl" || kind === "pi-jsonl") return discoverJsonl(filename, sourceID, kind, checkpoint as JsonlCheckpoint | undefined, includeToolOutput, maxRecords, signal, keepRemoteOnMissing)
-  if (kind === "codex-jsonl-sessions") return discoverJsonlSessions(filename, sourceID, kind, checkpoint as JsonlSessionCheckpoint | undefined, signal, keepRemoteOnMissing)
+  if (kind === "opencode-v1-sessions") return discoverOpenCodeV1Sessions(filename, sourceID, checkpoint as OpenCodeV1Checkpoint | undefined, allowSourceShrink)
+  if (kind === "codex-jsonl" || kind === "pi-jsonl") return discoverJsonl(filename, sourceID, kind, checkpoint as JsonlCheckpoint | undefined, includeToolOutput, maxRecords, signal, keepRemoteOnMissing, allowSourceShrink)
+  if (kind === "codex-jsonl-sessions") return discoverJsonlSessions(filename, sourceID, kind, checkpoint as JsonlSessionCheckpoint | undefined, signal, keepRemoteOnMissing, allowSourceShrink)
   throw new Error(`unsupported source adapter: ${kind}`)
 }
 

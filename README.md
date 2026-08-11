@@ -70,6 +70,7 @@ better-compact sync install
 better-compact sync prune --missing-directories --yes
 better-compact sync prune --blank-directories --yes
 better-compact sync compact --yes
+better-compact sync reconcile
 better-compact rag migrate
 better-compact rag status
 better-compact installation reset --yes
@@ -85,6 +86,8 @@ The generated wrapper points at the persistent checkout and also falls back to t
 `doctor` checks the managed checkout, both OpenCode configuration surfaces, the OpenCode and Bun executables, and performs a read-only SQLite probe. `update` runs the same rollback-safe checkout/configuration transaction as the installer. If Bun was bootstrapped temporarily during installation, install Bun separately or invoke the CLI with `OPENCODE_SAFE_COMPACTION_BUN=/path/to/bun`.
 
 The sync runner reads configured OpenCode V1 SQLite, Codex JSONL, and Pi JSONL sources read-only, stages redacted records in the stable local state database, and uploads bounded batches when the configured Postgres environment variable is present. The `*-sessions` adapters provide a fast, session-only index; pair them with the full-history adapters when message and part records are also wanted. `--once` drains discovery and the local outbox until no work remains; without it, the runner continues polling. Postgres failures leave leased outbox rows for retry and do not affect OpenCode. JSONL discovery is resumable by file and byte/line cursor, and completed files reconcile only their own natural-key prefix. Acknowledged payloads are released from local SQLite immediately; the durable local state is limited to cursors, source counters, revisions, and the currently pending outbox. `better-compact sync status` reports the staged cache, and `better-compact sync compact --yes` removes any legacy acknowledged cache rows and runs SQLite vacuum while preserving unsent rows.
+
+Completed source snapshots are guarded against destructive partial reads. An OpenCode database whose session/message/part/todo counts shrink, or a JSONL inventory whose files/bytes shrink, is uploaded as ordinary updates but is not allowed to emit tombstones until a complete stable snapshot is observed. This protects the remote history when a database is being replaced, a mount is briefly empty, or a writer exposes a partial copy. The worker logs a warning and retries automatically. Intentional source deletion is explicit: use `sync.keep_remote_on_missing=true` for retained remote history, or set `sync.allow_source_shrink=true` only when the corresponding deletion should be propagated. After repairing an already damaged remote projection, stop the worker and run `better-compact sync reconcile`; it marks the OpenCode checkpoints for a complete, forced rebuild without discarding the trusted count baseline, then start the worker again.
 
 Use `better-compact sync setup --url-stdin` to configure a server without putting the database password in shell history:
 
@@ -119,7 +122,7 @@ Example source configuration:
 ```json
 {
   "version": 1,
-  "sync": { "enabled": true, "allow_insecure_remote": false, "keep_remote_on_missing": false },
+  "sync": { "enabled": true, "allow_insecure_remote": false, "keep_remote_on_missing": false, "allow_source_shrink": false },
   "sources": [
     { "kind": "opencode-v1-sqlite", "database": "~/.local/share/opencode/opencode.db" },
     { "kind": "opencode-v1-sessions", "database": "~/.local/share/opencode/opencode.db" },
