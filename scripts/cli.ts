@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { access, chmod, lstat, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
-import { readFileSync } from "node:fs"
+import { existsSync, readFileSync } from "node:fs"
 import { spawn } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
 import path from "node:path"
@@ -77,7 +77,13 @@ if (command === "rag") {
   const action = process.argv[3]
   if (action === "migrate") process.exit(await ragMigrate())
   if (action === "status") process.exit(await ragStatus())
-  console.error("Usage: better-compact rag migrate | status")
+  if (action === "setup") process.exit(await ragSetup())
+  if (action === "run") process.exit(await ragRun(process.argv.includes("--once")))
+  if (action === "install") process.exit(await ragInstall())
+  if (action === "uninstall") process.exit(await ragUninstall())
+  if (action === "tunnel" && process.argv[4] === "install") process.exit(await ragTunnelInstall(await loadConfig(paths)))
+  if (action === "tunnel" && process.argv[4] === "uninstall") process.exit(await ragTunnelUninstall())
+  console.error("Usage: better-compact rag setup [--model-path PATH] [--python PATH] [--ssh-host HOST --ssh-user USER] [--install] | run [--once] | status | migrate | install | uninstall | tunnel install|uninstall")
   process.exit(2)
 }
 console.error(`Unknown command: ${command}`)
@@ -99,8 +105,13 @@ Usage:
   better-compact sync install|uninstall Manage a systemd user service
   better-compact sync prune (--missing-directories|--blank-directories) --yes Delete local Codex files while retaining remote rows
   better-compact sync compact --yes  Remove acknowledged local cache rows and compact SQLite
-  better-compact rag migrate       Create the additive 384-dimensional RAG projection (admin credentials)
+  better-compact rag setup         Enable the BGE-small embedding worker and configure its model/runtime
+  better-compact rag run [--once]  Run the streaming BGE-small worker in the foreground
   better-compact rag status        Show model, row, dimension, and size metadata
+  better-compact rag migrate       Create the additive 384-dimensional RAG projection (admin credentials)
+  better-compact rag install       Install and start the per-user embedding service
+  better-compact rag uninstall     Stop and remove the per-user embedding service
+  better-compact rag tunnel install|uninstall  Manage the encrypted PostgreSQL SSH tunnel
   better-compact installation reset|adopt --yes  Explicitly recover or replace sync identity
   better-compact help     Show this help
 
@@ -711,7 +722,9 @@ async function ragMigrate() {
 
 async function ragStatus() {
   const config = await loadConfig(paths)
-  const databaseURL = databaseURLFor(config)
+  console.log(`rag worker state: ${path.join(paths.home, "rag-state.json")}`)
+  console.log(`rag configuration: ${config.rag.enabled ? "enabled" : "disabled"}, model=${config.rag.model}, chunk=${config.rag.chunk_tokens}/${config.rag.overlap}`)
+  const databaseURL = ragDatabaseURLFor(config)
   if (!databaseURL) {
     console.error("missing the configured Postgres writer URL")
     return 2
@@ -741,6 +754,188 @@ async function ragStatus() {
   } finally {
     await client.close()
   }
+}
+
+async function ragSetup() {
+  try {
+    const existing = await loadConfig(paths)
+    const modelPath = flagValue("--model-path")
+    const python = flagValue("--python")
+    const model = flagValue("--model")
+    const sshHost = flagValue("--ssh-host")
+    const sshUser = flagValue("--ssh-user")
+    const sshLocalPort = flagValue("--ssh-local-port")
+    const sshRemoteHost = flagValue("--ssh-remote-host")
+    const sshRemotePort = flagValue("--ssh-remote-port")
+    if ([modelPath, python, model, sshHost, sshUser, sshLocalPort, sshRemoteHost, sshRemotePort].some((value) => value?.startsWith("--"))) throw new Error("RAG option values must follow their flags")
+    if ((sshHost && !sshUser) || (sshUser && !sshHost)) throw new Error("--ssh-host and --ssh-user must be supplied together")
+    const rag = {
+      ...existing.rag,
+      enabled: true,
+      ...(modelPath ? { model_path: path.resolve(modelPath) } : {}),
+      ...(python ? { python: path.resolve(python) } : {}),
+      ...(model ? { model } : {}),
+      ...(sshHost ? { ssh_host: sshHost, ssh_user: sshUser ?? "", database_url_env: "BETTER_COMPACT_RAG_DATABASE_URL" } : {}),
+      ...(sshLocalPort ? { ssh_local_port: Number(sshLocalPort) } : {}),
+      ...(sshRemoteHost ? { ssh_remote_host: sshRemoteHost } : {}),
+      ...(sshRemotePort ? { ssh_remote_port: Number(sshRemotePort) } : {}),
+    }
+    await saveConfig({ ...existing, rag }, paths)
+    if (sshHost) {
+      const sourceURL = databaseURLFor(existing)
+      if (!sourceURL) throw new Error("an existing sync database URL is required to derive the tunneled RAG URL")
+      const localURL = new URL(sourceURL)
+      localURL.hostname = "127.0.0.1"
+      localURL.port = String(rag.ssh_local_port)
+      localURL.searchParams.set("sslmode", "disable")
+      await writeRagEnvironment(localURL.toString(), rag.database_url_env)
+    }
+    console.log(`enabled RAG worker in ${paths.config}`)
+    if (rag.model_path) console.log(`RAG model path: ${rag.model_path}`)
+    if (rag.python) console.log(`RAG Python runtime: ${rag.python}`)
+    if (process.argv.includes("--install")) return ragInstall()
+    console.log("next: run better-compact rag migrate once with admin credentials, then better-compact rag install")
+    return 0
+  } catch (error) {
+    console.error(`rag setup failed: ${error instanceof Error ? error.message : String(error)}`)
+    return 2
+  }
+}
+
+async function ragRun(once: boolean) {
+  const config = await loadConfig(paths)
+  if (!config.rag.enabled) {
+    console.error("RAG is disabled; run better-compact rag setup first")
+    return 2
+  }
+  let worker: string
+  try { worker = ragWorkerPath() } catch (error) {
+    console.error(`RAG worker is unavailable: ${error instanceof Error ? error.message : String(error)}`)
+    return 2
+  }
+  const python = ragPython(config)
+  if (!path.isAbsolute(python)) console.error(`warning: RAG Python runtime is not absolute; foreground PATH resolution will be used: ${python}`)
+  const args = [worker, "--config", paths.config, "--state", path.join(paths.home, "rag-state.json")]
+  if (once) args.push("--once")
+  const databaseURL = ragDatabaseURLFor(config)
+  const environment: NodeJS.ProcessEnv = { ...process.env, PYTHONUNBUFFERED: "1" }
+  if (databaseURL) environment[config.rag.database_url_env] = databaseURL
+  return run(python, args, environment)
+}
+
+async function ragInstall() {
+  const config = await loadConfig(paths)
+  if (!config.rag.enabled) {
+    console.error("RAG is disabled; run better-compact rag setup first")
+    return 2
+  }
+  if (process.platform !== "linux") {
+    console.error("RAG install currently supports systemd user services on Linux; use better-compact rag run on other platforms")
+    return 2
+  }
+  let worker: string
+  try { worker = ragWorkerPath() } catch (error) {
+    console.error(`RAG worker is unavailable: ${error instanceof Error ? error.message : String(error)}`)
+    return 2
+  }
+  const python = ragPython(config)
+  if (!path.isAbsolute(python)) {
+    console.error("RAG service requires an absolute Python runtime; pass --python /absolute/path during rag setup")
+    return 2
+  }
+  if (!(await commandWorks(python, ["-c", "import psycopg, sentence_transformers"]))) {
+    console.error(`RAG Python runtime is missing psycopg or sentence-transformers: ${python}`)
+    return 2
+  }
+  const serviceDirectory = path.join(process.env.XDG_CONFIG_HOME ?? path.join(process.env.HOME ?? ".", ".config"), "systemd", "user")
+  const service = path.join(serviceDirectory, "better-compact-rag.service")
+  await mkdir(serviceDirectory, { recursive: true, mode: 0o700 })
+  const environmentFile = await writeRagEnvironment(ragDatabaseURLFor(config), config.rag.database_url_env)
+  if (config.rag.ssh_host) {
+    const tunnel = await ragTunnelInstall(config)
+    if (tunnel !== 0) return tunnel
+  }
+  const command = `${quoteSystemd(python)} ${quoteSystemd(worker)} --config ${quoteSystemd(paths.config)} --state ${quoteSystemd(path.join(paths.home, "rag-state.json"))}`
+  const tunnelDependency = config.rag.ssh_host ? "After=better-compact-rag-tunnel.service\nWants=better-compact-rag-tunnel.service\n" : ""
+  await writeFile(`${service}.tmp-${process.pid}`, `[Unit]\nDescription=Better Compact BGE-small RAG embeddings\nAfter=better-compact-sync.service\nWants=better-compact-sync.service\n${tunnelDependency}\n[Service]\nExecStart=${command}\n${environmentFile ? `EnvironmentFile=-${systemdEnvironmentFilePath(environmentFile)}\n` : ""}Environment=PYTHONUNBUFFERED=1\nRestart=on-failure\nRestartSec=15\nNice=10\n\n[Install]\nWantedBy=default.target\n`, { mode: 0o644 })
+  await rename(`${service}.tmp-${process.pid}`, service)
+  const reload = await run("systemctl", ["--user", "daemon-reload"], process.env)
+  if (reload !== 0) return reload
+  const enabled = await run("systemctl", ["--user", "enable", "--now", "better-compact-rag.service"], process.env)
+  if (enabled === 0) console.log(`installed ${service}`)
+  return enabled
+}
+
+async function ragUninstall() {
+  if (process.platform !== "linux") {
+    console.error("RAG uninstall currently supports systemd user services on Linux")
+    return 2
+  }
+  const service = path.join(process.env.XDG_CONFIG_HOME ?? path.join(process.env.HOME ?? ".", ".config"), "systemd", "user", "better-compact-rag.service")
+  await run("systemctl", ["--user", "disable", "--now", "better-compact-rag.service"], process.env)
+  await rm(service, { force: true })
+  await run("systemctl", ["--user", "daemon-reload"], process.env)
+  await ragTunnelUninstall()
+  console.log(`removed ${service}`)
+  return 0
+}
+
+function ragPython(config: Awaited<ReturnType<typeof loadConfig>>) {
+  return config.rag.python || process.env.BETTER_COMPACT_RAG_PYTHON || "python3"
+}
+
+function ragDatabaseURLFor(config: Awaited<ReturnType<typeof loadConfig>>) {
+  return process.env[config.rag.database_url_env] || ragEnvironmentValue(config.rag.database_url_env) || databaseURLFor(config)
+}
+
+function ragWorkerPath() {
+  const executable = path.dirname(process.argv[1] ?? ".")
+  const candidates = [
+    path.join(executable, "rag_worker.py"),
+    path.resolve(executable, "..", "scripts", "rag_worker.py"),
+    path.join(installDir, "scripts", "rag_worker.py"),
+  ]
+  const worker = candidates.find((candidate) => existsSync(candidate))
+  if (!worker) throw new Error("scripts/rag_worker.py was not included in this installation")
+  return worker
+}
+
+async function ragTunnelInstall(config: Awaited<ReturnType<typeof loadConfig>>) {
+  if (!config.rag.ssh_host) return 0
+  if (process.platform !== "linux") {
+    console.error("RAG SSH tunnel installation currently supports systemd user services on Linux")
+    return 2
+  }
+  if (!config.rag.ssh_user) {
+    console.error("RAG SSH tunnel requires rag.ssh_user")
+    return 2
+  }
+  const ssh = process.env.BETTER_COMPACT_RAG_SSH ?? "/usr/bin/ssh"
+  if (!path.isAbsolute(ssh) || !(await exists(ssh))) {
+    console.error(`RAG SSH executable is unavailable: ${ssh}`)
+    return 2
+  }
+  const serviceDirectory = path.join(process.env.XDG_CONFIG_HOME ?? path.join(process.env.HOME ?? ".", ".config"), "systemd", "user")
+  const service = path.join(serviceDirectory, "better-compact-rag-tunnel.service")
+  const forward = `127.0.0.1:${config.rag.ssh_local_port}:${config.rag.ssh_remote_host}:${config.rag.ssh_remote_port}`
+  const target = `${config.rag.ssh_user}@${config.rag.ssh_host}`
+  await mkdir(serviceDirectory, { recursive: true, mode: 0o700 })
+  await writeFile(`${service}.tmp-${process.pid}`, `[Unit]\nDescription=Better Compact encrypted PostgreSQL tunnel\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nExecStart=${quoteSystemd(ssh)} -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -L ${quoteSystemd(forward)} ${quoteSystemd(target)}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n`, { mode: 0o600 })
+  await rename(`${service}.tmp-${process.pid}`, service)
+  const reload = await run("systemctl", ["--user", "daemon-reload"], process.env)
+  if (reload !== 0) return reload
+  const enabled = await run("systemctl", ["--user", "enable", "--now", "better-compact-rag-tunnel.service"], process.env)
+  if (enabled === 0) console.log(`installed ${service}`)
+  return enabled
+}
+
+async function ragTunnelUninstall() {
+  if (process.platform !== "linux") return 0
+  const service = path.join(process.env.XDG_CONFIG_HOME ?? path.join(process.env.HOME ?? ".", ".config"), "systemd", "user", "better-compact-rag-tunnel.service")
+  await run("systemctl", ["--user", "disable", "--now", "better-compact-rag-tunnel.service"], process.env)
+  await rm(service, { force: true })
+  await run("systemctl", ["--user", "daemon-reload"], process.env)
+  return 0
 }
 
 async function installationReset(confirmed: boolean) {
@@ -866,10 +1061,16 @@ async function writeSyncEnvironment(databaseURL?: string, allowInsecureRemote?: 
 }
 
 function syncEnvironmentValue(name: string) {
+  return environmentValue(path.join(paths.home, "sync.env"), name)
+}
+
+function ragEnvironmentValue(name: string) {
+  return environmentValue(path.join(paths.home, "rag.env"), name)
+}
+
+function environmentValue(file: string, name: string) {
   try {
-    const line = readFileSync(path.join(paths.home, "sync.env"), "utf8")
-      .split(/\r?\n/)
-      .find((entry) => entry.startsWith(`${name}=`))
+    const line = readFileSync(file, "utf8").split(/\r?\n/).find((entry) => entry.startsWith(`${name}=`))
     if (!line) return undefined
     const value = line.slice(name.length + 1)
     if (value.startsWith('"') && value.endsWith('"')) {
@@ -880,6 +1081,23 @@ function syncEnvironmentValue(name: string) {
     }
     return value
   } catch { return undefined }
+}
+
+async function writeRagEnvironment(databaseURL: string | undefined, name: string) {
+  const config = await loadConfig(paths)
+  if (!databaseURL) return undefined
+  assertPostgresURL(databaseURL, config.sync.allow_insecure_remote)
+  await mkdir(paths.home, { recursive: true, mode: 0o700 })
+  await chmod(paths.home, 0o700)
+  const file = path.join(paths.home, "rag.env")
+  const temporary = `${file}.tmp-${process.pid}`
+  try {
+    await writeFile(temporary, `${name}=${quoteSystemd(databaseURL)}\n`, { mode: 0o600 })
+    await chmod(temporary, 0o600)
+    await rename(temporary, file)
+  } finally { await rm(temporary, { force: true }) }
+  await chmod(file, 0o600)
+  return file
 }
 
 function xml(value: string) {

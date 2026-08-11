@@ -47,6 +47,7 @@
     "src",
     "scripts/configure.ts",
     "scripts/cli.ts",
+    "scripts/rag_worker.py",
     "db/migrations",
     "LICENSE",
     "README.md"

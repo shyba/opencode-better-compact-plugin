@@ -103,7 +103,16 @@ If local Codex history has become large, stop the sync service and run `better-c
 
 Remote Postgres URLs must use certificate-verifying TLS (`sslmode=verify-full`) unless the host is loopback. If a trusted LAN server genuinely has no TLS, `sync.allow_insecure_remote=true` is an explicit opt-in and emits a warning; it must not be enabled on an untrusted network. When no URL variable is set, the runner can compose one from `POSTGRES_*` plus `DB_WRITER_*` environment variables. Run `better-compact sync migrate` once with explicit admin credentials before starting the worker; the long-running sync process is deliberately DDL-free and uses only writer privileges. Credentials stay in the environment or a separate mode-`0600` service environment file; they are never written to the JSON configuration. `better-compact sync install` installs the opt-in per-user service and preserves the same local state/outbox across restarts.
 
-The optional RAG projection is separate from the existing 4096-dimensional Qwen table. Run `better-compact rag migrate` once with the admin environment variables to create `rag.embedding_current_384`, then use `better-compact rag status` to inspect model, dimension, row, and table-size metadata. The evaluated first-delivery default is `BAAI/bge-small-en-v1.5` (384 dimensions, 512-token chunks with 64-token overlap, fixed 0.8 vector / 0.2 lexical retrieval). The live table currently contains the earlier 128-token pilot; changing its chunking requires a separately reviewed embedding load. Embedding generation remains an offline, separately reviewed job and is never performed on the compaction request path. See `aidocs/rag_embedding_pilot.md` for the benchmark protocol, evidence, and storage gate.
+The optional RAG projection is separate from the existing 4096-dimensional Qwen table. Run `better-compact rag migrate` once with the admin environment variables to create `rag.embedding_current_384`, then use `better-compact rag status` to inspect model, dimension, row, and table-size metadata. The evaluated first-delivery default is `BAAI/bge-small-en-v1.5` (384 dimensions, 512-token chunks with 64-token overlap, fixed 0.8 vector / 0.2 lexical retrieval). The live table currently contains the earlier 128-token pilot; changing its chunking requires a separately reviewed embedding load. Embedding generation remains off the compaction request path and is performed by a bounded streaming worker:
+
+```sh
+better-compact rag setup --model-path /absolute/path/to/bge-small-en-v1.5 --python /absolute/path/to/rag-venv/bin/python3
+better-compact rag migrate       # once, with admin credentials
+better-compact rag install       # opt-in systemd user service
+better-compact rag status
+```
+
+The worker reads only synced `opencode-v1-sqlite` rows, embeds missing 512/64 chunks in memory-sized batches, and writes append-only rows to the existing `rag.document_source`, `rag.chunk`, `rag.embedding_event`, and `rag.embedding_current_384` tables. It persists only a small cursor file, keeps no transcript staging file, and can be run in the foreground with `better-compact rag run --once`. The service requires a Python environment containing `sentence-transformers`, `torch`, and `psycopg[binary]`; use a durable virtualenv rather than `/tmp` for a long-lived installation. Remote PostgreSQL must use certificate-verifying TLS, or the explicit trusted-LAN insecure opt-in already required by sync. See `aidocs/rag_embedding_pilot.md` for the benchmark protocol and storage gate.
 
 Example source configuration:
 
