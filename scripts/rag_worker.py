@@ -224,9 +224,19 @@ def main() -> int:
         print(f"rag worker: started run {run_id}", flush=True)
         while not stop:
             try:
-                rows = fetch_candidates(connection, state, message_batch, chunker_version, model_name, lookback_seconds)
-                if not rows and state.get("caught_up"):
-                    rows = fetch_candidates(connection, state, message_batch, chunker_version, model_name, lookback_seconds, full_sweep=True)
+                cursor_rows: list[dict[str, Any]] = []
+                if state.get("caught_up"):
+                    rows = fetch_candidates(connection, state, message_batch, chunker_version, model_name, lookback_seconds)
+                    if not rows:
+                        rows = fetch_candidates(connection, state, message_batch, chunker_version, model_name, lookback_seconds, full_sweep=True)
+                        cursor_rows = rows
+                else:
+                    live_limit = max(1, message_batch // 4)
+                    backlog_limit = max(1, message_batch - live_limit)
+                    live_rows = fetch_candidates(connection, {"caught_up": True}, live_limit, chunker_version, model_name, lookback_seconds)
+                    backlog_rows = fetch_candidates(connection, state, backlog_limit, chunker_version, model_name, lookback_seconds)
+                    rows = merge_candidates(live_rows, backlog_rows)
+                    cursor_rows = backlog_rows
                 if not rows:
                     if not state.get("caught_up"):
                         state["caught_up"] = True
@@ -238,8 +248,9 @@ def main() -> int:
                     continue
                 processed, embedded = embed_batch(connection, rows, model, tokenizer, chunk_tokens, overlap, chunker_version, model_name, embed_batch_size, run_id)
                 if processed:
-                    state["cursor"] = cursor_from_row(rows[processed - 1])
-                    state["caught_up"] = False
+                    if cursor_rows and processed == len(rows):
+                        state["cursor"] = cursor_from_row(cursor_rows[-1])
+                        state["caught_up"] = False
                     state["last_progress_at"] = utc_now()
                     save_state(args.state, state)
                     print(f"rag worker: processed_messages={processed} embedded_chunks={embedded}", flush=True)
@@ -314,6 +325,19 @@ def fetch_candidates(connection: psycopg.Connection, state: dict[str, Any], limi
     with connection.cursor() as cursor_handle:
         cursor_handle.execute(MESSAGE_QUERY, parameters)
         return list(cursor_handle.fetchall())
+
+
+def merge_candidates(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str, str]] = set()
+    for group in groups:
+        for row in group:
+            key = (str(row["installation_id"]), str(row["source_id"]), str(row["session_id"]), str(row["message_id"]), str(row["content_hash"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(row)
+    return result
 
 
 def embed_batch(connection: psycopg.Connection, rows: list[dict[str, Any]], model: SentenceTransformer, tokenizer: Any, chunk_tokens: int, overlap: int, chunker_version: str, model_name: str, batch_size: int, run_id: uuid.UUID) -> tuple[int, int]:
