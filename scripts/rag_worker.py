@@ -366,6 +366,9 @@ def embed_batch(connection: psycopg.Connection, rows: list[dict[str, Any]], mode
         if not candidates:
             connection.commit()
             return len(rows), 0
+    # Do not keep the discovery snapshot open while CPU inference runs. The
+    # vector writes below use a fresh short transaction per embedding batch.
+    connection.commit()
     embedded = 0
     for start in range(0, len(candidates), batch_size):
         batch = candidates[start : start + batch_size]
