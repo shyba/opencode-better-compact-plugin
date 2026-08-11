@@ -122,7 +122,7 @@ def ranking_metrics(scores: np.ndarray, queries: list[tuple[str, tuple[str, int]
     hits = {1: 0, 3: 0, 5: 0}
     reciprocal_ranks: list[float] = []
     for row, (_, target) in zip(scores, queries):
-        order = np.argsort(-row)
+        order = np.argsort(-row, kind="stable")
         ranks = [
             position + 1
             for position, document_index in enumerate(order)
@@ -185,7 +185,7 @@ def evaluate_tfidf(documents: list[Document], queries: list[tuple[str, tuple[str
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("corpus", type=Path)
-    parser.add_argument("--model", default="jinaai/jina-embeddings-v2-base-code")
+    parser.add_argument("--model", default="BAAI/bge-small-en-v1.5")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--threads", type=int, default=16)

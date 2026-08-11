@@ -19,8 +19,11 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import re
+import tempfile
 import time
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,13 +33,14 @@ from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from transformers import logging as transformers_logging
 
-from rag_pilot import Document, Record, build_documents, crop_query, load_records, ranking_metrics
+from rag_pilot import Document, Record, build_documents, crop_query, load_records
 
 
 ACKNOWLEDGEMENT = re.compile(
     r"^(?:ok(?:ay)?|yes|no|continue|go ahead|do it|see|hm+|hmm+|blank|nice|cool|thanks?)(?:[,.!… ]+(?:this|that) one)?[.!…]*$",
     re.IGNORECASE,
 )
+CACHE_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -57,9 +61,9 @@ class Candidate:
     semantic_scores: np.ndarray
     lexical_scores: np.ndarray
     embedding_seconds: float
+    cache_hit: bool
     assistant_tokens: int
     document_tokens: int
-    tokenizer: object
 
 
 def normalize_query(text: str) -> str:
@@ -135,17 +139,42 @@ def minmax_rows(scores: np.ndarray) -> np.ndarray:
     return (scores - low) / np.maximum(high - low, 1e-9)
 
 
-def query_pairs(queries: list[Query], indexes: list[int], tokenizer: object, limit: int) -> list[tuple[str, tuple[str, int]]]:
-    tokenizer.model_max_length = 1_000_000
-    return [
-        (crop_query(queries[index].text, tokenizer, limit), queries[index].target)
-        for index in indexes
-    ]
+def metrics_for(scores: np.ndarray, queries: list[Query], indexes: list[int], documents: list[Document]) -> dict[str, float | int]:
+    """Measure the first relevant chunk without sorting every document row.
 
-
-def metrics_for(scores: np.ndarray, queries: list[Query], indexes: list[int], documents: list[Document], tokenizer: object, limit: int) -> dict[str, float | int]:
-    selected = query_pairs(queries, indexes, tokenizer, limit)
-    return ranking_metrics(scores[indexes], selected, documents)
+    The previous pilot used a full argsort for every query.  This equivalent
+    stable-rank calculation is linear in the document count and keeps the
+    benchmark usable on a larger local corpus.  Ties follow document order,
+    matching the intended deterministic ranking contract.
+    """
+    target_documents: dict[tuple[str, int], list[int]] = {}
+    for index, document in enumerate(documents):
+        target_documents.setdefault((document.session_id, document.record_ordinal), []).append(index)
+    hits = {1: 0, 3: 0, 5: 0}
+    reciprocal_ranks: list[float] = []
+    for query_index in indexes:
+        target = target_documents.get(queries[query_index].target, [])
+        if not target:
+            reciprocal_ranks.append(0.0)
+            continue
+        best = float(np.max(scores[query_index, target]))
+        first_target = min(index for index in target if scores[query_index, index] == best)
+        rank = 1 + int(np.count_nonzero(scores[query_index] > best))
+        rank += int(np.count_nonzero(scores[query_index, :first_target] == best))
+        reciprocal_ranks.append(1.0 / rank)
+        for cutoff in hits:
+            hits[cutoff] += int(rank <= cutoff)
+    total = len(indexes)
+    if not total:
+        return {"queries": 0, "documents": len(documents), "hit_at_1": 0.0, "hit_at_3": 0.0, "hit_at_5": 0.0, "mrr": 0.0}
+    return {
+        "queries": total,
+        "documents": len(documents),
+        "hit_at_1": round(hits[1] / total, 4),
+        "hit_at_3": round(hits[3] / total, 4),
+        "hit_at_5": round(hits[5] / total, 4),
+        "mrr": round(float(np.mean(reciprocal_ranks)), 4),
+    }
 
 
 def combine_scores(candidate: Candidate, semantic_weight: float) -> np.ndarray:
@@ -191,12 +220,71 @@ def model_label(name: str) -> str:
     return name
 
 
+def corpus_digest(records: list[Record]) -> str:
+    digest = hashlib.sha256()
+    for record in records:
+        digest.update(
+            json.dumps(
+                [record.installation_id, record.source_id, record.session_id, record.message_id, record.ordinal, record.role, record.synthetic, len(record.text)],
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        digest.update(hashlib.sha256(record.text.encode("utf-8")).digest())
+    return digest.hexdigest()
+
+
+def cache_path(cache_dir: Path | None, model_name: str, digest: str, chunk_tokens: int, overlap: int) -> Path | None:
+    if cache_dir is None:
+        return None
+    key = hashlib.sha256(f"{CACHE_VERSION}\n{model_name}\n{digest}\n{chunk_tokens}\n{overlap}".encode("utf-8")).hexdigest()[:24]
+    return cache_dir / f"vectors-{key}.npz"
+
+
+def load_cached_vectors(filename: Path, documents: list[Document], queries: list[Query], dimension: int) -> tuple[np.ndarray, np.ndarray, float] | None:
+    if not filename.exists():
+        return None
+    try:
+        with np.load(filename, allow_pickle=False) as cached:
+            document_embeddings = cached["document_embeddings"]
+            query_embeddings = cached["query_embeddings"]
+            embedding_seconds = float(cached["embedding_seconds"])
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile):
+        return None
+    if (
+        document_embeddings.shape != (len(documents), dimension)
+        or query_embeddings.shape != (len(queries), dimension)
+        or not np.issubdtype(document_embeddings.dtype, np.number)
+        or not np.issubdtype(query_embeddings.dtype, np.number)
+        or not np.isfinite(document_embeddings).all()
+        or not np.isfinite(query_embeddings).all()
+    ):
+        return None
+    return document_embeddings, query_embeddings, embedding_seconds
+
+
+def save_cached_vectors(filename: Path, document_embeddings: np.ndarray, query_embeddings: np.ndarray, embedding_seconds: float) -> None:
+    filename.parent.mkdir(parents=True, exist_ok=True)
+    filename.parent.chmod(0o700)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{filename.name}.", suffix=".tmp.npz", dir=filename.parent)
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    temporary.chmod(0o600)
+    try:
+        np.savez_compressed(temporary, document_embeddings=document_embeddings, query_embeddings=query_embeddings, embedding_seconds=np.array(embedding_seconds))
+        os.replace(temporary, filename)
+    finally:
+        temporary.unlink(missing_ok=True)
+    filename.chmod(0o600)
+
+
 def encode_candidates(
     model_name: str,
     records: list[Record],
     queries: list[Query],
     variants: list[tuple[int, int]],
     batch_size: int,
+    digest: str,
+    cache_dir: Path | None,
 ) -> tuple[list[Candidate], int, int]:
     model = model_instance(model_name)
     tokenizer = model.tokenizer
@@ -209,21 +297,32 @@ def encode_candidates(
             continue
         bounded_queries = [crop_query(query.text, tokenizer, chunk_tokens) for query in queries]
         model.max_seq_length = chunk_tokens
-        started = time.perf_counter()
-        document_embeddings = model.encode(
-            [document.text for document in documents],
-            batch_size=batch_size,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-            show_progress_bar=False,
-        )
-        query_embeddings = model.encode(
-            bounded_queries,
-            batch_size=batch_size,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-            show_progress_bar=False,
-        )
+        filename = cache_path(cache_dir, model_name, digest, chunk_tokens, overlap)
+        cached = load_cached_vectors(filename, documents, queries, int(model.get_embedding_dimension())) if filename is not None else None
+        print(json.dumps({"stage": "candidate", "model": model_label(model_name), "chunk_tokens": chunk_tokens, "documents": len(documents), "cache_hit": cached is not None}), flush=True)
+        if cached is not None:
+            document_embeddings, query_embeddings, embedding_seconds = cached
+            cache_hit = True
+        else:
+            started = time.perf_counter()
+            document_embeddings = model.encode(
+                [document.text for document in documents],
+                batch_size=batch_size,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
+            query_embeddings = model.encode(
+                bounded_queries,
+                batch_size=batch_size,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
+            embedding_seconds = round(time.perf_counter() - started, 3)
+            cache_hit = False
+            if filename is not None:
+                save_cached_vectors(filename, document_embeddings, query_embeddings, embedding_seconds)
         lexical_vectorizer = TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True, min_df=1)
         lexical_documents = lexical_vectorizer.fit_transform(document.text for document in documents)
         lexical_queries = lexical_vectorizer.transform(bounded_queries)
@@ -236,14 +335,14 @@ def encode_candidates(
                 documents,
                 query_embeddings @ document_embeddings.T,
                 (lexical_queries @ lexical_documents.T).toarray(),
-                round(time.perf_counter() - started, 3),
+                embedding_seconds,
+                cache_hit,
                 sum(
                     len(tokenizer.encode(record.text, add_special_tokens=False))
                     for record in records
                     if record.role == "assistant"
                 ),
                 sum(document.token_count for document in documents),
-                tokenizer,
             )
         )
     return candidates, int(model.get_embedding_dimension()), len(queries)
@@ -280,8 +379,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--semantic-weight", type=float, action="append", help="hybrid weight; repeat to tune")
     parser.add_argument("--reference-weight", type=float, default=0.8, help="fixed hybrid weight reported for cross-candidate comparison")
+    parser.add_argument("--reference-chunk-tokens", type=int, default=512, help="BGE-small chunk size used by the baseline reference")
     parser.add_argument("--projected-tokens", type=int, help="measured full-source assistant-token estimate")
     parser.add_argument("--event-bytes-per-row", type=int, default=8192)
+    parser.add_argument("--cache-dir", type=Path, help="mode-0600 vector cache directory for resumable runs")
     return parser.parse_args()
 
 
@@ -291,9 +392,12 @@ def main() -> None:
         raise SystemExit("--threads and --batch-size must be positive")
     if args.event_bytes_per_row < 0:
         raise SystemExit("--event-bytes-per-row cannot be negative")
+    if args.reference_chunk_tokens < 1:
+        raise SystemExit("--reference-chunk-tokens must be positive")
     torch.set_num_threads(args.threads)
     torch.set_num_interop_threads(max(1, min(2, args.threads // 4)))
     records = load_records(args.corpus)
+    digest = corpus_digest(records)
     queries, excluded = build_benchmark_queries(records)
     models = args.model or ["BAAI/bge-small-en-v1.5", "jinaai/jina-embeddings-v2-base-code"]
     sizes = args.chunk_tokens or [128, 256, 384, 512]
@@ -311,7 +415,7 @@ def main() -> None:
     dimensions: dict[str, int] = {}
     query_count = len(queries)
     for model_name in models:
-        candidates, dimension, _ = encode_candidates(model_name, records, queries, variants, args.batch_size)
+        candidates, dimension, _ = encode_candidates(model_name, records, queries, variants, args.batch_size, digest, args.cache_dir)
         all_candidates.extend(candidates)
         dimensions[model_name] = dimension
     if not all_candidates:
@@ -333,13 +437,13 @@ def main() -> None:
                 continue
             for weight in weights:
                 scores = combine_scores(candidate, weight)
-                train_metrics = metrics_for(scores, queries, train_indexes, candidate.documents, candidate.tokenizer, candidate.chunk_tokens)
+                train_metrics = metrics_for(scores, queries, train_indexes, candidate.documents)
                 eligible.append((metric_key(train_metrics, candidate, weight, candidate_storage_bytes), candidate, weight, train_metrics, candidate_storage_bytes))
         if not eligible:
             raise SystemExit("all candidates exceed the 100 GiB storage gate")
         _key, selected, weight, train_metrics, _bytes = max(eligible, key=lambda item: item[0])
         selected_scores = combine_scores(selected, weight)
-        selected_test = metrics_for(selected_scores, queries, test_indexes, selected.documents, selected.tokenizer, selected.chunk_tokens)
+        selected_test = metrics_for(selected_scores, queries, test_indexes, selected.documents)
         holdout_sessions = sorted({queries[index].session_id for index in test_indexes})
         folds.append(
             {
@@ -360,14 +464,7 @@ def main() -> None:
         for weight in (0.0, args.reference_weight, 1.0):
             scores = combine_scores(candidate, weight)
             values = [
-                metrics_for(
-                    scores,
-                    queries,
-                    [index for index, assignment in enumerate(assignments) if assignment == fold],
-                    candidate.documents,
-                    candidate.tokenizer,
-                    candidate.chunk_tokens,
-                )
+                metrics_for(scores, queries, [index for index, assignment in enumerate(assignments) if assignment == fold], candidate.documents)
                 for fold in range(fold_count)
                 if any(assignment == fold for assignment in assignments)
             ]
@@ -383,11 +480,11 @@ def main() -> None:
                     "storage": storage[f"{candidate.model}:{candidate.chunk_tokens}"],
                 }
             )
-    baseline_key = next((candidate for candidate in all_candidates if model_label(candidate.model) == "BAAI/bge-small-en-v1.5" and candidate.chunk_tokens == 128), None)
+    baseline_key = next((candidate for candidate in all_candidates if model_label(candidate.model) == "BAAI/bge-small-en-v1.5" and candidate.chunk_tokens == args.reference_chunk_tokens), None)
     baseline_folds: list[dict[str, float | int]] = []
     if baseline_key is not None:
-        baseline_scores = combine_scores(baseline_key, 0.8)
-        baseline_folds = [metrics_for(baseline_scores, queries, [index for index, assignment in enumerate(assignments) if assignment == fold], baseline_key.documents, baseline_key.tokenizer, baseline_key.chunk_tokens) for fold in range(fold_count) if any(assignment == fold for assignment in assignments)]
+        baseline_scores = combine_scores(baseline_key, args.reference_weight)
+        baseline_folds = [metrics_for(baseline_scores, queries, [index for index, assignment in enumerate(assignments) if assignment == fold], baseline_key.documents) for fold in range(fold_count) if any(assignment == fold for assignment in assignments)]
     candidate_metadata = [
         {
             "model": candidate.model,
@@ -398,14 +495,16 @@ def main() -> None:
             "documents": len(candidate.documents),
             "document_tokens_including_overlap": candidate.document_tokens,
             "embedding_seconds": candidate.embedding_seconds,
+            "cache_hit": candidate.cache_hit,
             "storage": storage[f"{candidate.model}:{candidate.chunk_tokens}"],
         }
         for candidate in all_candidates
     ]
     result = {
-        "benchmark_version": 1,
+        "benchmark_version": 2,
         "protocol": "next-assistant relevance; session-held-out tuning; vector/TF-IDF row-normalized hybrid",
         "corpus": str(args.corpus),
+        "corpus_digest": digest,
         "records": len(records),
         "sessions": len({record.session_id for record in records}),
         "models": models,
@@ -413,19 +512,20 @@ def main() -> None:
         "chunk_variants": variants,
         "semantic_weights": weights,
         "reference_weight": args.reference_weight,
+        "reference_chunk_tokens": args.reference_chunk_tokens,
         "query_filter": {"eligible": query_count, "excluded": excluded},
         "split": {"requested": args.split, "used": split_mode, "folds": fold_count, "seed": args.seed},
         "candidates": candidate_metadata,
         "selected_test_metrics": selected_metrics,
         "reference_evaluations": reference_evaluations,
-        "baseline_bge_small_128_hybrid_metrics": aggregate_metrics(baseline_folds) if baseline_folds else None,
+        "baseline_reference_metrics": aggregate_metrics(baseline_folds) if baseline_folds else None,
         "folds": folds,
         "storage_gate": {"budget_gib": 100, "event_bytes_per_row": args.event_bytes_per_row, "projected_tokens": args.projected_tokens, "all_candidates_pass": all(bool(item["storage"]["budget_passed"]) for item in candidate_metadata)},
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     args.output.chmod(0o600)
-    print(json.dumps({"output": str(args.output), "eligible_queries": query_count, "selected_test_metrics": selected_metrics, "baseline": result["baseline_bge_small_128_hybrid_metrics"]}, indent=2))
+    print(json.dumps({"output": str(args.output), "eligible_queries": query_count, "selected_test_metrics": selected_metrics, "baseline": result["baseline_reference_metrics"]}, indent=2))
 
 
 if __name__ == "__main__":
