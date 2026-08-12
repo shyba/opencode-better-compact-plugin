@@ -17,6 +17,7 @@ const installDir = path.resolve(process.env.OPENCODE_SAFE_COMPACTION_DIR ?? path
 const configDir = path.resolve(process.env.OPENCODE_SAFE_COMPACTION_CONFIG_DIR ?? process.env.OPENCODE_CONFIG_DIR ?? path.join(process.env.XDG_CONFIG_HOME ?? path.join(process.env.HOME ?? ".", ".config"), "opencode"))
 const databasePath = path.resolve(process.env.OPENCODE_DB ?? path.join(process.env.XDG_DATA_HOME ?? path.join(process.env.HOME ?? ".", ".local/share"), "opencode", "opencode.db"))
 const maxUploadBatchesPerSource = 8
+const remoteTombstonePurgeIntervalMs = 24 * 60 * 60 * 1000
 const idleCompactionMinBytes = 8 * 1024 * 1024
 const idleCompactionMinFreePages = 1024
 const idleCompactionMinFreeRatio = 0.2
@@ -419,9 +420,12 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>, signal?:
               throw error
             }
           }
-          try {
-            await purgeRemoteTombstones(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, ownerToken: workerToken, expectedRevision: revision }, config.sync.retention_days)
-          } catch { console.error("warning: remote tombstone maintenance failed") }
+          if (state.remoteTombstonePurgeDue(sourceID, Date.now(), remoteTombstonePurgeIntervalMs)) {
+            try {
+              await purgeRemoteTombstones(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, ownerToken: workerToken, expectedRevision: revision }, config.sync.retention_days)
+              state.markRemoteTombstonePurge(sourceID)
+            } catch { console.error("warning: remote tombstone maintenance failed") }
+          }
           console.log(`uploaded ${uploaded} records from ${filename}`)
         } catch (error) {
           if (rows.length) state.fail(rows.map((row) => row.id), error instanceof Error ? error.message : String(error))
@@ -726,7 +730,8 @@ async function syncMigrate() {
   try {
     await applyRemoteMigration(client, await readFile(path.resolve(path.dirname(process.argv[1] ?? "."), "..", "db/migrations/001_init.sql"), "utf8"))
     await applyRemoteMigration(client, await readFile(path.resolve(path.dirname(process.argv[1] ?? "."), "..", "db/migrations/004_reconcile_prefix_index.sql"), "utf8"))
-    console.log("applied better-compact Postgres schema and prefix-reconcile index migrations")
+    await applyRemoteMigration(client, await readFile(path.resolve(path.dirname(process.argv[1] ?? "."), "..", "db/migrations/006_tombstone_purge_indexes.sql"), "utf8"))
+    console.log("applied better-compact Postgres schema, reconciliation, and tombstone-purge index migrations")
     return 0
   } finally {
     await client.close()

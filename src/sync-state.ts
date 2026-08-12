@@ -38,7 +38,7 @@ export class SyncState {
     this.db.exec(`
       create table if not exists schema_migration (version integer primary key, applied_at integer not null);
       create table if not exists installation (id text primary key, incarnation text not null, created_at integer not null, adopted_at integer);
-      create table if not exists source (id text primary key, installation_id text not null references installation(id) on delete cascade, kind text not null, schema_version integer not null, canonical_locator text not null, fingerprint text, incarnation text not null, remote_revision_high_water integer, local_revision integer not null default 0, records_staged integer not null default 0, records_sent integer not null default 0, bytes_sent integer not null default 0, last_staged_at integer, last_sent_at integer, created_at integer not null, last_seen_at integer not null);
+      create table if not exists source (id text primary key, installation_id text not null references installation(id) on delete cascade, kind text not null, schema_version integer not null, canonical_locator text not null, fingerprint text, incarnation text not null, remote_revision_high_water integer, local_revision integer not null default 0, records_staged integer not null default 0, records_sent integer not null default 0, bytes_sent integer not null default 0, last_staged_at integer, last_sent_at integer, last_remote_tombstone_purge_at integer, created_at integer not null, last_seen_at integer not null);
       create table if not exists source_cursor (source_id text not null references source(id) on delete cascade, stream text not null, checkpoint_json text not null, reconcile_before integer, updated_at integer not null, primary key (source_id, stream));
       create table if not exists normalized_record (source_id text not null references source(id) on delete cascade, record_kind text not null, natural_key text not null, source_version text, routing_json text, payload_json text, payload_sha256 text not null, record_revision integer not null, deleted_at integer, observed_at integer not null, primary key (source_id, record_kind, natural_key));
       create table if not exists destination (id text primary key, kind text not null, config_ref text not null, created_at integer not null);
@@ -61,6 +61,7 @@ export class SyncState {
       [7, "source", "bytes_sent", "integer not null default 0"],
       [8, "source", "last_staged_at", "integer"],
       [9, "source", "last_sent_at", "integer"],
+      [10, "source", "last_remote_tombstone_purge_at", "integer"],
     ] as const
     for (const [version, table, column, definition] of migrations) {
       const exists = (this.db.query(`pragma table_info(${table})`).all() as Array<{ name: string }>).some((row) => row.name === column)
@@ -120,6 +121,15 @@ export class SyncState {
 
   setRemoteRevision(sourceID: string, revision: number) {
     this.db.query("update source set remote_revision_high_water=? where id=?").run(revision, sourceID)
+  }
+
+  remoteTombstonePurgeDue(sourceID: string, now = Date.now(), intervalMs = 24 * 60 * 60 * 1000) {
+    const row = this.db.query("select last_remote_tombstone_purge_at from source where id=?").get(sourceID) as { last_remote_tombstone_purge_at?: number } | null
+    return !row || row.last_remote_tombstone_purge_at === undefined || row.last_remote_tombstone_purge_at === null || Number(row.last_remote_tombstone_purge_at) <= now - intervalMs
+  }
+
+  markRemoteTombstonePurge(sourceID: string, at = Date.now()) {
+    this.db.query("update source set last_remote_tombstone_purge_at=? where id=?").run(at, sourceID)
   }
 
   reconcileCommitted(sourceID: string, revision: number, destinationID = "postgres") {

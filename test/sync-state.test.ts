@@ -124,6 +124,22 @@ describe("portable better-compact state", () => {
     state.close()
   })
 
+  test("throttles remote tombstone maintenance across restarts", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "better-compact-state-"))
+    temporary.push(directory)
+    const filename = path.join(directory, "state.sqlite")
+    const state = await openSyncState(filename)
+    state.ensureInstallation("install-1", "incarnation-1")
+    state.upsertSource({ id: "source-1", installationID: "install-1", kind: "fixture", schemaVersion: 1, locator: "fixture://one", incarnation: "source-inc-1" })
+    expect(state.remoteTombstonePurgeDue("source-1", 10_000, 1_000)).toBe(true)
+    state.markRemoteTombstonePurge("source-1", 10_000)
+    expect(state.remoteTombstonePurgeDue("source-1", 10_999, 1_000)).toBe(false)
+    state.close()
+    const reopened = await openSyncState(filename)
+    expect(reopened.remoteTombstonePurgeDue("source-1", 11_000, 1_000)).toBe(true)
+    reopened.close()
+  })
+
   test("replays an expired lease after reopening the state database", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "better-compact-state-"))
     temporary.push(directory)
