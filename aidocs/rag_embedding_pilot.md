@@ -97,6 +97,49 @@ faster in the earlier 128-token comparison (22.3 seconds versus 84.5 seconds
 for Jina on the same CPU). Neither larger screen was a consistent improvement,
 so the 384-dimensional model is the better first-delivery trade-off.
 
+## Execution backend screen (2026-08-11)
+
+The model choice and vector format were held constant while the local CPU
+execution path was compared on the 404-record, 823-chunk, 48-query smoke
+corpus. PyTorch 2.7.1+cpu reported oneDNN/MKL-DNN 3.7.1 and selected
+`avx512_core_bf16` matmul kernels on the Ryzen 9 9950X3D. These are encode-only
+times with 16 Torch threads; retrieval quality was unchanged between Torch
+FP32 and Torch BF16 on this small set (`hit@1=0.5000`, `hit@3=0.6667`,
+`hit@5=0.7917`, `MRR=0.6079`).
+
+| backend / batch | encode seconds | query seconds | hybrid MRR |
+| --- | ---: | ---: | ---: |
+| ONNX INT8 VNNI / 64 | 59.492 | 3.360 | 0.6004 |
+| Torch oneDNN FP32 / 64 | 25.249 | 1.458 | 0.6079 |
+| Torch oneDNN BF16 / 64 | **13.330** | **0.774** | **0.6079** |
+| ONNX INT8 VNNI / 512 | 56.146 | 3.311 | not re-scored |
+| Torch oneDNN BF16 / 512 | 18.140 | 0.865 | not re-scored |
+
+The smaller batch timing is the better comparison for the worker's default
+batch size. The production worker therefore uses `backend: "auto"` to select
+Torch when full weights are present, defaults to CPU BF16 when supported, and
+falls back to ONNX/float32 on bundles or hosts that cannot run that path.
+Existing vectors are not rewritten when the execution backend changes; this is
+a compute-path choice, not a new embedding identity.
+
+A direct worker-path recheck on the same 823 chunks measured 15.832 seconds
+without sorting and 12.342 seconds with token-count sorting at batch 64 (about
+22% faster in that run). The exact gain depends on the length distribution, so
+the setting is bounded and reversible rather than hard-coded into the schema.
+
+The service data path was also changed after the pilot timings. Live discovery
+is now timestamp-keyed before message aggregation, with migration
+`005_rag_live_candidate_index.sql`; idle full sweeps are limited to a 15-minute
+interval. A pass uses bulk document/chunk staging and one missing-chunk select.
+A single lookahead page is inserted and selected on a staging connection while
+the current page is encoded; a dedicated writer connection commits vector
+events/current rows while the main thread encodes the next batch. The defaults
+are 2,048 messages and 16 chunks per CPU inference call; the larger
+message/staging batch is independent of model padding. Torch uses direct
+forward calls on pre-batched inputs, while
+ONNX remains available as an explicit fallback. These changes hide
+database insert latency without changing the model identity or vector schema.
+
 ## Live PostgreSQL pilot
 
 The existing `rag.embedding_current.embedding_vec` is a fixed `vector(4096)`

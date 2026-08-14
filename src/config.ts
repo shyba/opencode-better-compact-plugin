@@ -20,6 +20,9 @@ export type RagConfig = {
   database_url_env: string
   model: string
   model_path: string
+  backend: "auto" | "onnx" | "torch"
+  compute_dtype: "float32" | "bfloat16"
+  length_bucketing: boolean
   python: string
   ssh_host: string
   ssh_user: string
@@ -33,6 +36,7 @@ export type RagConfig = {
   message_batch_size: number
   poll_interval_ms: number
   lookback_seconds: number
+  full_sweep_interval_seconds: number
   threads: number
 }
 
@@ -76,6 +80,9 @@ const defaults: BetterCompactConfig = {
     database_url_env: "OPENCODE_SYNC_DATABASE_URL",
     model: "BAAI/bge-small-en-v1.5",
     model_path: "",
+    backend: "auto",
+    compute_dtype: "bfloat16",
+    length_bucketing: true,
     python: "",
     ssh_host: "",
     ssh_user: "",
@@ -85,10 +92,11 @@ const defaults: BetterCompactConfig = {
     onnx_file: "onnx/model_qint8_avx512_vnni.onnx",
     chunk_tokens: 512,
     overlap: 64,
-    batch_size: 64,
-    message_batch_size: 32,
+    batch_size: 16,
+    message_batch_size: 2048,
     poll_interval_ms: 30_000,
     lookback_seconds: 900,
+    full_sweep_interval_seconds: 900,
     threads: 16,
   },
   sources: [],
@@ -172,6 +180,10 @@ export function validateConfig(value: unknown): BetterCompactConfig {
   if (typeof result.rag.database_url_env !== "string" || !/^[A-Z_][A-Z0-9_]*$/.test(result.rag.database_url_env)) throw new TypeError("rag.database_url_env must be an environment variable name")
   if (typeof result.rag.model !== "string" || !result.rag.model.trim()) throw new TypeError("rag.model must be a non-empty string")
   if (typeof result.rag.model_path !== "string") throw new TypeError("rag.model_path must be a string")
+  if (result.rag.backend !== "auto" && result.rag.backend !== "onnx" && result.rag.backend !== "torch") throw new TypeError("rag.backend must be auto, onnx, or torch")
+  if (result.rag.compute_dtype !== "float32" && result.rag.compute_dtype !== "bfloat16") throw new TypeError("rag.compute_dtype must be float32 or bfloat16")
+  if (result.rag.backend === "onnx" && result.rag.compute_dtype === "bfloat16") throw new TypeError("rag.compute_dtype bfloat16 requires rag.backend torch")
+  if (typeof result.rag.length_bucketing !== "boolean") throw new TypeError("rag.length_bucketing must be boolean")
   if (typeof result.rag.python !== "string") throw new TypeError("rag.python must be a string")
   for (const key of ["ssh_host", "ssh_user", "ssh_remote_host"] as const) {
     if (typeof result.rag[key] !== "string") throw new TypeError(`rag.${key} must be a string`)
@@ -180,7 +192,7 @@ export function validateConfig(value: unknown): BetterCompactConfig {
     if (!Number.isSafeInteger(result.rag[key]) || result.rag[key] < 1 || result.rag[key] > 65_535) throw new TypeError(`rag.${key} must be a valid TCP port`)
   }
   if (typeof result.rag.onnx_file !== "string" || !result.rag.onnx_file.trim() || path.isAbsolute(result.rag.onnx_file)) throw new TypeError("rag.onnx_file must be a relative path")
-  for (const key of ["chunk_tokens", "overlap", "batch_size", "message_batch_size", "poll_interval_ms", "lookback_seconds", "threads"] as const) {
+  for (const key of ["chunk_tokens", "overlap", "batch_size", "message_batch_size", "poll_interval_ms", "lookback_seconds", "full_sweep_interval_seconds", "threads"] as const) {
     if (!Number.isSafeInteger(result.rag[key]) || result.rag[key] <= 0) throw new TypeError(`rag.${key} must be a positive integer`)
   }
   if (result.rag.overlap >= result.rag.chunk_tokens) throw new TypeError("rag.overlap must be smaller than rag.chunk_tokens")

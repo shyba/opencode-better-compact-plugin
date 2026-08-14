@@ -85,7 +85,7 @@ if (command === "rag") {
   if (action === "uninstall") process.exit(await ragUninstall())
   if (action === "tunnel" && process.argv[4] === "install") process.exit(await ragTunnelInstall(await loadConfig(paths)))
   if (action === "tunnel" && process.argv[4] === "uninstall") process.exit(await ragTunnelUninstall())
-  console.error("Usage: better-compact rag setup [--model-path PATH] [--python PATH] [--ssh-host HOST --ssh-user USER] [--install] | run [--once] | status | migrate | install | uninstall | tunnel install|uninstall")
+  console.error("Usage: better-compact rag setup [--backend auto|onnx|torch] [--compute-dtype float32|bfloat16] [--length-bucketing|--no-length-bucketing] [--batch-size N --message-batch-size N --threads N --full-sweep-interval-seconds N] [--model-path PATH] [--python PATH] [--ssh-host HOST --ssh-user USER] [--install] | run [--once] | status | migrate | install | uninstall | tunnel install|uninstall")
   process.exit(2)
 }
 console.error(`Unknown command: ${command}`)
@@ -108,7 +108,7 @@ Usage:
   better-compact sync prune (--missing-directories|--blank-directories) --yes Delete local Codex files while retaining remote rows
   better-compact sync compact --yes  Remove acknowledged local cache rows and compact SQLite
   better-compact sync reconcile    Force the next OpenCode source pass to rebuild a complete snapshot
-  better-compact rag setup         Enable the BGE-small embedding worker and configure its model/runtime
+  better-compact rag setup         Enable the BGE-small worker and configure backend, dtype, batches, model/runtime
   better-compact rag run [--once]  Run the streaming BGE-small worker in the foreground
   better-compact rag status        Show model, row, dimension, and size metadata
   better-compact rag migrate       Create the additive 384-dimensional RAG projection (admin credentials)
@@ -133,6 +133,25 @@ Environment overrides:
 function flagValue(flag: string) {
   const index = process.argv.indexOf(flag)
   return index >= 0 ? process.argv[index + 1] : undefined
+}
+
+function parseRagBackend(value: string | undefined): "auto" | "onnx" | "torch" | undefined {
+  if (value === undefined) return undefined
+  if (value === "auto" || value === "onnx" || value === "torch") return value
+  throw new Error("--backend must be auto, onnx, or torch")
+}
+
+function parseRagComputeDtype(value: string | undefined): "float32" | "bfloat16" | undefined {
+  if (value === undefined) return undefined
+  if (value === "float32" || value === "bfloat16") return value
+  throw new Error("--compute-dtype must be float32 or bfloat16")
+}
+
+function parsePositiveInteger(value: string | undefined, flag: string): number | undefined {
+  if (value === undefined) return undefined
+  const parsed = Number(value)
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error(`${flag} must be a positive integer`)
+  return parsed
 }
 
 function machineWorkerToken(statePath: string) {
@@ -750,7 +769,8 @@ async function ragMigrate() {
   try {
     await applyRemoteMigration(client, await readFile(path.resolve(path.dirname(process.argv[1] ?? "."), "..", "db/migrations/002_rag_embedding_384.sql"), "utf8"))
     await applyRemoteMigration(client, await readFile(path.resolve(path.dirname(process.argv[1] ?? "."), "..", "db/migrations/003_rag_chunk_version.sql"), "utf8"))
-    console.log("applied the 384-dimensional RAG projection and version-aware chunk migrations")
+    await applyRemoteMigration(client, await readFile(path.resolve(path.dirname(process.argv[1] ?? "."), "..", "db/migrations/005_rag_live_candidate_index.sql"), "utf8"))
+    console.log("applied the 384-dimensional RAG projection, version-aware chunks, and live candidate index migrations")
     return 0
   } finally {
     await client.close()
@@ -760,7 +780,7 @@ async function ragMigrate() {
 async function ragStatus() {
   const config = await loadConfig(paths)
   console.log(`rag worker state: ${path.join(paths.home, "rag-state.json")}`)
-  console.log(`rag configuration: ${config.rag.enabled ? "enabled" : "disabled"}, model=${config.rag.model}, chunk=${config.rag.chunk_tokens}/${config.rag.overlap}`)
+  console.log(`rag configuration: ${config.rag.enabled ? "enabled" : "disabled"}, model=${config.rag.model}, backend=${config.rag.backend}, dtype=${config.rag.compute_dtype}, batches=${config.rag.message_batch_size}/${config.rag.batch_size}, threads=${config.rag.threads}, full_sweep=${config.rag.full_sweep_interval_seconds}s, chunk=${config.rag.chunk_tokens}/${config.rag.overlap}`)
   const databaseURL = ragDatabaseURLFor(config)
   if (!databaseURL) {
     console.error("missing the configured Postgres writer URL")
@@ -805,19 +825,42 @@ async function ragSetup() {
     const modelPath = flagValue("--model-path")
     const python = flagValue("--python")
     const model = flagValue("--model")
+    const backend = flagValue("--backend")
+    const computeDtype = flagValue("--compute-dtype")
+    const batchSize = flagValue("--batch-size")
+    const messageBatchSize = flagValue("--message-batch-size")
+    const threads = flagValue("--threads")
+    const fullSweepInterval = flagValue("--full-sweep-interval-seconds")
+    const enableLengthBucketing = process.argv.includes("--length-bucketing")
+    const disableLengthBucketing = process.argv.includes("--no-length-bucketing")
     const sshHost = flagValue("--ssh-host")
     const sshUser = flagValue("--ssh-user")
     const sshLocalPort = flagValue("--ssh-local-port")
     const sshRemoteHost = flagValue("--ssh-remote-host")
     const sshRemotePort = flagValue("--ssh-remote-port")
-    if ([modelPath, python, model, sshHost, sshUser, sshLocalPort, sshRemoteHost, sshRemotePort].some((value) => value?.startsWith("--"))) throw new Error("RAG option values must follow their flags")
+    if ([modelPath, python, model, backend, computeDtype, batchSize, messageBatchSize, threads, fullSweepInterval, sshHost, sshUser, sshLocalPort, sshRemoteHost, sshRemotePort].some((value) => value?.startsWith("--"))) throw new Error("RAG option values must follow their flags")
     if ((sshHost && !sshUser) || (sshUser && !sshHost)) throw new Error("--ssh-host and --ssh-user must be supplied together")
+    if (enableLengthBucketing && disableLengthBucketing) throw new Error("choose only one of --length-bucketing and --no-length-bucketing")
+    const selectedBackend = parseRagBackend(backend)
+    const selectedComputeDtype = parseRagComputeDtype(computeDtype)
+    const selectedBatchSize = parsePositiveInteger(batchSize, "--batch-size")
+    const selectedMessageBatchSize = parsePositiveInteger(messageBatchSize, "--message-batch-size")
+    const selectedThreads = parsePositiveInteger(threads, "--threads")
+    const selectedFullSweepInterval = parsePositiveInteger(fullSweepInterval, "--full-sweep-interval-seconds")
+    const selectedLengthBucketing = enableLengthBucketing ? true : disableLengthBucketing ? false : undefined
     const rag = {
       ...existing.rag,
       enabled: true,
       ...(modelPath ? { model_path: path.resolve(modelPath) } : {}),
       ...(python ? { python: path.resolve(python) } : {}),
       ...(model ? { model } : {}),
+      ...(selectedBackend ? { backend: selectedBackend } : {}),
+      ...(selectedComputeDtype ? { compute_dtype: selectedComputeDtype } : {}),
+      ...(selectedBatchSize === undefined ? {} : { batch_size: selectedBatchSize }),
+      ...(selectedMessageBatchSize === undefined ? {} : { message_batch_size: selectedMessageBatchSize }),
+      ...(selectedThreads === undefined ? {} : { threads: selectedThreads }),
+      ...(selectedFullSweepInterval === undefined ? {} : { full_sweep_interval_seconds: selectedFullSweepInterval }),
+      ...(selectedLengthBucketing === undefined ? {} : { length_bucketing: selectedLengthBucketing }),
       ...(sshHost ? { ssh_host: sshHost, ssh_user: sshUser ?? "", database_url_env: "BETTER_COMPACT_RAG_DATABASE_URL" } : {}),
       ...(sshLocalPort ? { ssh_local_port: Number(sshLocalPort) } : {}),
       ...(sshRemoteHost ? { ssh_remote_host: sshRemoteHost } : {}),

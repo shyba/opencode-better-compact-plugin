@@ -19,10 +19,16 @@ describe("portable better-compact state", () => {
   })
 
   test("validates the versioned config and rejects unknown keys", () => {
-  expect(validateConfig({ version: 1, sync: {}, sources: [], installation: { name: "server" } })).toMatchObject({ installation: { name: "server" }, sync: { keep_remote_on_missing: false, allow_source_shrink: false }, rag: { model: "BAAI/bge-small-en-v1.5", chunk_tokens: 512, overlap: 64, enabled: false } })
+  expect(validateConfig({ version: 1, sync: {}, sources: [], installation: { name: "server" } })).toMatchObject({ installation: { name: "server" }, sync: { keep_remote_on_missing: false, allow_source_shrink: false }, rag: { model: "BAAI/bge-small-en-v1.5", backend: "auto", compute_dtype: "bfloat16", length_bucketing: true, chunk_tokens: 512, overlap: 64, batch_size: 16, message_batch_size: 2048, full_sweep_interval_seconds: 900, enabled: false } })
   expect(() => validateConfig({ version: 1, sync: { unknown: true }, sources: [] })).toThrow("unknown key")
   expect(() => validateConfig({ version: 1, sync: {}, rag: { overlap: 512 }, sources: [] })).toThrow("rag.overlap")
-    expect(() => validateConfig({ version: 1, sync: {}, sources: [{ kind: "fixture", database: "db", extra: true }] })).toThrow("source contains an unknown key")
+  expect(() => validateConfig({ version: 1, sync: {}, rag: { backend: "cuda" }, sources: [] })).toThrow("rag.backend")
+  expect(() => validateConfig({ version: 1, sync: {}, rag: { compute_dtype: "float16" }, sources: [] })).toThrow("rag.compute_dtype")
+  expect(() => validateConfig({ version: 1, sync: {}, rag: { backend: "onnx", compute_dtype: "bfloat16" }, sources: [] })).toThrow("requires rag.backend")
+  expect(validateConfig({ version: 1, sync: {}, rag: { model_path: "/models/bge", compute_dtype: "bfloat16" }, sources: [] })).toMatchObject({ rag: { backend: "auto", compute_dtype: "bfloat16", model_path: "/models/bge" } })
+  expect(() => validateConfig({ version: 1, sync: {}, rag: { length_bucketing: "yes" }, sources: [] })).toThrow("rag.length_bucketing")
+  expect(validateConfig({ version: 1, sync: {}, rag: { backend: "torch", compute_dtype: "bfloat16", length_bucketing: false }, sources: [] })).toMatchObject({ rag: { backend: "torch", compute_dtype: "bfloat16", length_bucketing: false } })
+  expect(() => validateConfig({ version: 1, sync: {}, sources: [{ kind: "fixture", database: "db", extra: true }] })).toThrow("source contains an unknown key")
   })
 
   test("enqueues, leases, and acknowledges records transactionally", async () => {

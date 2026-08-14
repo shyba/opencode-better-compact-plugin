@@ -162,6 +162,35 @@ describe("better-compact sync setup", () => {
   })
 })
 
+describe("better-compact RAG setup", () => {
+  test("persists the measured streaming pipeline settings", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "better-compact-cli-"))
+    temporary.push(root)
+    const config = path.join(root, "config.json")
+    const result = await runCLI(["rag", "setup", "--backend", "torch", "--compute-dtype", "bfloat16", "--length-bucketing", "--batch-size", "16", "--message-batch-size", "2048", "--threads", "16", "--full-sweep-interval-seconds", "900", "--model-path", "/tmp/bge", "--python", "/tmp/.venv/bin/python3"], {
+      HOME: root,
+      BETTER_COMPACT_CONFIG: config,
+      BETTER_COMPACT_HOME: path.join(root, "state"),
+    })
+
+    expect(result.exitCode).toBe(0)
+    expect(JSON.parse(await readFile(config, "utf8"))).toMatchObject({
+      rag: {
+        enabled: true,
+        backend: "torch",
+        compute_dtype: "bfloat16",
+        length_bucketing: true,
+        batch_size: 16,
+        message_batch_size: 2048,
+        threads: 16,
+        full_sweep_interval_seconds: 900,
+        model_path: "/tmp/bge",
+        python: "/tmp/.venv/bin/python3",
+      },
+    })
+  })
+})
+
 async function fakePi(root: string) {
   const executable = path.join(root, "pi")
   await writeFile(
