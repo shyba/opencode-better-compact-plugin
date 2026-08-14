@@ -156,9 +156,14 @@ export async function discoverJsonl(
   for (const file of candidates) {
     if (signal?.aborted) break
     const saved = checkpoint.current?.path === file.relativePath ? checkpoint.current : undefined
-    const sameMetadata = saved && saved.size === file.size && saved.mtimeMs === file.mtimeMs
-    const startLine = sameMetadata ? saved.line : 0
-    const startOffset = sameMetadata ? saved.byteOffset : 0
+    // Resume an append-only JSONL file from the saved line/byte offset whenever
+    // it only grew since we left it (live sessions append lines and bump mtime).
+    // Restarting from line 0 on every mtime change re-stages the same leading
+    // records each pass, so hasMore stays true forever and `sync run --once`
+    // never drains. A shrunken/rewritten file still restarts from the top.
+    const resumeFromSaved = saved !== undefined && file.size >= saved.size
+    const startLine = resumeFromSaved ? (saved.line ?? 0) : 0
+    const startOffset = resumeFromSaved ? (saved.byteOffset ?? 0) : 0
     const sessionHeader = await readSessionHeader(file.filename)
     const sessionID = sessionHeader.sessionID || stableSessionID(sourceID, file.relativePath)
     const sessionCreatedAt = sessionHeader.createdAt || file.mtimeMs

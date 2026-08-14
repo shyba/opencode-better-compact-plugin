@@ -283,6 +283,11 @@ export class SyncState {
   }
   fail(ids: number[], error: string, nextAttemptAt = Date.now() + 30_000) { if (ids.length) this.db.query(`update outbox set state='failed', lease_until=null, last_error=?, next_attempt_at=? where id in (${ids.map(() => "?").join(",")})`).run(error.slice(0, 1000), nextAttemptAt, ...ids) }
   pendingCount(destinationID = "postgres") { const row = this.db.query("select count(*) as value from outbox where destination_id=?").get(destinationID) as { value: number }; return Number(row.value) }
+  /** Outbox rows still owed for one source: pending, expiring lease, or failed rows due for retry. */
+  sourcePendingCount(sourceID: string, now = Date.now()) {
+    const row = this.db.query("select count(*) as value from outbox where destination_id='postgres' and source_id=? and (state='pending' or (state='leased' and lease_until<?) or (state='failed' and next_attempt_at<=?))").get(sourceID, now, now) as { value: number }
+    return Number(row.value)
+  }
   releaseAcknowledgedRecords(limit = 50_000) {
     const result = this.db.query(`delete from normalized_record where rowid in (
       select normalized_record.rowid from normalized_record

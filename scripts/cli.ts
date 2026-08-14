@@ -397,8 +397,13 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>, signal?:
           const fingerprint = await sourcePathFingerprint(source.kind, filename)
           pathFingerprint = fingerprint
           if (state.shouldSkipSource(sourceID, fingerprint.mtimeMs, fingerprint.sizeOrCount, fingerprint.childMaxMtimeMs)) {
-            console.log(`unchanged ${filename}`)
-            continue
+            // Only skip when this source owes nothing to the outbox. Pending,
+            // leased, or failed rows must still be uploaded this pass, or
+            // `sync run --once` never reaches pending === 0 and never exits.
+            if (state.sourcePendingCount(sourceID) === 0) {
+              console.log(`unchanged ${filename}`)
+              continue
+            }
           }
         } catch (fingerprintError) {
           if (signal?.aborted) break

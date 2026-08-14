@@ -39,6 +39,33 @@ describe("streaming JSONL adapters", () => {
     expect(second.records.some((record) => record.payloadJSON?.includes("[REDACTED]"))).toBe(true)
   })
 
+  test("resumes an append-only JSONL file from its saved offset instead of re-staging from line 0", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "better-compact-jsonl-"))
+    temporary.push(root)
+    const filename = path.join(root, "session.jsonl")
+    const line = (index: number) => JSON.stringify({ type: "message", id: `m${index}`, message: { role: "user", content: `line ${index}` }, timestamp: `2026-08-07T12:00:${String(index % 60).padStart(2, "0")}.000Z` })
+    await writeFile(filename, Array.from({ length: 300 }, (_, index) => line(index)).join("\n") + "\n")
+
+    const first = await discoverJsonl(root, "source", "codex-jsonl", 0, false, 100)
+    expect(first.checkpoint.current?.line).toBe(100)
+
+    // The file grows (live session appends) and bumps its mtime. Discovery must
+    // resume from the saved line/byte offset, not re-stage lines 0..99 again.
+    await writeFile(filename, Array.from({ length: 600 }, (_, index) => line(index)).join("\n") + "\n")
+    const second = await discoverJsonl(root, "source", "codex-jsonl", first.checkpoint, false, 100)
+    expect(second.checkpoint.current?.line).toBe(200)
+    const secondMessages = second.records.filter((record) => record.recordKind === "message")
+    const keys = secondMessages.map((record) => record.naturalKey)
+    expect(keys[0]).toBe("session.jsonl|line:100")
+    expect(keys.some((key) => key.endsWith("|line:0"))).toBe(false)
+
+    // A shrunken/rewritten file still restarts from the top.
+    await writeFile(filename, Array.from({ length: 50 }, (_, index) => line(1000 + index)).join("\n") + "\n")
+    const third = await discoverJsonl(root, "source", "codex-jsonl", second.checkpoint, false, 100)
+    const thirdMessages = third.records.filter((record) => record.recordKind === "message")
+    expect(thirdMessages[0]?.naturalKey).toBe("session.jsonl|line:0")
+  })
+
   test("emits a bounded invalid-line record and a tombstone prefix for deleted files", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "better-compact-jsonl-"))
     temporary.push(root)
