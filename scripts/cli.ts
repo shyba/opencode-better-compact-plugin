@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { access, chmod, lstat, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
+import { access, chmod, lstat, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
 import { existsSync, readFileSync } from "node:fs"
 import { spawn } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
@@ -9,9 +9,9 @@ import { Database } from "bun:sqlite"
 import { discoverOpenCodeV1, discoverOpenCodeV1Sessions, inspectOpenCodeV1 } from "../src/opencode-v1.js"
 import type { OpenCodeV1Checkpoint } from "../src/opencode-v1.js"
 import { discoverJsonl, discoverJsonlSessions, inspectJsonl } from "../src/jsonl.js"
-import type { JsonlCheckpoint, JsonlDiscoveryResult, JsonlSessionCheckpoint } from "../src/jsonl.js"
+import type { JsonlCheckpoint, JsonlDiscoveryResult, JsonlReconcilePrefix, JsonlSessionCheckpoint } from "../src/jsonl.js"
 import { applyRemoteMigration, ensureRemoteSource, openPostgres, purgeRemoteTombstones, readRemoteFence, recordObservation, uploadFenced } from "../src/postgres.js"
-import { openSyncState } from "../src/sync-state.js"
+import { openSyncState, type NormalizedRecord } from "../src/sync-state.js"
 
 const installDir = path.resolve(process.env.OPENCODE_SAFE_COMPACTION_DIR ?? path.join(process.env.HOME ?? ".", ".local/share/opencode/plugins/safe-compaction"))
 const configDir = path.resolve(process.env.OPENCODE_SAFE_COMPACTION_CONFIG_DIR ?? process.env.OPENCODE_CONFIG_DIR ?? path.join(process.env.XDG_CONFIG_HOME ?? path.join(process.env.HOME ?? ".", ".config"), "opencode"))
@@ -386,29 +386,45 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>, signal?:
     const installation = state.ensureDefaultInstallation()
     for (const source of config.sources) {
       if (signal?.aborted) break
+      const filename = path.resolve(source.database.replace(/^~(?=\/|$)/, process.env.HOME ?? "."))
+      const sourceID = createHash("sha256").update(`${source.kind}\n${filename}`).digest("hex").slice(0, 32)
+      let pathFingerprint: { mtimeMs: number; sizeOrCount: number; childMaxMtimeMs: number } | undefined
+      let result: { records: NormalizedRecord[]; complete: boolean; checkpoint: unknown; hasMore?: boolean; reconcilePrefixes: JsonlReconcilePrefix[]; sourceUpdatedAt?: number; reconcileBlocked?: string } | undefined
+      let backpressure = false
       try {
         if (source.kind !== "opencode-v1-sqlite" && source.kind !== "opencode-v1-sessions" && source.kind !== "codex-jsonl" && source.kind !== "codex-jsonl-sessions" && source.kind !== "pi-jsonl") throw new Error(`unsupported source adapter: ${source.kind}`)
-        const filename = path.resolve(source.database.replace(/^~(?=\/|$)/, process.env.HOME ?? "."))
-      const sourceID = createHash("sha256").update(`${source.kind}\n${filename}`).digest("hex").slice(0, 32)
+        try {
+          const fingerprint = await sourcePathFingerprint(source.kind, filename)
+          pathFingerprint = fingerprint
+          if (state.shouldSkipSource(sourceID, fingerprint.mtimeMs, fingerprint.sizeOrCount, fingerprint.childMaxMtimeMs)) {
+            console.log(`unchanged ${filename}`)
+            continue
+          }
+        } catch (fingerprintError) {
+          if (signal?.aborted) break
+          // A stat failure is not itself a reason to skip; let the discovery
+          // path report the real error.
+        }
       const inspection = source.kind === "opencode-v1-sqlite" || source.kind === "opencode-v1-sessions" ? inspectOpenCodeV1(filename) : await inspectJsonl(filename)
       const sourceIncarnation = state.sourceIncarnation(sourceID)
       state.upsertSource({ id: sourceID, installationID: installation.id, kind: source.kind, schemaVersion: inspection.schemaVersion, locator: filename, ...(source.kind === "opencode-v1-sqlite" || source.kind === "opencode-v1-sessions" ? { fingerprint: inspection.layoutFingerprint } : {}), incarnation: sourceIncarnation })
       const outboxBytes = state.outboxBytes()
-      const backpressure = outboxBytes >= config.sync.max_outbox_bytes * 0.75
+      backpressure = outboxBytes >= config.sync.max_outbox_bytes * 0.75
       if (backpressure) console.error(`warning: sync backpressure at ${outboxBytes} bytes; uploading existing rows only`)
       const checkpoint = state.checkpoint(sourceID)
-      const result = backpressure
+      const discoveryResult = backpressure
         ? emptyDiscovery(source.kind, checkpoint)
       : await discoverSource(source.kind, filename, sourceID, checkpoint, config.sync.include_parts, config.sync.include_tool_output, config.sync.batch_size * 5, signal, config.sync.keep_remote_on_missing, config.sync.allow_source_shrink)
-      if ("reconcileBlocked" in result && result.reconcileBlocked) console.error(`warning: ${filename}: ${result.reconcileBlocked}; retaining remote rows`)
+      result = discoveryResult
+      if ("reconcileBlocked" in discoveryResult && discoveryResult.reconcileBlocked) console.error(`warning: ${filename}: ${discoveryResult.reconcileBlocked}; retaining remote rows`)
       const snapshot = source.kind === "opencode-v1-sqlite"
-        ? { complete: result.complete, recordKinds: ["session", "message", "part", "todo"] }
+        ? { complete: discoveryResult.complete, recordKinds: ["session", "message", "part", "todo"] }
         : source.kind === "opencode-v1-sessions"
-          ? { complete: result.complete, recordKinds: ["session"] }
-        : { prefixes: result.reconcilePrefixes }
-      state.enqueue(result.records, sourceID, "messages", result.checkpoint, "postgres", snapshot, config.sync.max_outbox_bytes)
-      progressed = progressed || result.records.length > 0 || result.reconcilePrefixes.length > 0
-      console.log(`staged ${result.records.length} records from ${filename}${result.complete ? " (reconciled)" : result.hasMore ? " (more pending)" : " (unchanged)"}`)
+          ? { complete: discoveryResult.complete, recordKinds: ["session"] }
+        : { prefixes: discoveryResult.reconcilePrefixes }
+      state.enqueue(discoveryResult.records, sourceID, "messages", discoveryResult.checkpoint, "postgres", snapshot, config.sync.max_outbox_bytes)
+      progressed = progressed || discoveryResult.records.length > 0 || discoveryResult.reconcilePrefixes.length > 0
+      console.log(`staged ${discoveryResult.records.length} records from ${filename}${discoveryResult.complete ? " (reconciled)" : discoveryResult.hasMore ? " (more pending)" : " (unchanged)"}`)
       if (signal?.aborted) break
       const databaseURL = databaseURLFor(config)
         if (databaseURL) {
@@ -432,7 +448,7 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>, signal?:
               uploaded += rows.length
               progressed = true
               try {
-                await recordObservation(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, ownerToken: workerToken, expectedRevision: revision }, result.records.length, rows.length, result.sourceUpdatedAt ? Math.max(0, Date.now() - result.sourceUpdatedAt) : null)
+                await recordObservation(client, { installationID: installation.id, installationIncarnation: installation.incarnation, sourceID, incarnation: sourceIncarnation, ownerToken: workerToken, expectedRevision: revision }, discoveryResult.records.length, rows.length, discoveryResult.sourceUpdatedAt ? Math.max(0, Date.now() - discoveryResult.sourceUpdatedAt) : null)
               } catch { console.error("warning: remote observation maintenance failed") }
             } catch (error) {
               state.fail(rows.map((row) => row.id), error instanceof Error ? error.message : String(error))
@@ -456,6 +472,13 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>, signal?:
       } catch (error) {
         failed = true
         console.error(`warning: sync source ${source.kind} failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
+      if (pathFingerprint && result && !backpressure && result.complete && !("reconcileBlocked" in result && result.reconcileBlocked)) {
+        try {
+          state.recordSourceComplete(sourceID, pathFingerprint.mtimeMs, pathFingerprint.sizeOrCount, pathFingerprint.childMaxMtimeMs)
+        } catch (recordError) {
+          // A failed recording should not poison the pass.
+        }
       }
     }
     return { progress: progressed, pending: state.pendingCount(), failed }
@@ -524,6 +547,30 @@ async function availableDefaultSyncSources() {
 function emptyDiscovery(kind: string, checkpoint: Record<string, unknown> | undefined): JsonlDiscoveryResult | { records: never[]; sessionRecords: never[]; checkpoint: OpenCodeV1Checkpoint; complete: false; hasMore: boolean; reconcilePrefixes: never[]; sourceUpdatedAt: number } {
   if (kind === "opencode-v1-sqlite" || kind === "opencode-v1-sessions") return { records: [], sessionRecords: [], checkpoint: checkpoint as OpenCodeV1Checkpoint ?? { sourceUpdatedAt: 0, sessionCreatedAt: 0, sessionID: "", reconcileBefore: Date.now() }, complete: false, hasMore: false, reconcilePrefixes: [], sourceUpdatedAt: 0 }
   return { records: [], sessionRecords: [], checkpoint: checkpoint as JsonlCheckpoint ?? { version: 1, files: {} }, complete: false, hasMore: true, reconcilePrefixes: [], sourceUpdatedAt: 0 }
+}
+
+async function sourcePathFingerprint(kind: string, filename: string): Promise<{ mtimeMs: number; sizeOrCount: number; childMaxMtimeMs: number }> {
+  const metadata = await stat(filename)
+  const isDirectory = kind === "codex-jsonl" || kind === "codex-jsonl-sessions" || kind === "pi-jsonl"
+  if (!isDirectory) return { mtimeMs: metadata.mtimeMs, sizeOrCount: metadata.size, childMaxMtimeMs: 0 }
+  let sizeOrCount = 0
+  let childMaxMtimeMs = 0
+  try {
+    const entries = await readdir(filename)
+    sizeOrCount = entries.length
+    for (const entry of entries) {
+      try {
+        const child = await stat(path.join(filename, entry))
+        if (child.mtimeMs > childMaxMtimeMs) childMaxMtimeMs = child.mtimeMs
+      } catch {
+        // An unreadable entry should not block the fingerprint.
+      }
+    }
+  } catch {
+    // The directory itself was statable but is unreadable; fall through
+    // with the counts we have. The discovery pass will surface the real error.
+  }
+  return { mtimeMs: metadata.mtimeMs, sizeOrCount, childMaxMtimeMs }
 }
 
 async function discoverSource(kind: string, filename: string, sourceID: string, checkpoint: Record<string, unknown> | undefined, includeParts: boolean, includeToolOutput: boolean, maxRecords: number, signal?: AbortSignal, keepRemoteOnMissing = false, allowSourceShrink = false) {

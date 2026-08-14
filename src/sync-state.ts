@@ -46,6 +46,7 @@ export class SyncState {
       create index if not exists outbox_ready_idx on outbox(destination_id, state, next_attempt_at, record_revision);
       create index if not exists normalized_record_retention_idx on normalized_record(observed_at);
       create index if not exists outbox_record_idx on outbox(source_id, record_kind, natural_key);
+      create table if not exists source_scan (source_id text primary key references source(id) on delete cascade, path_mtime_ms integer not null, path_size_or_count integer not null, child_max_mtime_ms integer not null, last_complete_scan_at integer not null);
     `)
     this.db.query("insert or ignore into schema_migration(version, applied_at) values (1, ?)").run(Date.now())
     this.applyLocalMigrations()
@@ -62,8 +63,15 @@ export class SyncState {
       [8, "source", "last_staged_at", "integer"],
       [9, "source", "last_sent_at", "integer"],
       [10, "source", "last_remote_tombstone_purge_at", "integer"],
+      [11, "source_scan", "source_id", "text primary key"],
     ] as const
     for (const [version, table, column, definition] of migrations) {
+      if (definition.includes("primary key")) {
+        const exists = (this.db.query(`select 1 from sqlite_master where type='table' and name=?`).get(table) !== null)
+        if (!exists) this.db.exec(`create table if not exists ${table} (${column} references source(id) on delete cascade, path_mtime_ms integer not null, path_size_or_count integer not null, child_max_mtime_ms integer not null, last_complete_scan_at integer not null)`)
+        this.db.query("insert or ignore into schema_migration(version, applied_at) values (?, ?)").run(version, Date.now())
+        continue
+      }
       const exists = (this.db.query(`pragma table_info(${table})`).all() as Array<{ name: string }>).some((row) => row.name === column)
       if (!exists) this.db.exec(`alter table ${table} add column ${column} ${definition}`)
       this.db.query("insert or ignore into schema_migration(version, applied_at) values (?, ?)").run(version, Date.now())
@@ -168,6 +176,23 @@ export class SyncState {
       return changed
     })
     return transaction()
+  }
+
+  /** Record a successful complete scan of a source. The fingerprint lets the
+   *  next syncPass detect "nothing changed" without re-running discovery. */
+  recordSourceComplete(sourceID: string, pathMtimeMs: number, pathSizeOrCount: number, childMaxMtimeMs: number): void {
+    this.db.query(
+      "insert into source_scan(source_id, path_mtime_ms, path_size_or_count, child_max_mtime_ms, last_complete_scan_at) values(?, ?, ?, ?, ?) on conflict(source_id) do update set path_mtime_ms=excluded.path_mtime_ms, path_size_or_count=excluded.path_size_or_count, child_max_mtime_ms=excluded.child_max_mtime_ms, last_complete_scan_at=excluded.last_complete_scan_at"
+    ).run(sourceID, pathMtimeMs, pathSizeOrCount, childMaxMtimeMs, Date.now())
+  }
+
+  /** Return true iff the source has been fully scanned before AND its current
+   *  path fingerprint matches the one stored at the last complete scan. The
+   *  caller is expected to have just computed a fresh fingerprint. */
+  shouldSkipSource(sourceID: string, pathMtimeMs: number, pathSizeOrCount: number, childMaxMtimeMs: number): boolean {
+    const row = this.db.query("select path_mtime_ms, path_size_or_count, child_max_mtime_ms from source_scan where source_id=?").get(sourceID) as { path_mtime_ms: number; path_size_or_count: number; child_max_mtime_ms: number } | undefined
+    if (!row) return false
+    return row.path_mtime_ms === pathMtimeMs && row.path_size_or_count === pathSizeOrCount && row.child_max_mtime_ms === childMaxMtimeMs
   }
 
   enqueue(records: NormalizedRecord[], sourceID: string, stream: string, checkpoint: unknown, destinationID = "postgres", snapshot?: { complete?: boolean; recordKinds?: string[]; prefixes?: Array<{ prefix: string; lineCount: number; recordKinds: string[] }> }, maxOutboxBytes = Number.POSITIVE_INFINITY) {

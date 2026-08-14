@@ -182,4 +182,23 @@ describe("portable better-compact state", () => {
     state.close()
     await rm(path.dirname(filename), { recursive: true, force: true })
   })
+
+  test("records and skips a complete source scan by path fingerprint", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "better-compact-state-"))
+    temporary.push(directory)
+    const state = await openSyncState(path.join(directory, "state.sqlite"))
+    state.ensureInstallation("installation-1", "incarnation-1")
+    state.upsertSource({ id: "source-1", installationID: "installation-1", kind: "opencode-v1-sqlite", schemaVersion: 1, locator: "/tmp/opencode.db", incarnation: "source-incarnation-1" })
+
+    expect(state.shouldSkipSource("source-1", 1234, 567, 0)).toBe(false)
+    state.recordSourceComplete("source-1", 1234, 567, 0)
+    expect(state.shouldSkipSource("source-1", 1234, 567, 0)).toBe(true)
+    expect(state.shouldSkipSource("source-1", 1235, 567, 0)).toBe(false)
+    expect(state.shouldSkipSource("source-1", 1234, 568, 0)).toBe(false)
+    expect(state.shouldSkipSource("source-2", 1234, 567, 0)).toBe(false)
+
+    state.recordSourceComplete("source-1", 9999, 100, 200)
+    expect(state.shouldSkipSource("source-1", 9999, 100, 200)).toBe(true)
+    state.close()
+  })
 })
