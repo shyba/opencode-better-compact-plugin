@@ -20,13 +20,15 @@ describe("Node-hosted Pi runtime", () => {
     }
   })
 
-  test("opens and queries semantic state through node:sqlite", async () => {
+  test("keeps semantic state on node:sqlite after Pi installs its Bun crypto shim", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "better-compact-node-sqlite-"))
     try {
       const result = Bun.spawnSync({
         cmd: ["node", "--input-type=module", "-e", `
           import { createJiti } from "jiti"
           const jiti = createJiti(import.meta.url)
+          const extension = await jiti.import(process.env.PI_MODULE)
+          extension.default({ on() {}, registerCommand() {} })
           const semantic = await jiti.import(process.env.SEMANTIC_MODULE)
           const store = new semantic.SemanticStore(process.env.SEMANTIC_DATABASE)
           console.log(JSON.stringify(store.db.query("select 1 as ok").get()))
@@ -35,6 +37,7 @@ describe("Node-hosted Pi runtime", () => {
         env: {
           ...process.env,
           NODE_NO_WARNINGS: "1",
+          PI_MODULE: path.join(process.cwd(), "src/pi.ts"),
           SEMANTIC_MODULE: path.join(process.cwd(), "src/semantic.ts"),
           SEMANTIC_DATABASE: path.join(dir, "state.sqlite"),
         },

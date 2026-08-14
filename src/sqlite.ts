@@ -58,7 +58,9 @@ export class SQLiteDatabase {
 }
 
 function sqliteConstructor() {
-  if (typeof Bun !== "undefined") {
+  // Pi installs a minimal globalThis.Bun crypto shim when it runs on Node, so
+  // the global's presence cannot identify the host runtime.
+  if (process.versions.bun) {
     return (runtimeRequire("bun:sqlite") as { Database: SQLiteConstructor }).Database
   }
   return (runtimeRequire("node:sqlite") as { DatabaseSync: SQLiteConstructor }).DatabaseSync
