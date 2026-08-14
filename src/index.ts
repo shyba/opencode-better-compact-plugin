@@ -5,6 +5,7 @@ export { server }
 export * from "./ledger.js"
 export * from "./options.js"
 export * from "./semantic.js"
+export * from "./sqlite.js"
 export * from "./state.js"
 export * from "./validation.js"
 

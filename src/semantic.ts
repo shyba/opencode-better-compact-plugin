@@ -1,8 +1,8 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs"
 import path from "node:path"
-import { Database } from "bun:sqlite"
 import type { CatFile } from "./cat-core.js"
 import { redact, sha256, truncateUtf8, utf8Bytes } from "./ledger.js"
+import { SQLiteDatabase } from "./sqlite.js"
 
 export const SEMANTIC_START = "<!-- better-compact semantic-checkpoint v1 start -->"
 export const SEMANTIC_END = "<!-- better-compact semantic-checkpoint v1 end -->"
@@ -138,11 +138,11 @@ export function attachSemanticCheckpoint(summary: string, checkpoint: SemanticCh
 }
 
 export class SemanticStore {
-  readonly db: Database
+  readonly db: SQLiteDatabase
 
   constructor(readonly filename: string) {
     mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 })
-    this.db = new Database(filename)
+    this.db = new SQLiteDatabase(filename)
     chmodSync(filename, 0o600)
     this.db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=1000;")
     this.db.exec(`
