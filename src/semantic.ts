@@ -1,37 +1,8 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs"
 import path from "node:path"
-import type { Database as BunDatabase } from "bun:sqlite"
 import type { CatFile } from "./cat-core.js"
 import { redact, sha256, truncateUtf8, utf8Bytes } from "./ledger.js"
-
-export type Database = BunDatabase
-
-// `bun:sqlite` is a Bun built-in. Some pi installations run the global `pi`
-// binary on Node, where `bun:sqlite` cannot be resolved at module load and
-// the pi extension would crash before any handler runs. Keep the `Database`
-// runtime binding runtime-conditional so the module loads under both:
-//   - Bun   -> `Database` is the real `bun:sqlite` class.
-//   - Node  -> `Database` is a stub that throws a clear error the moment
-//              anyone tries to open a sqlite handle, so the rest of the
-//              semantic pipeline (pure-JS helpers, validation, prompt
-//              extension, checkpoint block) still works in degraded mode.
-const Database: any = typeof Bun !== "undefined"
-  ? ((await import("bun:sqlite")).Database)
-  : class NodeDatabaseStub {
-      constructor(_filename: string) {
-        throw new Error("semantic checkpoints require Bun (bun:sqlite is unavailable under Node)")
-      }
-      exec(_sql: string): void {
-        throw new Error("semantic checkpoints require Bun")
-      }
-      query(_sql: string): never {
-        throw new Error("semantic checkpoints require Bun")
-      }
-      transaction<T extends (...args: any[]) => any>(_fn: T): T {
-        throw new Error("semantic checkpoints require Bun")
-      }
-      close(): void {}
-    }
+import { SQLiteDatabase } from "./sqlite.js"
 
 export const SEMANTIC_START = "<!-- better-compact semantic-checkpoint v1 start -->"
 export const SEMANTIC_END = "<!-- better-compact semantic-checkpoint v1 end -->"
@@ -167,11 +138,11 @@ export function attachSemanticCheckpoint(summary: string, checkpoint: SemanticCh
 }
 
 export class SemanticStore {
-  readonly db: Database
+  readonly db: SQLiteDatabase
 
   constructor(readonly filename: string) {
     mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 })
-    this.db = new Database(filename)
+    this.db = new SQLiteDatabase(filename)
     chmodSync(filename, 0o600)
     this.db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=1000;")
     this.db.exec(`
