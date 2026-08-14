@@ -4,11 +4,12 @@ import path from "node:path"
 import { CONFIG_DIR_NAME, type SessionEntry } from "@earendil-works/pi-coding-agent"
 import type { AgentMessage } from "@earendil-works/pi-agent-core"
 import type { ImageContent, TextContent, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai"
-import type { MessageRecord, RecoveryLedger, TodoRecord } from "./ledger.js"
+import { utf8Bytes, type MessageRecord, type RecoveryLedger, type TodoRecord } from "./ledger.js"
 import { parseOptions, type ParsedOptions, type PluginOptions } from "./options.js"
 import type { ProjectedSummary } from "./projection.js"
 import { parsePluginLedger, parseProjectedSummary } from "./validation.js"
 import { CAT_INJECTION_MARKER } from "./cat-markers.js"
+import type { CatFile } from "./cat-core.js"
 
 export const PI_CONFIG_FILENAME = "safe-compaction.json"
 
@@ -24,6 +25,8 @@ export type PriorPluginSummary = {
 const PERSISTED_OPTION_KEYS = [
   "model",
   "response_mode",
+  "semantic_checkpoints",
+  "max_semantic_source_bytes",
   "tail_turns",
   "max_output_tokens",
   "max_user_text_bytes",
@@ -44,6 +47,26 @@ export function isCatAttachment(message: AgentMessage): boolean {
   if (message.role !== "user" && message.role !== "custom") return false
   if (typeof message.content === "string") return message.content.trimStart().startsWith(CAT_INJECTION_MARKER)
   return message.content.some((block, index) => index === 0 && block.type === "text" && block.text.trimStart().startsWith(CAT_INJECTION_MARKER))
+}
+
+/** Recover exact /cat payloads already present in Pi context. Newer payloads
+ *  replace older copies of the same path; the semantic pipeline applies its
+ *  own byte cap before sending them to the checkpoint model. */
+export function catFilesFromMessages(messages: readonly AgentMessage[]): CatFile[] {
+  const files = new Map<string, CatFile>()
+  for (const message of messages) {
+    if (!isCatAttachment(message)) continue
+    const text = messageText(message)
+    for (const match of text.matchAll(/<file:([^\r\n>]+)>\n([\s\S]*?)\n<\/file>/g)) {
+      const filename = match[1]?.trim()
+      const content = match[2]
+      if (!filename || content === undefined) continue
+      const bytes = utf8Bytes(content)
+      files.set(filename, { path: filename, text: content, bytes, tokens: Math.ceil(content.length / 4) })
+      if (files.size >= 256) break
+    }
+  }
+  return [...files.values()].sort((left, right) => left.path.localeCompare(right.path))
 }
 
 /** Convert pi AgentMessages into the plugin's host-agnostic MessageRecord shape.
@@ -251,6 +274,13 @@ function standaloneToolPart(result: ToolResultMessage, messageID: string, sessio
 
 function textOfContent(content: readonly (TextContent | ImageContent)[]): string {
   return content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n")
+}
+
+function messageText(message: AgentMessage) {
+  if (message.role === "compactionSummary" || message.role === "branchSummary") return message.summary
+  if (message.role !== "user" && message.role !== "custom") return ""
+  if (typeof message.content === "string") return message.content
+  return message.content.flatMap((block) => block.type === "text" ? [block.text] : []).join("\n")
 }
 
 function bashExecutionText(message: { command?: string; output?: string; truncated?: boolean }): string {

@@ -12,6 +12,7 @@ import {
   PROJECTION_SECTION_LIMITS,
   ledgerReferenceID,
   ledgerReferenceIDs,
+  parseProjectionEnvelope,
   parseProjectionBlock,
   parseProjectionJSON,
   projectionBudget,
@@ -69,6 +70,13 @@ describe("validated model projection", () => {
     const invalid = projection(current)
     invalid.goal.ledger_refs = []
     expect(parseProjectionJSON(JSON.stringify(invalid), current, 16_384)).toBeUndefined()
+  })
+
+  test("validates a strict projection envelope without weakening duplicate-key checks", () => {
+    const current = ledger()
+    const value = { ...projection(current), semantic_delta: { upserts: [] } }
+    expect(parseProjectionEnvelope(JSON.stringify(value), current, 49_152, ["semantic_delta"])?.extras).toEqual({ semantic_delta: { upserts: [] } })
+    expect(parseProjectionEnvelope(JSON.stringify(value).replace('"semantic_delta":', '"semantic_delta":{},"semantic_delta":'), current, 49_152, ["semantic_delta"])).toBeUndefined()
   })
 
   test("remaps stable references onto a newer ledger and drops stale claims", () => {

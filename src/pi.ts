@@ -6,10 +6,11 @@ import { uuidv7 } from "@earendil-works/pi-ai"
 import { createHash } from "node:crypto"
 import { buildRecoveryLedger, utf8Bytes } from "./ledger.js"
 import { SELECTED_MODEL, parseOptions, resolveOptions, type PluginOptions } from "./options.js"
-import { isCatAttachment, loadPiOptions, priorPluginSummary, savePiOptions, toMessageRecords, todosFromBranch } from "./pi-adapter.js"
-import { remapProjection } from "./projection.js"
+import { catFilesFromMessages, isCatAttachment, loadPiOptions, priorPluginSummary, savePiOptions, toMessageRecords, todosFromBranch } from "./pi-adapter.js"
+import { parseProjectionEnvelope, remapProjection, renderProjection } from "./projection.js"
 import { buildAuthoritativeSummary, buildCompactionPrompt, renderProjectedResponse } from "./validation.js"
 import { collectFiles, formatPinnedBlock, loadCatOptions, loadFixedPin, pinnedPathsOnlyBlock } from "./cat-core.js"
+import { SEMANTIC_CHECKPOINT_MAX_BYTES, SemanticStore, attachSemanticCheckpoint, repositoryIdentity, semanticArtifacts, semanticDatabasePath, semanticPromptExtension, validateSemanticDelta } from "./semantic.js"
 
 export { loadPiOptions, savePiOptions, toMessageRecords, todosFromBranch, priorPluginSummary } from "./pi-adapter.js"
 export type { PriorPluginSummary } from "./pi-adapter.js"
@@ -46,8 +47,14 @@ export default function piExtension(pi: ExtensionAPI) {
     const { messages, branch, sessionID, signal, ctx } = input
     if (signal.aborted) return
     const fixedPin = loadFixedPin(ctx.cwd, sessionID)
+    const fixedFiles = fixedPin
+      ? collectFiles(fixedPin.patterns, ctx.cwd, loadCatOptions(ctx.cwd), fixedPin.tokenBudget, fixedPin.excludeGitIgnored).files
+      : []
+    const artifacts = resolved.semantic_checkpoints
+      ? semanticArtifacts(fixedFiles.length ? fixedFiles : catFilesFromMessages(messages), resolved.max_semantic_source_bytes)
+      : []
     const records = toMessageRecords(
-      fixedPin ? messages.filter((message) => !isCatAttachment(message)) : messages,
+      fixedPin || resolved.semantic_checkpoints ? messages.filter((message) => !isCatAttachment(message)) : messages,
       sessionID,
     )
     const todos = todosFromBranch(branch)
@@ -62,7 +69,19 @@ export default function piExtension(pi: ExtensionAPI) {
     const projection = prior?.projection ? remapProjection(prior.projection, ledger) : undefined
     const model = compactionModel(ctx, resolved.model)
     if (!model) return
-    const prompt = buildCompactionPrompt(ledger, resolved.max_summary_bytes, projection, resolved.response_mode)
+    let semantic: { store: SemanticStore; repository: ReturnType<typeof repositoryIdentity>; extension: ReturnType<typeof semanticPromptExtension> } | undefined
+    if (artifacts.length && resolved.response_mode === "json") {
+      let store: SemanticStore | undefined
+      try {
+        store = new SemanticStore(semanticDatabasePath())
+        const repository = repositoryIdentity(ctx.cwd)
+        semantic = { store, repository, extension: semanticPromptExtension(store.context(repository.id), artifacts) }
+      } catch (error) {
+        store?.close()
+        warnHook("semantic.prepare", sessionID, error)
+      }
+    }
+    const prompt = buildCompactionPrompt(ledger, resolved.max_summary_bytes, projection, resolved.response_mode, semantic?.extension)
     const response = await ctx.modelRegistry.complete(
       model,
       {
@@ -74,12 +93,39 @@ export default function piExtension(pi: ExtensionAPI) {
         sessionId: uuidv7(),
         signal,
       },
-    )
-    if (signal.aborted) return
+    ).catch((error) => {
+      semantic?.store.close()
+      throw error
+    })
+    if (signal.aborted) {
+      semantic?.store.close()
+      return
+    }
     const text = response.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n")
-    const summary =
-      renderProjectedResponse(text, ledger, resolved.max_summary_bytes, resolved.response_mode) ??
-      buildAuthoritativeSummary({ ledger, maxBytes: resolved.max_summary_bytes })
+    let summary = renderProjectedResponse(text, ledger, resolved.max_summary_bytes, resolved.response_mode)
+    if (semantic) {
+      try {
+        const envelope = parseProjectionEnvelope(
+          text,
+          ledger,
+          resolved.max_summary_bytes,
+          ["semantic_delta"],
+        )
+        if (envelope) {
+          summary = renderProjection(envelope.projection, ledger, Math.max(0, resolved.max_summary_bytes - SEMANTIC_CHECKPOINT_MAX_BYTES))
+          const delta = validateSemanticDelta(envelope.extras.semantic_delta, artifacts, semantic.store.currentIDs(semantic.repository.id))
+          if (delta && summary) {
+            const checkpoint = semantic.store.commit(semantic.repository, artifacts, delta)
+            summary = attachSemanticCheckpoint(summary, checkpoint, resolved.max_summary_bytes)
+          }
+        }
+      } catch (error) {
+        warnHook("semantic.commit", sessionID, error)
+      } finally {
+        semantic.store.close()
+      }
+    }
+    summary ??= buildAuthoritativeSummary({ ledger, maxBytes: resolved.max_summary_bytes })
     return { summary, usage: response.usage, details: { ledgerDigest: ledger.digest, ledgerBytes: utf8Bytes(ledger.block) } }
   }
 

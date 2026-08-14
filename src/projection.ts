@@ -86,6 +86,18 @@ export function parseProjectionJSON(text: string, ledger: RecoveryLedger, maxByt
   return validateProjection(value, ledger, { maxBytes })
 }
 
+export function parseProjectionEnvelope(text: string, ledger: RecoveryLedger, maxBytes: number, extraKeys: readonly string[]) {
+  if (!text.trim() || utf8Bytes(text) > maxBytes || hasUnpairedSurrogate(text)) return
+  const value = strictJSON(text)
+  if (!value || typeof value !== "object" || Array.isArray(value)) return
+  const object = value as Record<string, unknown>
+  const keys = ["version", "goal", "constraints", "decisions", "current_state", "files", "evidence", "blockers", "next_actions", "ledger_sha256"]
+  if (!exactKeys(object, [...keys, ...extraKeys])) return
+  const projection = validateProjection(Object.fromEntries(keys.map((key) => [key, object[key]])), ledger, { maxBytes })
+  if (!projection) return
+  return { projection, extras: Object.fromEntries(extraKeys.map((key) => [key, object[key]])) }
+}
+
 export function projectionBlock(projection: ProjectedSummary) {
   const body = JSON.stringify(projection, null, 2)
   return `${PROJECTION_START}\n\`\`\`json\n${body}\n\`\`\`\n${PROJECTION_END}`

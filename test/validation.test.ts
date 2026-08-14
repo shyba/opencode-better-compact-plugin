@@ -140,3 +140,24 @@ describe("legacy markdown response mode", () => {
     expect(renderProjectedResponse('{"version":1}', ledger, 49_152, "markdown")).toBeUndefined()
   })
 })
+
+describe("semantic prompt extension", () => {
+  const ledger = canonicalLedger({ ...EMPTY_DATA, recent_requests: ["Understand the mapper"] })
+
+  test("leaves the default JSON contract free of semantic instructions", () => {
+    const prompt = buildCompactionPrompt(ledger, 49_152)
+    expect(prompt).toContain("Keep the JSON response within")
+    expect(prompt).not.toContain("semantic_delta")
+    expect(prompt).not.toContain("Semantic checkpointing is enabled")
+  })
+
+  test("adds the extra JSON field only when explicitly enabled", () => {
+    const prompt = buildCompactionPrompt(ledger, 49_152, undefined, "json", {
+      instructions: "Semantic checkpointing is enabled.",
+      jsonField: '"semantic_delta":{"upserts":[]}',
+    })
+    expect(prompt).toContain("Semantic checkpointing is enabled")
+    expect(prompt).toContain('"semantic_delta":{"upserts":[]}')
+    expect(prompt).toContain("complete JSON response within 49152 bytes")
+  })
+})

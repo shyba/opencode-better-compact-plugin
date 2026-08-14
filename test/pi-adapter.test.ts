@@ -8,6 +8,7 @@ import { canonicalLedger, type RecoveryLedgerData } from "../src/ledger.js"
 import { resolveOptions, parseOptions } from "../src/options.js"
 import {
   isCatAttachment,
+  catFilesFromMessages,
   loadPiOptions,
   priorPluginSummary,
   savePiOptions,
@@ -16,6 +17,9 @@ import {
 } from "../src/pi-adapter.js"
 import { buildAuthoritativeSummary } from "../src/validation.js"
 import { PINNED_START, saveFixedPin, formatInjection } from "../src/cat-core.js"
+import { SEMANTIC_START, SemanticStore, repositoryIdentity } from "../src/semantic.js"
+import { ledgerReferenceID } from "../src/projection.js"
+import { parsePluginLedger } from "../src/validation.js"
 import packageJSON from "../package.json"
 import piExtension from "../src/pi.js"
 import catExtension from "../src/cat.js"
@@ -88,6 +92,20 @@ describe("isCatAttachment", () => {
   test("detects the marker in summary messages", () => {
     expect(isCatAttachment({ role: "compactionSummary", summary: "<!-- cat-files v1 -->", tokensBefore: 10, timestamp: 1 })).toBe(true)
     expect(isCatAttachment({ role: "branchSummary", summary: "no marker", tokensBefore: 10, timestamp: 1 })).toBe(false)
+  })
+})
+
+describe("catFilesFromMessages", () => {
+  test("recovers the newest exact /cat payload for each path", () => {
+    const first = formatInjection([{ path: "src/a.rs", bytes: 3, tokens: 1, text: "old" }])
+    const second = formatInjection([
+      { path: "src/a.rs", bytes: 3, tokens: 1, text: "new" },
+      { path: "src/b.rs", bytes: 4, tokens: 1, text: "more" },
+    ])
+    expect(catFilesFromMessages([userMessage(first), userMessage(second)])).toEqual([
+      { path: "src/a.rs", bytes: 3, tokens: 1, text: "new" },
+      { path: "src/b.rs", bytes: 4, tokens: 1, text: "more" },
+    ])
   })
 })
 
@@ -396,6 +414,135 @@ describe("Pi package integration", () => {
       }, { ...ctx, sessionManager: { getSessionId: () => "session-without-pin", getBranch: () => [] } })
       expect((ordinaryResult as { compaction: { summary: string } }).compaction.summary).toContain("ordinary.rs")
     } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("persists a semantic /cat checkpoint while keeping only its compact reference inline", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "sc-pi-semantic-"))
+    const priorState = process.env.BETTER_COMPACT_STATE
+    try {
+      const stateFile = path.join(dir, "state.sqlite")
+      process.env.BETTER_COMPACT_STATE = stateFile
+      await mkdir(path.join(dir, ".pi"), { recursive: true })
+      await writeFile(path.join(dir, ".pi", "safe-compaction.json"), JSON.stringify({ semantic_checkpoints: true, max_semantic_source_bytes: 32_768 }))
+      const events = new Map<string, unknown[]>()
+      const api = {
+        on(event: string, handler: unknown) { events.set(event, [...(events.get(event) ?? []), handler]) },
+        registerCommand() {},
+      } as unknown as ExtensionAPI
+      piExtension(api)
+      const model = {
+        provider: "test", id: "model", api: "openai-completions", name: "test", baseUrl: "http://example.test",
+        reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 20_000, maxTokens: 4_000,
+      }
+      const ctx = {
+        cwd: dir,
+        model,
+        sessionManager: { getSessionId: () => "semantic-session", getBranch: () => [] },
+        modelRegistry: {
+          hasConfiguredAuth: () => true,
+          complete: async (_model: unknown, context: { messages: Array<{ content: Array<{ text: string }> }> }) => {
+            const prompt = context.messages[0]!.content[0]!.text
+            const ledger = parsePluginLedger(prompt)!
+            const request = ledger.data.recent_requests[0]!
+            const ref = ledgerReferenceID("recent_requests", request)
+            const artifact = prompt.match(/"ref":"(cat:[a-f0-9]+)"/)?.[1]
+            expect(artifact).toBeDefined()
+            const output = {
+              version: 1,
+              goal: { text: "Understand the mapper", ledger_refs: [ref] },
+              constraints: [], decisions: [], current_state: [], files: [], evidence: [], blockers: [], next_actions: [],
+              ledger_sha256: ledger.digest,
+              semantic_delta: {
+                upserts: [{ id: "sem:mapper-role", kind: "responsibility", title: "Mapper role", summary: "Maps persisted records into API responses.", status: "current", confidence: "high", evidence_refs: [artifact], related_ids: [] }],
+                supersede_ids: [], active_ids: ["sem:mapper-role"], nucleus: ["The mapper owns persistence-to-API conversion."],
+              },
+            }
+            return {
+              role: "assistant", content: [{ type: "text", text: JSON.stringify(output) }], api: "openai-completions", provider: "test", model: "model",
+              usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+              stopReason: "stop", timestamp: 1,
+            }
+          },
+        },
+        getContextUsage: () => ({ tokens: 1_000, contextWindow: 20_000 }),
+      }
+      await (events.get("session_start")![0] as (event: unknown, context: unknown) => unknown)({}, ctx)
+      const handler = events.get("session_before_compact")![0] as (event: unknown, context: unknown) => Promise<unknown>
+      const source = formatInjection([{ path: "src/Mapper.java", bytes: 36, tokens: 9, text: "class Mapper { Api map(Row row) {} }" }])
+      const result = await handler({ preparation: { messagesToSummarize: [userMessage("Understand the mapper"), userMessage(source)], turnPrefixMessages: [], firstKeptEntryId: "keep", tokensBefore: 1_000 }, signal: new AbortController().signal }, ctx)
+      const summary = (result as { compaction: { summary: string } }).compaction.summary
+      expect(summary).toContain(SEMANTIC_START)
+      expect(summary).toContain("The mapper owns persistence-to-API conversion.")
+      expect(summary).not.toContain("class Mapper")
+      const store = new SemanticStore(stateFile)
+      const repository = repositoryIdentity(dir)
+      expect(store.context(repository.id)).toContain("sem:mapper-role")
+      expect(store.context(repository.id)).toContain("Maps persisted records into API responses.")
+      store.close()
+    } finally {
+      if (priorState === undefined) delete process.env.BETTER_COMPACT_STATE
+      else process.env.BETTER_COMPACT_STATE = priorState
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("keeps ordinary compaction valid when the semantic delta is malformed", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "sc-pi-semantic-invalid-"))
+    const priorState = process.env.BETTER_COMPACT_STATE
+    try {
+      const stateFile = path.join(dir, "state.sqlite")
+      process.env.BETTER_COMPACT_STATE = stateFile
+      await mkdir(path.join(dir, ".pi"), { recursive: true })
+      await writeFile(path.join(dir, ".pi", "safe-compaction.json"), JSON.stringify({ semantic_checkpoints: true }))
+      const events = new Map<string, unknown[]>()
+      const api = {
+        on(event: string, handler: unknown) { events.set(event, [...(events.get(event) ?? []), handler]) },
+        registerCommand() {},
+      } as unknown as ExtensionAPI
+      piExtension(api)
+      const model = {
+        provider: "test", id: "model", api: "openai-completions", name: "test", baseUrl: "http://example.test",
+        reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 20_000, maxTokens: 4_000,
+      }
+      const ctx = {
+        cwd: dir,
+        model,
+        sessionManager: { getSessionId: () => "semantic-invalid", getBranch: () => [] },
+        modelRegistry: {
+          hasConfiguredAuth: () => true,
+          complete: async (_model: unknown, context: { messages: Array<{ content: Array<{ text: string }> }> }) => {
+            const ledger = parsePluginLedger(context.messages[0]!.content[0]!.text)!
+            const ref = ledgerReferenceID("recent_requests", ledger.data.recent_requests[0]!)
+            return {
+              role: "assistant", content: [{ type: "text", text: JSON.stringify({
+                version: 1,
+                goal: { text: "Understand the mapper", ledger_refs: [ref] },
+                constraints: [], decisions: [], current_state: [], files: [], evidence: [], blockers: [], next_actions: [],
+                ledger_sha256: ledger.digest,
+                semantic_delta: { upserts: "not-an-array", supersede_ids: [], active_ids: [], nucleus: [] },
+              }) }], api: "openai-completions", provider: "test", model: "model",
+              usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+              stopReason: "stop", timestamp: 1,
+            }
+          },
+        },
+        getContextUsage: () => ({ tokens: 1_000, contextWindow: 20_000 }),
+      }
+      await (events.get("session_start")![0] as (event: unknown, context: unknown) => unknown)({}, ctx)
+      const handler = events.get("session_before_compact")![0] as (event: unknown, context: unknown) => Promise<unknown>
+      const source = formatInjection([{ path: "src/Mapper.java", bytes: 15, tokens: 4, text: "class Mapper {}" }])
+      const result = await handler({ preparation: { messagesToSummarize: [userMessage("Understand the mapper"), userMessage(source)], turnPrefixMessages: [], firstKeptEntryId: "keep", tokensBefore: 1_000 }, signal: new AbortController().signal }, ctx)
+      const summary = (result as { compaction: { summary: string } }).compaction.summary
+      expect(summary).toContain("## Goal\n- Understand the mapper")
+      expect(summary).not.toContain(SEMANTIC_START)
+      const store = new SemanticStore(stateFile)
+      expect(store.latest(repositoryIdentity(dir).id)).toBeUndefined()
+      store.close()
+    } finally {
+      if (priorState === undefined) delete process.env.BETTER_COMPACT_STATE
+      else process.env.BETTER_COMPACT_STATE = priorState
       await rm(dir, { recursive: true, force: true })
     }
   })

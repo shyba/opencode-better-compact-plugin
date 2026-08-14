@@ -1,6 +1,8 @@
 export const OPTION_KEYS = [
   "model",
   "response_mode",
+  "semantic_checkpoints",
+  "max_semantic_source_bytes",
   "tail_turns",
   "preserve_recent_tokens",
   "reserved_tokens",
@@ -18,6 +20,8 @@ export type ResponseMode = (typeof RESPONSE_MODES)[number]
 export type PluginOptions = {
   model: string
   response_mode: ResponseMode
+  semantic_checkpoints: boolean
+  max_semantic_source_bytes: number
   tail_turns: number
   preserve_recent_tokens: number
   reserved_tokens: number
@@ -42,6 +46,8 @@ export const SELECTED_MODEL = "selected"
 
 export const DEFAULT_OPTIONS = {
   response_mode: "json",
+  semantic_checkpoints: false,
+  max_semantic_source_bytes: 262_144,
   tail_turns: 4,
   preserve_recent_tokens: 16_000,
   reserved_tokens: 32_000,
@@ -63,6 +69,7 @@ export const MAX_OPTIONS = {
   max_historical_part_bytes: 1 * 1_024 * 1_024,
   max_ledger_bytes: 256 * 1_024,
   max_summary_bytes: 1 * 1_024 * 1_024,
+  max_semantic_source_bytes: 4 * 1_024 * 1_024,
 } as const
 
 export function parseOptions(input: Record<string, unknown> | undefined) {
@@ -88,7 +95,12 @@ export function parseOptions(input: Record<string, unknown> | undefined) {
     result.response_mode = value.response_mode as ResponseMode
   }
 
-  for (const key of OPTION_KEYS.filter((item) => item !== "model" && item !== "response_mode")) {
+  if (value.semantic_checkpoints !== undefined) {
+    if (typeof value.semantic_checkpoints !== "boolean") throw new TypeError('Option "semantic_checkpoints" must be boolean')
+    result.semantic_checkpoints = value.semantic_checkpoints
+  }
+
+  for (const key of OPTION_KEYS.filter((item) => item !== "model" && item !== "response_mode" && item !== "semantic_checkpoints")) {
     if (value[key] === undefined) continue
     if (!Number.isSafeInteger(value[key]) || (key === "tail_turns" ? Number(value[key]) < 0 : Number(value[key]) <= 0)) {
       throw new TypeError(`Option "${key}" must be a ${key === "tail_turns" ? "non-negative" : "positive"} integer`)
@@ -102,6 +114,8 @@ export function resolveOptions(options: ParsedOptions, existing: ExistingOptions
   const result: PluginOptions = {
     model: options.model ?? existing.model ?? SELECTED_MODEL,
     response_mode: options.response_mode ?? DEFAULT_OPTIONS.response_mode,
+    semantic_checkpoints: options.semantic_checkpoints ?? DEFAULT_OPTIONS.semantic_checkpoints,
+    max_semantic_source_bytes: options.max_semantic_source_bytes ?? DEFAULT_OPTIONS.max_semantic_source_bytes,
     tail_turns: options.tail_turns ?? existing.tail_turns ?? DEFAULT_OPTIONS.tail_turns,
     preserve_recent_tokens:
       options.preserve_recent_tokens ?? existing.preserve_recent_tokens ?? DEFAULT_OPTIONS.preserve_recent_tokens,

@@ -6,6 +6,8 @@ describe("plugin option validation", () => {
     const input = {
       model: "opencode-go/glm-5.2",
       response_mode: "json",
+      semantic_checkpoints: true,
+      max_semantic_source_bytes: 262_145,
       tail_turns: 0,
       preserve_recent_tokens: 16_001,
       reserved_tokens: 32_001,
@@ -23,6 +25,12 @@ describe("plugin option validation", () => {
 
   test("accepts a legacy markdown response mode", () => {
     expect(parseOptions({ response_mode: "markdown" })).toEqual({ response_mode: "markdown" })
+  })
+
+  test("keeps semantic checkpoints explicitly opt-in", () => {
+    expect(resolveOptions({}).semantic_checkpoints).toBe(false)
+    expect(parseOptions({ semantic_checkpoints: true })).toEqual({ semantic_checkpoints: true })
+    expect(() => parseOptions({ semantic_checkpoints: "yes" })).toThrow('Option "semantic_checkpoints" must be boolean')
   })
 
   test.each(["jsonc", "text", "json-projection", 1, null])(

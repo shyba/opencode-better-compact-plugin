@@ -194,6 +194,8 @@ Tuple options use snake case. Unknown keys and invalid values fail during plugin
 | --- | ---: | --- |
 | `model` | `selected` | `selected` follows the model chosen for each compaction; `provider/model` pins a dedicated compaction model. |
 | `response_mode` | `json` | `json` asks the model for the single strict JSON projection and validates it; `markdown` keeps the legacy Markdown contract for a compatibility window. The legacy Markdown validator stays available in both modes for already-stored plugin summaries. |
+| `semantic_checkpoints` | `false` | Pi only: opt in to validated semantic objects derived from bounded `/cat` source during compaction. OpenCode behavior is unchanged. |
+| `max_semantic_source_bytes` | `262144` | Pi only: maximum aggregate exact `/cat` source supplied to one experimental semantic checkpoint. |
 | `tail_turns` | `4` | Number of recent ordinary user requests retained in the recovery ledger. May be zero. |
 | `preserve_recent_tokens` | `16000` | Recent-history budget written into OpenCode's V1 compaction settings. |
 | `reserved_tokens` | `32000` | Context reserved from compaction input; must leave usable model context. |
@@ -206,7 +208,7 @@ Tuple options use snake case. Unknown keys and invalid values fail during plugin
 
 For values OpenCode already exposes (`model`, `tail_turns`, `preserve_recent_tokens`, and `reserved_tokens`), precedence is explicit tuple option, existing OpenCode value, then plugin default. Other plugin limits use the explicit tuple option or plugin default. The configuration hook pins a dedicated model or removes that override in `selected` mode, sets temperature zero, and applies the selected compaction thresholds. The request hook validates and caps the actual per-compaction model in either mode while preserving an omitted temperature when the model declares that parameter unsupported. Existing explicit `compaction.auto` and `compaction.prune` values are preserved; absent values default to `true` and `false` respectively.
 
-Safety-critical tuple values also have hard ceilings: `tail_turns=64`, `max_user_text_bytes=8388608`, `max_inline_data_bytes=67108864`, `max_historical_part_bytes=1048576`, `max_ledger_bytes=262144`, and `max_summary_bytes=1048576`. These ceilings keep a tuple from disabling the plugin's resource bounds.
+Safety-critical tuple values also have hard ceilings: `tail_turns=64`, `max_user_text_bytes=8388608`, `max_inline_data_bytes=67108864`, `max_historical_part_bytes=1048576`, `max_ledger_bytes=262144`, `max_summary_bytes=1048576`, and `max_semantic_source_bytes=4194304`. These ceilings keep a tuple from disabling the plugin's resource bounds.
 
 ## Runtime behavior
 
@@ -284,6 +286,8 @@ Plugin-side options are read from `<cwd>/.pi/safe-compaction.json`:
 {
   "model": "selected",
   "response_mode": "json",
+  "semantic_checkpoints": false,
+  "max_semantic_source_bytes": 262144,
   "tail_turns": 4,
   "max_output_tokens": 16384,
   "max_user_text_bytes": 524288,
@@ -295,6 +299,8 @@ Plugin-side options are read from `<cwd>/.pi/safe-compaction.json`:
 ```
 
 `model: "selected"` follows the model pi selects for the session; `provider/model` pins a dedicated compaction model. `preserve_recent_tokens` and `reserved_tokens` are not persisted here — pi manages its own recent-history budgets via `compaction.keepRecentTokens` / `compaction.reserveTokens`.
+
+`semantic_checkpoints: true` enables the experimental `/cat` semantic checkpoint path. Exact `/cat` or `/cat --fixed` source is bounded by `max_semantic_source_bytes` and supplied to the checkpoint model as reference data. Validated semantic objects and source digests are stored in the Better Compact SQLite state database; the durable compaction summary carries only a compact nucleus and content-addressed snapshot reference. Invalid semantic output or local-state failures are ignored without invalidating ordinary compaction. The feature is disabled by default and currently applies only to Pi, where `/cat` is available.
 
 Todo recovery depends on a user-installed todo-tracking extension (e.g. the `todo` example). The adapter scans the branch for the most recent `todo`-tool result; with no such extension installed the ledger's todos section is empty.
 

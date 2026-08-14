@@ -46,6 +46,7 @@ export function buildCompactionPrompt(
   maxBytes: number,
   priorProjection?: ProjectedSummary,
   responseMode: ResponseMode = "json",
+  extension?: { instructions: string; jsonField: string },
 ) {
   if (responseMode === "markdown") {
     return `Compact the bounded recovery ledger below into the exact Markdown contract that follows. You are responsible for choosing the semantically active goal and the useful fields; do not mechanically copy every entry.
@@ -87,6 +88,10 @@ Return only the Markdown summary, with no commentary or code fences around the r
 ${ledger.block}`
   }
   const budget = projectionBudget(maxBytes, Math.min(maxBytes, utf8Bytes(ledger.block)))
+  const responseBudget = extension
+    ? `Keep the operational projection within ${Math.max(2_048, budget)} UTF-8 bytes and the complete JSON response within ${maxBytes} bytes so the rendered summary remains within ${maxBytes} bytes.`
+    : `Keep the JSON response within ${Math.max(2_048, budget)} UTF-8 bytes so the rendered summary remains within ${maxBytes} bytes.`
+  const extensionInstructions = extension ? `\n\n${extension.instructions}` : ""
   return `Compact the bounded recovery ledger below into exactly one JSON object. You are responsible for choosing the semantically active goal and useful fields; do not mechanically copy every entry.
 
 Before answering, silently check:
@@ -97,11 +102,11 @@ Before answering, silently check:
 - Every claim must include stable ledger_refs from the ledger entries; files use evidence_refs.
 - Use JSON only: no Markdown fences, commentary, duplicate keys, or trailing text.
 - The JSON must include version=1, all required fields, and ledger_sha256=${ledger.digest}.
-- Keep the JSON response within ${Math.max(2_048, budget)} UTF-8 bytes so the rendered summary remains within ${maxBytes} bytes.
-- Respect the item limits: constraints ${PROJECTION_SECTION_LIMITS.constraints}, decisions ${PROJECTION_SECTION_LIMITS.decisions}, current_state ${PROJECTION_SECTION_LIMITS.current_state}, blockers ${PROJECTION_SECTION_LIMITS.blockers}, evidence ${PROJECTION_SECTION_LIMITS.evidence}, files ${PROJECTION_FILES_MAX}, and next_actions ${PROJECTION_ACTIONS_MAX}.
+- ${responseBudget}
+- Respect the item limits: constraints ${PROJECTION_SECTION_LIMITS.constraints}, decisions ${PROJECTION_SECTION_LIMITS.decisions}, current_state ${PROJECTION_SECTION_LIMITS.current_state}, blockers ${PROJECTION_SECTION_LIMITS.blockers}, evidence ${PROJECTION_SECTION_LIMITS.evidence}, files ${PROJECTION_FILES_MAX}, and next_actions ${PROJECTION_ACTIONS_MAX}.${extensionInstructions}
 
 Required JSON shape:
-{"version":1,"goal":{"text":"...","ledger_refs":["..."]},"constraints":[{"text":"...","ledger_refs":["..."]}],"decisions":[{"text":"...","ledger_refs":["..."]}],"current_state":[{"text":"...","ledger_refs":["..."]}],"files":[{"path":"...","status":"changed","summary":"...","evidence_refs":["..."]}],"evidence":[{"text":"...","ledger_refs":["..."]}],"blockers":[{"text":"...","ledger_refs":["..."]}],"next_actions":[{"text":"...","status":"proposed","ledger_refs":["..."]}],"ledger_sha256":"${ledger.digest}"}
+{"version":1,"goal":{"text":"...","ledger_refs":["..."]},"constraints":[{"text":"...","ledger_refs":["..."]}],"decisions":[{"text":"...","ledger_refs":["..."]}],"current_state":[{"text":"...","ledger_refs":["..."]}],"files":[{"path":"...","status":"changed","summary":"...","evidence_refs":["..."]}],"evidence":[{"text":"...","ledger_refs":["..."]}],"blockers":[{"text":"...","ledger_refs":["..."]}],"next_actions":[{"text":"...","status":"proposed","ledger_refs":["..."]}],"ledger_sha256":"${ledger.digest}"${extension ? `,${extension.jsonField}` : ""}}
 
 The host-facing renderer will produce these compatibility sections: ## Goal, ## Constraints, ## Decisions, ## Current state, ## Files, ## Evidence, ## Blockers/questions, ## Next actions.
 
