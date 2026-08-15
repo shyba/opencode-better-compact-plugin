@@ -76,6 +76,8 @@ export class SyncState {
       if (!exists) this.db.exec(`alter table ${table} add column ${column} ${definition}`)
       this.db.query("insert or ignore into schema_migration(version, applied_at) values (?, ?)").run(version, Date.now())
     }
+    this.db.exec("create table if not exists hierarchy_backfill (source_id text not null references source(id) on delete cascade, path text not null, payload_sha256 text not null, hierarchy_status text not null, updated_at integer not null, primary key (source_id, path))")
+    this.db.query("insert or ignore into schema_migration(version, applied_at) values (12, ?)").run(Date.now())
     this.db.exec("update source set local_revision=max(local_revision, coalesce((select max(record_revision) from normalized_record where normalized_record.source_id=source.id), 0))")
   }
 
@@ -198,9 +200,21 @@ export class SyncState {
     return row.path_mtime_ms === pathMtimeMs && row.path_size_or_count === pathSizeOrCount && row.child_max_mtime_ms === childMaxMtimeMs
   }
 
-  /** All staged session records for a source, for hierarchy backfills. */
-  sessionRecords(sourceID: string): Array<{ naturalKey: string; payloadJSON: string }> {
-    return (this.db.query("select natural_key, payload_json from normalized_record where source_id=? and record_kind='session'").all(sourceID) as Array<Record<string, unknown>>).map((row) => ({ naturalKey: String(row.natural_key), payloadJSON: String(row.payload_json ?? "") }))
+  /** Persisted session inventory from the last discovery pass. The files map
+   *  survives payload release, so hierarchy backfills use it as the session list. */
+  sessionInventory(sourceID: string): Array<{ path: string; sessionID?: string; mtimeMs: number }> {
+    const checkpoint = this.checkpoint(sourceID)
+    const files = checkpoint?.files && typeof checkpoint.files === "object" && !Array.isArray(checkpoint.files) ? checkpoint.files as Record<string, { sessionID?: unknown; mtimeMs?: unknown }> : undefined
+    return Object.entries(files ?? {}).map(([path, saved]) => ({ path, ...(typeof saved?.sessionID === "string" ? { sessionID: saved.sessionID } : {}), mtimeMs: Number(saved?.mtimeMs ?? 0) }))
+  }
+
+  hierarchyBackfillSHA(sourceID: string, path: string): string | undefined {
+    const row = this.db.query("select payload_sha256 from hierarchy_backfill where source_id=? and path=?").get(sourceID, path) as { payload_sha256: string } | undefined
+    return row?.payload_sha256
+  }
+
+  recordHierarchyBackfill(sourceID: string, path: string, payloadSHA256: string, hierarchyStatus: string): void {
+    this.db.query("insert into hierarchy_backfill(source_id, path, payload_sha256, hierarchy_status, updated_at) values (?, ?, ?, ?, ?) on conflict(source_id, path) do update set payload_sha256=excluded.payload_sha256, hierarchy_status=excluded.hierarchy_status, updated_at=excluded.updated_at").run(sourceID, path, payloadSHA256, hierarchyStatus, Date.now())
   }
 
   enqueue(records: NormalizedRecord[], sourceID: string, stream: string, checkpoint: unknown, destinationID = "postgres", snapshot?: { complete?: boolean; recordKinds?: string[]; prefixes?: Array<{ prefix: string; lineCount: number; recordKinds: string[] }> }, maxOutboxBytes = Number.POSITIVE_INFINITY) {

@@ -5,7 +5,6 @@ import os from "node:os"
 import path from "node:path"
 import { Database } from "bun:sqlite"
 import { openSyncState } from "../src/sync-state.js"
-import { sessionRecord } from "../src/jsonl.js"
 
 const temporary: string[] = []
 
@@ -265,11 +264,13 @@ describe("better-compact sync backfill-hierarchy", () => {
     const state = path.join(root, "state.sqlite")
     const sourceID = createHash("sha256").update(`codex-jsonl\n${path.resolve(sessions)}`).digest("hex").slice(0, 32)
 
-    // Simulate sessions mirrored by an older build: no hierarchy in the payload.
+    // Simulate sessions mirrored by an older build: the checkpoint inventory
+    // (which survives payload release) lists both files, but no hierarchy was
+    // ever staged. normalized_record is empty like a steady-state host.
     const store = await openSyncState(state)
     store.ensureInstallation("installation-1", "incarnation-1")
     store.upsertSource({ id: sourceID, installationID: "installation-1", kind: "codex-jsonl", schemaVersion: 1, locator: sessions, incarnation: "source-incarnation-1" })
-    store.enqueue([sessionRecord(sourceID, "codex-jsonl", "2026/08/14/rollout-sub.jsonl", "66666666-6666-7666-8666-666666666666", { title: undefined, directory: undefined }, 1, 2), sessionRecord(sourceID, "codex-jsonl", "2026/08/14/rollout-root.jsonl", "77777777-7777-7777-8777-777777777777", { title: undefined, directory: undefined }, 1, 2)], sourceID, "messages", { legacy: true })
+    store.enqueue([], sourceID, "messages", { files: { "2026/08/14/rollout-sub.jsonl": { size: 1, mtimeMs: 2, sessionID: "66666666-6666-7666-8666-666666666666" }, "2026/08/14/rollout-root.jsonl": { size: 1, mtimeMs: 2, sessionID: "77777777-7777-7777-8777-777777777777" } } })
     store.close()
 
     const config = path.join(root, "config.json")
@@ -308,7 +309,7 @@ describe("better-compact sync backfill-hierarchy", () => {
     const store = await openSyncState(state)
     store.ensureInstallation("installation-1", "incarnation-1")
     store.upsertSource({ id: sourceID, installationID: "installation-1", kind: "codex-jsonl", schemaVersion: 1, locator: sessions, incarnation: "source-incarnation-1" })
-    store.enqueue([sessionRecord(sourceID, "codex-jsonl", "2025/01/01/rollout-remote.jsonl", "88888888-8888-7888-8888-888888888888", { title: undefined, directory: undefined }, 1, 2)], sourceID, "messages", { legacy: true })
+    store.enqueue([], sourceID, "messages", { files: { "2025/01/01/rollout-remote.jsonl": { size: 1, mtimeMs: 2, sessionID: "88888888-8888-7888-8888-888888888888" } } })
     store.close()
 
     const config = path.join(root, "config.json")

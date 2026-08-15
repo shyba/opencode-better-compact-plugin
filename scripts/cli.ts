@@ -383,22 +383,21 @@ async function syncBackfillHierarchy(dryRun: boolean) {
       const root = path.resolve(source.database.replace(/^~(?=\/|$)/, process.env.HOME ?? "."))
       const sourceID = createHash("sha256").update(`${source.kind}\n${root}`).digest("hex").slice(0, 32)
       const checkpoint = state.checkpoint(sourceID)
-      const staged: NormalizedRecord[] = []
-      for (const row of state.sessionRecords(sourceID)) {
-        let payload: Record<string, unknown>
-        try { payload = JSON.parse(row.payloadJSON) } catch { skipped++; continue }
-        const metadata = payload.metadata && typeof payload.metadata === "object" && !Array.isArray(payload.metadata) ? payload.metadata as Record<string, unknown> : undefined
-        if (typeof metadata?.source_path !== "string" || typeof metadata.session_id !== "string") { skipped++; continue }
-        const header = await readSessionHeader(path.join(root, metadata.source_path)).catch(() => undefined)
+      const staged: Array<{ record: NormalizedRecord; path: string; status: string }> = []
+      for (const file of state.sessionInventory(sourceID)) {
+        const header = await readSessionHeader(path.join(root, file.path)).catch(() => undefined)
         // A parsed header means a real session_meta line: known root when no
         // hierarchy fields are present. Unreadable files stay "unknown" so
         // another host (or a later copy) can still fill them in.
         const hierarchy = header?.sessionID === undefined ? { hierarchy_status: "unknown" as const } : header.hierarchy ?? { hierarchy_status: "root" as const }
-        const record = sessionRecord(sourceID, source.kind, metadata.source_path, metadata.session_id, { title: typeof payload.title === "string" ? payload.title : undefined, directory: typeof payload.directory === "string" ? payload.directory : undefined, hierarchy }, Number(payload.source_created_at ?? 0), Number(payload.source_updated_at ?? 0))
-        if (record.payloadJSON === row.payloadJSON) { current++; continue }
+        const sessionID = file.sessionID ?? header?.sessionID
+        if (!sessionID) { skipped++; continue }
+        const metadata = await stat(path.join(root, file.path)).catch(() => undefined)
+        const record = sessionRecord(sourceID, source.kind, file.path, sessionID, { title: header?.title, directory: header?.directory, hierarchy }, header?.createdAt ?? metadata?.mtimeMs ?? file.mtimeMs, metadata?.mtimeMs ?? file.mtimeMs)
+        if (state.hierarchyBackfillSHA(sourceID, file.path) === record.payloadSHA256) { current++; continue }
         if (hierarchy.hierarchy_status === "unknown") unknown++
         updated++
-        staged.push(record)
+        staged.push({ record, path: file.path, status: hierarchy.hierarchy_status })
       }
       if (dryRun || !staged.length) continue
       if (!checkpoint) {
@@ -406,7 +405,8 @@ async function syncBackfillHierarchy(dryRun: boolean) {
         console.error(`warning: no stored checkpoint for ${source.kind} at ${root}; skipped ${staged.length} staged updates`)
         continue
       }
-      state.enqueue(staged, sourceID, "messages", checkpoint, "postgres", undefined, config.sync.max_outbox_bytes)
+      state.enqueue(staged.map((item) => item.record), sourceID, "messages", checkpoint, "postgres", undefined, config.sync.max_outbox_bytes)
+      for (const item of staged) state.recordHierarchyBackfill(sourceID, item.path, item.record.payloadSHA256, item.status)
     }
     console.log(`${dryRun ? "would update" : "updated"} ${updated} session record${updated === 1 ? "" : "s"} (${unknown} unknown), ${current} already current, ${skipped} skipped${dryRun ? " (dry-run)" : ""}`)
     console.log(dryRun ? "dry-run: nothing staged; re-run without --dry-run to apply" : "staged records upload on the next sync pass")
