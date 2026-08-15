@@ -34,7 +34,7 @@ export class SyncState {
 
   constructor(readonly filename: string) {
     this.db = new Database(filename)
-    this.db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=1000;")
+    this.db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=10000;")
     this.db.exec(`
       create table if not exists schema_migration (version integer primary key, applied_at integer not null);
       create table if not exists installation (id text primary key, incarnation text not null, created_at integer not null, adopted_at integer);
