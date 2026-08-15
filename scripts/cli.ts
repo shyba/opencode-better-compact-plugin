@@ -8,7 +8,7 @@ import { configPaths, loadConfig, saveConfig } from "../src/config.js"
 import { Database } from "bun:sqlite"
 import { discoverOpenCodeV1, discoverOpenCodeV1Sessions, inspectOpenCodeV1 } from "../src/opencode-v1.js"
 import type { OpenCodeV1Checkpoint } from "../src/opencode-v1.js"
-import { discoverJsonl, discoverJsonlSessions, inspectJsonl } from "../src/jsonl.js"
+import { discoverJsonl, discoverJsonlSessions, inspectJsonl, readSessionHeader, sessionRecord } from "../src/jsonl.js"
 import type { JsonlCheckpoint, JsonlDiscoveryResult, JsonlReconcilePrefix, JsonlSessionCheckpoint } from "../src/jsonl.js"
 import { applyRemoteMigration, ensureRemoteSource, openPostgres, purgeRemoteTombstones, readRemoteFence, recordObservation, uploadFenced } from "../src/postgres.js"
 import { openSyncState, type NormalizedRecord } from "../src/sync-state.js"
@@ -72,7 +72,8 @@ if (command === "sync") {
   if (action === "prune") process.exit(await syncPrune(process.argv.includes("--yes"), process.argv.includes("--missing-directories"), process.argv.includes("--blank-directories")))
   if (action === "compact") process.exit(await syncCompact(process.argv.includes("--yes")))
   if (action === "reconcile") process.exit(await syncReconcile())
-  console.error("Usage: better-compact sync setup [--url URL|--url-stdin] [--allow-insecure-remote] [--install] | run [--once] | status | migrate | install | uninstall | prune (--missing-directories|--blank-directories) --yes | compact --yes | reconcile")
+  if (action === "backfill-hierarchy") process.exit(await syncBackfillHierarchy(process.argv.includes("--dry-run")))
+  console.error("Usage: better-compact sync setup [--url URL|--url-stdin] [--allow-insecure-remote] [--install] | run [--once] | status | migrate | install | uninstall | prune (--missing-directories|--blank-directories) --yes | compact --yes | reconcile | backfill-hierarchy [--dry-run]")
   process.exit(2)
 }
 if (command === "rag") {
@@ -108,6 +109,9 @@ Usage:
   better-compact sync prune (--missing-directories|--blank-directories) --yes Delete local Codex files while retaining remote rows
   better-compact sync compact --yes  Remove acknowledged local cache rows and compact SQLite
   better-compact sync reconcile    Force the next OpenCode source pass to rebuild a complete snapshot
+  better-compact sync backfill-hierarchy [--dry-run]
+                                   Re-read local Codex session headers and stage hierarchy metadata
+                                   (parent session, depth, nickname) for already-mirrored sessions
   better-compact rag setup         Enable the BGE-small worker and configure backend, dtype, batches, model/runtime
   better-compact rag run [--once]  Run the streaming BGE-small worker in the foreground
   better-compact rag status        Show model, row, dimension, and size metadata
@@ -322,7 +326,7 @@ async function syncRun(once: boolean, singlePass = false) {
   try {
     do {
       try {
-        const progress = await syncPass(config, controller.signal)
+        const progress = await syncPass(config, controller.signal, { bypassSkip: once })
         if (progress.pending === 0) await compactStateIfIdle()
         if (progress.failed && (once || singlePass)) return 1
         if (stopping || singlePass || (once && (!databaseURL || (!progress.progress && progress.pending === 0)))) return 0
@@ -359,6 +363,57 @@ async function syncReconcile() {
   } finally { state.close() }
 }
 
+/** Re-read local Codex session headers and stage updated session records so
+ *  the mirror learns parent/child thread hierarchy. Header-only: one small
+ *  session record per file, no message replay. Each host fills what it has
+ *  locally; files that are not present remain hierarchy_status "unknown". */
+async function syncBackfillHierarchy(dryRun: boolean) {
+  const config = await loadConfig(paths)
+  if (!config.sync.enabled) {
+    console.log("sync disabled; set sync.enabled=true in the better-compact config")
+    return 1
+  }
+  const state = await openSyncState(paths.state)
+  try {
+    let updated = 0
+    let current = 0
+    let unknown = 0
+    let skipped = 0
+    for (const source of config.sources.filter((candidate) => candidate.kind === "codex-jsonl")) {
+      const root = path.resolve(source.database.replace(/^~(?=\/|$)/, process.env.HOME ?? "."))
+      const sourceID = createHash("sha256").update(`${source.kind}\n${root}`).digest("hex").slice(0, 32)
+      const checkpoint = state.checkpoint(sourceID)
+      const staged: NormalizedRecord[] = []
+      for (const row of state.sessionRecords(sourceID)) {
+        let payload: Record<string, unknown>
+        try { payload = JSON.parse(row.payloadJSON) } catch { skipped++; continue }
+        const metadata = payload.metadata && typeof payload.metadata === "object" && !Array.isArray(payload.metadata) ? payload.metadata as Record<string, unknown> : undefined
+        if (typeof metadata?.source_path !== "string" || typeof metadata.session_id !== "string") { skipped++; continue }
+        const header = await readSessionHeader(path.join(root, metadata.source_path)).catch(() => undefined)
+        // A parsed header means a real session_meta line: known root when no
+        // hierarchy fields are present. Unreadable files stay "unknown" so
+        // another host (or a later copy) can still fill them in.
+        const hierarchy = header?.sessionID === undefined ? { hierarchy_status: "unknown" as const } : header.hierarchy ?? { hierarchy_status: "root" as const }
+        const record = sessionRecord(sourceID, source.kind, metadata.source_path, metadata.session_id, { title: typeof payload.title === "string" ? payload.title : undefined, directory: typeof payload.directory === "string" ? payload.directory : undefined, hierarchy }, Number(payload.source_created_at ?? 0), Number(payload.source_updated_at ?? 0))
+        if (record.payloadJSON === row.payloadJSON) { current++; continue }
+        if (hierarchy.hierarchy_status === "unknown") unknown++
+        updated++
+        staged.push(record)
+      }
+      if (dryRun || !staged.length) continue
+      if (!checkpoint) {
+        skipped += staged.length
+        console.error(`warning: no stored checkpoint for ${source.kind} at ${root}; skipped ${staged.length} staged updates`)
+        continue
+      }
+      state.enqueue(staged, sourceID, "messages", checkpoint, "postgres", undefined, config.sync.max_outbox_bytes)
+    }
+    console.log(`${dryRun ? "would update" : "updated"} ${updated} session record${updated === 1 ? "" : "s"} (${unknown} unknown), ${current} already current, ${skipped} skipped${dryRun ? " (dry-run)" : ""}`)
+    console.log(dryRun ? "dry-run: nothing staged; re-run without --dry-run to apply" : "staged records upload on the next sync pass")
+    return 0
+  } finally { state.close() }
+}
+
 async function compactStateIfIdle() {
   const metadata = await stat(paths.state).catch(() => undefined)
   if (!metadata || metadata.size < idleCompactionMinBytes) return
@@ -376,7 +431,7 @@ async function compactStateIfIdle() {
   }
 }
 
-async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>, signal?: AbortSignal) {
+async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>, signal?: AbortSignal, options: { bypassSkip?: boolean } = {}) {
   const state = await openSyncState(paths.state)
   let progressed = false
   let failed = false
@@ -396,10 +451,13 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>, signal?:
         try {
           const fingerprint = await sourcePathFingerprint(source.kind, filename)
           pathFingerprint = fingerprint
-          if (state.shouldSkipSource(sourceID, fingerprint.mtimeMs, fingerprint.sizeOrCount, fingerprint.childMaxMtimeMs)) {
+          if (!options.bypassSkip && state.shouldSkipSource(sourceID, fingerprint.mtimeMs, fingerprint.sizeOrCount, fingerprint.childMaxMtimeMs, config.sync.rescan_interval_ms)) {
             // Only skip when this source owes nothing to the outbox. Pending,
             // leased, or failed rows must still be uploaded this pass, or
             // `sync run --once` never reaches pending === 0 and never exits.
+            // The fingerprint is shallow (direct children of the path), so it
+            // cannot see appends to existing deep session files; the age bound
+            // and the --once bypass keep those from stranding indefinitely.
             if (state.sourcePendingCount(sourceID) === 0) {
               console.log(`unchanged ${filename}`)
               continue

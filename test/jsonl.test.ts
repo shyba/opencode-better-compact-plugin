@@ -119,4 +119,36 @@ describe("streaming JSONL adapters", () => {
     expect(result.complete).toBe(false)
     expect(result.hasMore).toBe(true)
   })
+
+  test("extracts codex thread hierarchy into session records", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "better-compact-jsonl-"))
+    temporary.push(root)
+    await mkdir(path.join(root, "2026/08/14"), { recursive: true })
+    const meta = (id: string, extra: Record<string, unknown> = {}) => JSON.stringify({ timestamp: "2026-08-14T10:00:00.000Z", type: "session_meta", payload: { id, timestamp: "2026-08-14T10:00:00.000Z", cwd: "/repo", originator: "codex_cli_rs", cli_version: "0.105.0", ...extra } })
+    const message = (text: string) => JSON.stringify({ timestamp: "2026-08-14T10:00:01.000Z", type: "event_msg", payload: { type: "user_message", message: text } })
+    const parent = "00000000-0000-7000-8000-000000000000"
+    await writeFile(path.join(root, "2026/08/14/rollout-sub.jsonl"), [meta("11111111-1111-7111-8111-111111111111", { source: { subagent: { thread_spawn: { parent_thread_id: parent, depth: 1, agent_nickname: "Alder", agent_role: "awaiter" } } }, agent_nickname: "Alder", agent_role: "awaiter" }), message("sub")].join("\n") + "\n")
+    await writeFile(path.join(root, "2026/08/14/rollout-fork.jsonl"), [meta("22222222-2222-7222-8222-222222222222", { forked_from_id: parent }), message("fork")].join("\n") + "\n")
+    await writeFile(path.join(root, "2026/08/14/rollout-guardian.jsonl"), [meta("33333333-3333-7333-8333-333333333333", { source: { subagent: { other: "guardian" } }, thread_source: "subagent" }), message("judge")].join("\n") + "\n")
+    await writeFile(path.join(root, "2026/08/14/rollout-root.jsonl"), [meta("44444444-4444-7444-8444-444444444444"), message("root")].join("\n") + "\n")
+
+    const result = await discoverJsonl(root, "source", "codex-jsonl", 0, false, 100)
+    const sessions = new Map(result.records.filter((record) => record.recordKind === "session").map((record) => [record.naturalKey, JSON.parse(record.payloadJSON ?? "{}") as Record<string, any>]))
+
+    const sub = sessions.get("2026/08/14/rollout-sub.jsonl|session")
+    expect(sub.parent_session_id).toBe(parent)
+    expect(sub.metadata.hierarchy).toEqual({ hierarchy_status: "subagent", parent_session_id: parent, depth: 1, nickname: "Alder", role: "awaiter" })
+
+    const fork = sessions.get("2026/08/14/rollout-fork.jsonl|session")
+    expect(fork.parent_session_id).toBe(parent)
+    expect(fork.metadata.hierarchy).toEqual({ hierarchy_status: "subagent", parent_session_id: parent })
+
+    const guardian = sessions.get("2026/08/14/rollout-guardian.jsonl|session")
+    expect("parent_session_id" in guardian).toBe(false)
+    expect(guardian.metadata.hierarchy).toEqual({ hierarchy_status: "subagent", thread_source: "subagent" })
+
+    const plain = sessions.get("2026/08/14/rollout-root.jsonl|session")
+    expect("parent_session_id" in plain).toBe(false)
+    expect("hierarchy" in plain.metadata).toBe(false)
+  })
 })

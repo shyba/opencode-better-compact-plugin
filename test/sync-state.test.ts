@@ -199,6 +199,14 @@ describe("portable better-compact state", () => {
 
     state.recordSourceComplete("source-1", 9999, 100, 200)
     expect(state.shouldSkipSource("source-1", 9999, 100, 200)).toBe(true)
+
+    // The skip ages out so a shallow fingerprint cannot hide appends to deep
+    // session files (or stall a drain) indefinitely.
+    expect(state.shouldSkipSource("source-1", 9999, 100, 200, 3_600_000, Date.now())).toBe(true)
+    expect(state.shouldSkipSource("source-1", 9999, 100, 200, 3_600_000, Date.now() + 3_600_000 - 5_000)).toBe(true)
+    expect(state.shouldSkipSource("source-1", 9999, 100, 200, 3_600_000, Date.now() + 3_600_000 + 5_000)).toBe(false)
+    // Without an age bound the old fingerprint-only behavior is preserved.
+    expect(state.shouldSkipSource("source-1", 9999, 100, 200, undefined, Date.now() + 10 * 3_600_000)).toBe(true)
     state.close()
   })
 })

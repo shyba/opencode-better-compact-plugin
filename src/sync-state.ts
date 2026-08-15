@@ -189,10 +189,18 @@ export class SyncState {
   /** Return true iff the source has been fully scanned before AND its current
    *  path fingerprint matches the one stored at the last complete scan. The
    *  caller is expected to have just computed a fresh fingerprint. */
-  shouldSkipSource(sourceID: string, pathMtimeMs: number, pathSizeOrCount: number, childMaxMtimeMs: number): boolean {
-    const row = this.db.query("select path_mtime_ms, path_size_or_count, child_max_mtime_ms from source_scan where source_id=?").get(sourceID) as { path_mtime_ms: number; path_size_or_count: number; child_max_mtime_ms: number } | undefined
+  shouldSkipSource(sourceID: string, pathMtimeMs: number, pathSizeOrCount: number, childMaxMtimeMs: number, maxAgeMs?: number, now = Date.now()): boolean {
+    const row = this.db.query("select path_mtime_ms, path_size_or_count, child_max_mtime_ms, last_complete_scan_at from source_scan where source_id=?").get(sourceID) as { path_mtime_ms: number; path_size_or_count: number; child_max_mtime_ms: number; last_complete_scan_at: number } | undefined
     if (!row) return false
+    // The fingerprint only covers the path itself, so an age bound keeps a
+    // stale skip from hiding appends (or a stalled drain) indefinitely.
+    if (maxAgeMs !== undefined && now - Number(row.last_complete_scan_at) > maxAgeMs) return false
     return row.path_mtime_ms === pathMtimeMs && row.path_size_or_count === pathSizeOrCount && row.child_max_mtime_ms === childMaxMtimeMs
+  }
+
+  /** All staged session records for a source, for hierarchy backfills. */
+  sessionRecords(sourceID: string): Array<{ naturalKey: string; payloadJSON: string }> {
+    return (this.db.query("select natural_key, payload_json from normalized_record where source_id=? and record_kind='session'").all(sourceID) as Array<Record<string, unknown>>).map((row) => ({ naturalKey: String(row.natural_key), payloadJSON: String(row.payload_json ?? "") }))
   }
 
   enqueue(records: NormalizedRecord[], sourceID: string, stream: string, checkpoint: unknown, destinationID = "postgres", snapshot?: { complete?: boolean; recordKinds?: string[]; prefixes?: Array<{ prefix: string; lineCount: number; recordKinds: string[] }> }, maxOutboxBytes = Number.POSITIVE_INFINITY) {

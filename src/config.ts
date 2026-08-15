@@ -5,6 +5,7 @@ export type SyncConfig = {
   enabled: boolean
   database_url_env: string
   poll_interval_ms: number
+  rescan_interval_ms: number
   batch_size: number
   max_outbox_bytes: number
   include_parts: boolean
@@ -66,6 +67,7 @@ const defaults: BetterCompactConfig = {
     enabled: false,
     database_url_env: "OPENCODE_SYNC_DATABASE_URL",
     poll_interval_ms: 2_000,
+    rescan_interval_ms: 60_000,
     batch_size: 100,
     max_outbox_bytes: 268_435_456,
     include_parts: true,
@@ -166,7 +168,7 @@ export function validateConfig(value: unknown): BetterCompactConfig {
   }
   if (typeof result.sync.enabled !== "boolean") throw new TypeError("sync.enabled must be boolean")
   if (typeof result.sync.database_url_env !== "string" || !/^[A-Z_][A-Z0-9_]*$/.test(result.sync.database_url_env)) throw new TypeError("sync.database_url_env must be an environment variable name")
-  for (const key of ["poll_interval_ms", "batch_size", "max_outbox_bytes", "retention_days"] as const) {
+  for (const key of ["poll_interval_ms", "rescan_interval_ms", "batch_size", "max_outbox_bytes", "retention_days"] as const) {
     if (!Number.isSafeInteger(result.sync[key]) || result.sync[key] <= 0) throw new TypeError(`sync.${key} must be a positive integer`)
   }
   if (typeof result.sync.include_parts !== "boolean" || typeof result.sync.include_tool_output !== "boolean" || typeof result.sync.allow_insecure_remote !== "boolean" || typeof result.sync.keep_remote_on_missing !== "boolean" || typeof result.sync.allow_source_shrink !== "boolean") throw new TypeError("sync include flags must be boolean")

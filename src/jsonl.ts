@@ -310,7 +310,7 @@ async function listJsonlPaths(root: string): Promise<Array<Pick<JsonlFile, "rela
   return result.sort((left, right) => left.relativePath.localeCompare(right.relativePath))
 }
 
-async function readSessionHeader(filename: string) {
+export async function readSessionHeader(filename: string): Promise<{ sessionID: string | undefined; createdAt: number | undefined; title: string | undefined; directory: string | undefined; hierarchy: SessionHierarchy | undefined }> {
   const input = createReadStream(filename, { start: 0, end: 16_383 })
   const lines = createInterface({ input, crlfDelay: Infinity })
   try {
@@ -321,20 +321,59 @@ async function readSessionHeader(filename: string) {
       const createdAt = timestampMs(parsed.value)
       const title = findString(parsed.value, ["title", "name"], 2)
       const directory = findString(parsed.value, ["directory", "cwd", "workdir"], 2)
-      return { sessionID, createdAt, title, directory }
+      return { sessionID, createdAt, title, directory, hierarchy: hierarchyFromSessionMeta(parsed.value) }
     }
   } finally {
     lines.close()
     input.destroy()
   }
-  return { sessionID: undefined, createdAt: undefined, title: undefined, directory: undefined }
+  return { sessionID: undefined, createdAt: undefined, title: undefined, directory: undefined, hierarchy: undefined }
 }
 
-function sessionRecord(sourceID: string, kind: string, relativePath: string, sessionID: string, header: { title?: string | undefined; directory?: string | undefined }, createdAt: number, updatedAt: number): NormalizedRecord {
+export type SessionHierarchy = {
+  hierarchy_status: "root" | "subagent" | "unknown"
+  parent_session_id?: string
+  thread_source?: string
+  depth?: number
+  nickname?: string
+  role?: string
+}
+
+/** Codex stores thread hierarchy on the session_meta header line: subagent
+ *  spawns under payload.source.subagent.thread_spawn, forks under
+ *  payload.forked_from_id, and guardian/judge threads carry thread_source
+ *  "subagent" without a parent id. Other formats return undefined. */
+function hierarchyFromSessionMeta(meta: Record<string, unknown>): SessionHierarchy | undefined {
+  const payload = objectAt(meta, "payload")
+  const spawn = objectAt(objectAt(objectAt(payload, "source"), "subagent"), "thread_spawn")
+  const parentSessionID = typeof spawn?.parent_thread_id === "string" ? spawn.parent_thread_id : typeof payload?.forked_from_id === "string" ? payload.forked_from_id : undefined
+  const threadSource = typeof payload?.thread_source === "string" ? payload.thread_source : undefined
+  const subagentPresent = objectAt(payload, "source")?.subagent !== undefined
+  if (parentSessionID === undefined && threadSource === undefined && !subagentPresent) return undefined
+  const nickname = typeof spawn?.agent_nickname === "string" ? spawn.agent_nickname : typeof payload?.agent_nickname === "string" ? payload.agent_nickname : undefined
+  const role = typeof spawn?.agent_role === "string" ? spawn.agent_role : typeof payload?.agent_role === "string" ? payload.agent_role : undefined
+  return {
+    hierarchy_status: "subagent",
+    ...(parentSessionID === undefined ? {} : { parent_session_id: parentSessionID }),
+    ...(threadSource === undefined ? {} : { thread_source: threadSource }),
+    ...(typeof spawn?.depth === "number" ? { depth: spawn.depth } : {}),
+    ...(nickname === undefined ? {} : { nickname }),
+    ...(role === undefined ? {} : { role }),
+  }
+}
+
+function objectAt(value: Record<string, unknown> | undefined, key: string): Record<string, unknown> | undefined {
+  const inner = value?.[key]
+  return inner && typeof inner === "object" && !Array.isArray(inner) ? inner as Record<string, unknown> : undefined
+}
+
+export function sessionRecord(sourceID: string, kind: string, relativePath: string, sessionID: string, header: { title?: string | undefined; directory?: string | undefined; hierarchy?: SessionHierarchy | undefined }, createdAt: number, updatedAt: number): NormalizedRecord {
+  const hierarchy = header.hierarchy
   const payload = {
     title: header.title,
     directory: header.directory,
-    metadata: { source_kind: kind, source_path: relativePath, session_id: sessionID },
+    ...(hierarchy?.parent_session_id === undefined ? {} : { parent_session_id: hierarchy.parent_session_id }),
+    metadata: { source_kind: kind, source_path: relativePath, session_id: sessionID, ...(hierarchy === undefined ? {} : { hierarchy }) },
     source_created_at: createdAt,
     source_updated_at: updatedAt,
   }
