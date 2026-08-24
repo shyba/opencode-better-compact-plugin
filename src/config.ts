@@ -3,6 +3,11 @@ import path from "node:path"
 
 export type SyncConfig = {
   enabled: boolean
+  /** The durable session transport. Postgres remains an explicit migration
+   *  compatibility mode; new configurations use session-center S3 ingest. */
+  transport: "s3" | "postgres"
+  s3_url_env: string
+  s3_token_env: string
   database_url_env: string
   poll_interval_ms: number
   rescan_interval_ms: number
@@ -65,6 +70,9 @@ const defaults: BetterCompactConfig = {
   version: 1,
   sync: {
     enabled: false,
+    transport: "s3",
+    s3_url_env: "SESSION_CENTER_URL",
+    s3_token_env: "S3_SYNC_TOKEN",
     database_url_env: "OPENCODE_SYNC_DATABASE_URL",
     poll_interval_ms: 2_000,
     rescan_interval_ms: 60_000,
@@ -167,7 +175,10 @@ export function validateConfig(value: unknown): BetterCompactConfig {
     result.installation = { name: installation.name }
   }
   if (typeof result.sync.enabled !== "boolean") throw new TypeError("sync.enabled must be boolean")
-  if (typeof result.sync.database_url_env !== "string" || !/^[A-Z_][A-Z0-9_]*$/.test(result.sync.database_url_env)) throw new TypeError("sync.database_url_env must be an environment variable name")
+  if (result.sync.transport !== "s3" && result.sync.transport !== "postgres") throw new TypeError("sync.transport must be s3 or postgres")
+  for (const key of ["s3_url_env", "s3_token_env", "database_url_env"] as const) {
+    if (typeof result.sync[key] !== "string" || !/^[A-Z_][A-Z0-9_]*$/.test(result.sync[key])) throw new TypeError(`sync.${key} must be an environment variable name`)
+  }
   for (const key of ["poll_interval_ms", "rescan_interval_ms", "batch_size", "max_outbox_bytes", "retention_days"] as const) {
     if (!Number.isSafeInteger(result.sync[key]) || result.sync[key] <= 0) throw new TypeError(`sync.${key} must be a positive integer`)
   }

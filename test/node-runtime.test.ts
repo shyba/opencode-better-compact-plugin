@@ -28,7 +28,7 @@ describe("Node-hosted Pi runtime", () => {
           import { createJiti } from "jiti"
           const jiti = createJiti(import.meta.url)
           const extension = await jiti.import(process.env.PI_MODULE)
-          extension.default({ on() {}, registerCommand() {} })
+          extension.default({ on() {}, registerCommand() {}, registerTool() {} })
           const semantic = await jiti.import(process.env.SEMANTIC_MODULE)
           const store = new semantic.SemanticStore(process.env.SEMANTIC_DATABASE)
           console.log(JSON.stringify(store.db.query("select 1 as ok").get()))

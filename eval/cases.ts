@@ -1,4 +1,4 @@
-import type { EvalCase } from "./types.js"
+import type { EvalCase, EvalNextAction } from "./types.js"
 
 export const CORPUS_VERSION = 1
 
@@ -16,7 +16,42 @@ type Scenario = {
   unsupported: [string, string]
 }
 
+const nextActionOracles: Record<string, EvalNextAction> = {
+  "case-01": { todo_id: "case-01-next", kind: "run_test", target: "src/http/checkout.ts", required_atoms: ["bun test test/checkout.test.ts"], action_markers: ["reproduce", "focused test"], forbidden_claims: ["deployed the timeout fix", "all checkout tests passed"] },
+  "case-02": { todo_id: "case-02-next", kind: "compare", target: "crates/parser/src/expression.rs", required_atoms: ["crates/parser/src/expression.rs"], action_markers: ["cursor", "before editing"], forbidden_claims: ["parser release was published", "unsafe audit passed"] },
+  "case-03": { todo_id: "case-03-next", kind: "choose", target: "db/migrations/0042_add_job_index.sql", required_atoms: ["jobs_state_idx"], action_markers: ["deterministic", "index name"], forbidden_claims: ["production schema was migrated", "index is live"] },
+  "case-04": { todo_id: "case-04-next", kind: "verify", target: "src/ui/command-palette.tsx", required_atoms: ["src/ui/command-palette.tsx"], action_markers: ["focus", "rendered test"], forbidden_claims: ["accessibility sign-off completed", "UI shipped"] },
+  "case-05": { todo_id: "case-05-next", kind: "capture", target: "test/scheduler/wake.test.ts", required_atoms: ["test/scheduler/wake.test.ts"], action_markers: ["scheduler events", "fake clock"], forbidden_claims: ["entire suite is stable", "CI is green"] },
+  "case-06": { todo_id: "case-06-next", kind: "assert", target: "src/auth/callback.ts", required_atoms: ["src/auth/callback.ts"], action_markers: ["redaction", "callback metadata"], forbidden_claims: ["security audit passed", "credentials were rotated"] },
+  "case-07": { todo_id: "case-07-next", kind: "test", target: "src/queue/claim.ts", required_atoms: ["bun test test/queue/concurrent-claim.test.ts"], action_markers: ["atomic claim", "two workers"], forbidden_claims: ["duplicate jobs were repaired", "worker fleet was restarted"] },
+  "case-08": { todo_id: "case-08-next", kind: "compare", target: "src/worker/stream-pool.ts", required_atoms: ["src/worker/stream-pool.ts"], action_markers: ["heap snapshots", "stream close"], forbidden_claims: ["memory leak was fixed", "production memory dropped"] },
+  "case-09": { todo_id: "case-09-next", kind: "replace", target: "docs/api/create-job.md", required_atoms: ["docs/api/create-job.md"], action_markers: ["replace", "stale request field"], forbidden_claims: ["docs site was published", "all guides were reviewed"] },
+  "case-10": { todo_id: "case-10-next", kind: "use", target: "scripts/package-desktop.ts", required_atoms: ["scripts/package-desktop.ts"], action_markers: ["path API", "packaging boundary"], forbidden_claims: ["Windows build shipped", "Linux behavior changed"] },
+  "case-11": { todo_id: "case-11-next", kind: "add", target: "deploy/demo-worker.yaml", required_atoms: ["kubectl apply --dry-run=server -f deploy/demo-worker.yaml"], action_markers: ["CPU request", "dry run"], forbidden_claims: ["deployment applied", "worker was rolled out"] },
+  "case-12": { todo_id: "case-12-next", kind: "derive", target: "src/data/list-events.ts", required_atoms: ["src/data/list-events.ts"], action_markers: ["cursor", "final returned row"], forbidden_claims: ["duplicate event was repaired", "ordering was changed"] },
+  "case-13": { todo_id: "case-13-next", kind: "invalidate", target: "src/profile/update.ts", required_atoms: ["src/profile/update.ts"], action_markers: ["invalidate", "profile key"], forbidden_claims: ["entire cache was flushed", "all profiles were invalidated"] },
+  "case-14": { todo_id: "case-14-next", kind: "add", target: "src/text/truncate.ts", required_atoms: ["bun test test/text/truncate.test.ts"], action_markers: ["multi-byte", "boundary fixture"], forbidden_claims: ["UTF-8 was fixed", "output exceeded 128 bytes"] },
+  "case-15": { todo_id: "case-15-next", kind: "assert", target: "src/realtime/socket.ts", required_atoms: ["src/realtime/socket.ts"], action_markers: ["unsubscribe ordering", "reconnect test"], forbidden_claims: ["duplicate sequence was fixed", "resume token was discarded"] },
+  "case-16": { todo_id: "case-16-next", kind: "set", target: "src/cli/validate.ts", required_atoms: ["src/cli/validate.ts"], action_markers: ["status", "command boundary"], forbidden_claims: ["stdout format changed", "validation passed"] },
+  "case-17": { todo_id: "case-17-next", kind: "reorder", target: "src/config/resolve.ts", required_atoms: ["src/config/resolve.ts"], action_markers: ["precedence", "expression"], forbidden_claims: ["environment precedence was accepted", "option names changed"] },
+  "case-18": { todo_id: "case-18-next", kind: "replace", target: "src/metrics/request.ts", required_atoms: ["src/metrics/request.ts"], action_markers: ["unbounded label", "metadata-free counting"], forbidden_claims: ["cardinality was fixed", "status_code label was removed"] },
+  "case-19": { todo_id: "case-19-next", kind: "compare", target: "fixtures/backups/demo-2026-01.tar", required_atoms: ["fixtures/backups/demo-2026-01.tar"], action_markers: ["segment-03", "synthetic manifest"], forbidden_claims: ["restore was run", "backup was repaired"] },
+  "case-20": { todo_id: "case-20-next", kind: "assert", target: "src/session/attempt-store.ts", required_atoms: ["src/session/attempt-store.ts"], action_markers: ["interleaved", "two-session"], forbidden_claims: ["session isolation was fixed", "sessions ran serially"] },
+  "case-21": { todo_id: "case-21-next", kind: "record", target: "src/ui/confirm-dialog.tsx", required_atoms: ["src/ui/confirm-dialog.tsx"], action_markers: ["trigger", "dialog"], forbidden_claims: ["dialog was made non-modal", "focus restoration passed"] },
+  "case-22": { todo_id: "case-22-next", kind: "add", target: "src/i18n/resolve.ts", required_atoms: ["src/i18n/resolve.ts"], action_markers: ["missing-key", "fallback assertion"], forbidden_claims: ["locale order was implicit", "translation review completed"] },
+  "case-23": { todo_id: "case-23-next", kind: "change", target: "src/upload/limits.ts", required_atoms: ["src/upload/limits.ts"], action_markers: ["inclusive", "exclusive rejection"], forbidden_claims: ["full upload was buffered", "payload was accepted"] },
+  "case-24": { todo_id: "case-24-next", kind: "add", target: "src/search/tokenize.ts", required_atoms: ["src/search/tokenize.ts"], action_markers: ["two-segment", "token fixture"], forbidden_claims: ["ranking weights changed", "blue-green was split incorrectly"] },
+  "case-25": { todo_id: "case-25-next", kind: "decode", target: "src/schema/job.ts", required_atoms: ["src/schema/job.ts"], action_markers: ["v1 fixture", "encoder"], forbidden_claims: ["retry_policy was dropped", "v2 records were rewritten"] },
+  "case-26": { todo_id: "case-26-next", kind: "use", target: "src/limits/window.ts", required_atoms: ["src/limits/window.ts"], action_markers: ["monotonic", "boundary fixture"], forbidden_claims: ["quota window changed", "negative retry delay was accepted"] },
+  "case-27": { todo_id: "case-27-next", kind: "add", target: "src/desktop/window-state.ts", required_atoms: ["src/desktop/window-state.ts"], action_markers: ["removed-display", "fixture"], forbidden_claims: ["offscreen coordinate was kept", "saved dimensions were discarded"] },
+  "case-28": { todo_id: "case-28-next", kind: "run_test", target: "packages/sdk/src/generated/client.ts", required_atoms: ["bun run generate"], action_markers: ["generation", "owning package"], forbidden_claims: ["generated file was edited directly", "cursor parameter was dropped"] },
+  "case-29": { todo_id: "case-29-next", kind: "mark", target: "incidents/demo-17/timeline.md", required_atoms: ["14:07Z"], action_markers: ["unconfirmed", "pending evidence"], forbidden_claims: ["real person was named", "customer was identified"] },
+  "case-30": { todo_id: "case-30-next", kind: "add", target: "CHANGELOG.md", required_atoms: ["CHANGELOG.md"], action_markers: ["changelog entry", "dry run"], forbidden_claims: ["release was published", "tag was created"] },
+}
+
 function scenario(input: Scenario): EvalCase {
+  const next_action = nextActionOracles[input.id]
+  if (!next_action || next_action.todo_id !== `${input.id}-next`) throw new Error(`missing next-action oracle: ${input.id}`)
   const facts = [input.path, input.command, input.error, input.constraint]
   return {
     id: input.id,
@@ -45,6 +80,7 @@ function scenario(input: Scenario): EvalCase {
       { id: `${input.id}-done`, content: input.progress, status: "completed", priority: "medium" },
       { id: `${input.id}-next`, content: input.next, status: "pending", priority: "high" },
     ],
+    next_action,
     key_facts: facts.map((value, index) => ({ id: `${input.id}-fact-${index + 1}`, value })),
     unsupported_claims: input.unsupported,
   }

@@ -11,6 +11,37 @@ The package is private at version `0.1.0`. Git/source-path installation is the s
 - Either `model: "selected"` to follow each compaction's selected model, or a fixed `provider/model`. The initial configuration below uses `opencode-go/glm-5.2`, but the package itself is provider-neutral.
 - The selected model must have a positive output limit and leave positive usable input under OpenCode's V1 overflow calculation.
 
+## VCC modes and exact recall
+
+VCC is opt-in. The default `vcc_mode: "off"` keeps the existing provider-backed
+compaction contract. `vcc_mode: "hybrid"` is available for both OpenCode V1 and
+Pi: it compiles a deterministic candidate, makes at most one bounded semantic
+request, validates the response, and falls back to the authoritative candidate
+on missing auth, refusal, abort, or malformed output. `vcc_mode: "offline"`
+uses that deterministic candidate directly and never resolves auth or calls a
+provider.
+
+OpenCode V1 still uses the host-selected preparation boundary; its offline mode
+therefore does not change which messages the host keeps. Pi exposes the full
+`session_before_compact` contract, so its offline/hybrid path follows Pi VCC:
+the extension rebuilds the active branch, preserves custom/branch-summary
+messages, chooses a stable user-turn cut, and returns the complete compaction
+result. If that branch cannot form a safe cut, the extension returns `undefined`
+and Pi's native fallback remains in control.
+
+Both hosts expose a bounded `vcc_recall` tool for the current canonical scope
+(OpenCode session or Pi active branch). Discovery returns verified handles;
+expansion re-resolves canonical records and emits redacted, transformed output
+with exact source/payload digests. Handles are scoped and restart-resolvable;
+malformed, stale, incomplete, cross-scope, and oversized requests return
+explicit statuses. `scope: "all"` is unavailable in these V1 adapters. Recall
+does not require RAG, Postgres, network access, persistence, or workspace reads.
+
+To roll back to the legacy behavior, remove `vcc_mode` (or set it to `"off"`)
+before loading an older plugin. The option default and durable Pi option
+round-trip remain legacy-safe; no transcript, archive, RAG, or filesystem data
+is deleted by changing modes.
+
 Before enabling the plugin, remove only the stale `deepseek-v4-flash-free` model-limit override from the global OpenCode JSONC configuration. Do not remove the provider, other model entries, credentials, or unrelated settings. The usual global file is `${XDG_CONFIG_HOME:-~/.config}/opencode/opencode.jsonc`; use the path reported by OpenCode if the configuration directory was overridden. The plugin deliberately does not rewrite provider catalogs.
 
 ## One-command installation
@@ -86,30 +117,31 @@ The generated wrapper points at the persistent checkout and also falls back to t
 
 `doctor` checks the managed checkout, both OpenCode configuration surfaces, the OpenCode and Bun executables, and performs a read-only SQLite probe. `update` runs the same rollback-safe checkout/configuration transaction as the installer. If Bun was bootstrapped temporarily during installation, install Bun separately or invoke the CLI with `OPENCODE_SAFE_COMPACTION_BUN=/path/to/bun`.
 
-The sync runner reads configured OpenCode V1 SQLite, Codex JSONL, and Pi JSONL sources read-only, stages redacted records in the stable local state database, and uploads bounded batches when the configured Postgres environment variable is present. The `*-sessions` adapters provide a fast, session-only index; pair them with the full-history adapters when message and part records are also wanted. `--once` drains discovery and the local outbox until no work remains; without it, the runner continues polling. Postgres failures leave leased outbox rows for retry and do not affect OpenCode. JSONL discovery is resumable by file and byte/line cursor, and completed files reconcile only their own natural-key prefix. Acknowledged payloads are released from local SQLite immediately; the durable local state is limited to cursors, source counters, revisions, maintenance timestamps, and the currently pending outbox. Remote tombstone retention is indexed and attempted at most once per source per day, rather than after every upload batch. `better-compact sync status` reports the staged cache, and `better-compact sync compact --yes` removes any legacy acknowledged cache rows and runs SQLite vacuum while preserving unsent rows.
+The default sync transport is session-center S3 ingest. The runner reads configured Codex JSONL and Pi JSONL sources read-only, uploads only changed bytes to `PUT /file/<file_id>`, and marks shrink/same-size rewrites with `x-vcc-full: true`. The local SQLite state stores the last acknowledged path version so an interrupted PUT can be replayed safely; S3 archives remain the durable source of truth and `vcc_load.py` projects them into `vcc.*`. OpenCode V1 SQLite remains an explicit warning until session-center's normalized-record feeder is enabled; it is never sent to the retired `opencode.*` writer. `better-compact sync status` reports acknowledged S3 file versions, and `better-compact sync compact --yes` vacuums only the local cache.
 
-Completed source snapshots are guarded against destructive partial reads. An OpenCode database whose session/message/part/todo counts shrink, or a JSONL inventory whose files/bytes shrink, is uploaded as ordinary updates but is not allowed to emit tombstones until a complete stable snapshot is observed. This protects the remote history when a database is being replaced, a mount is briefly empty, or a writer exposes a partial copy. The worker logs a warning and retries automatically. Intentional source deletion is explicit: use `sync.keep_remote_on_missing=true` for retained remote history, or set `sync.allow_source_shrink=true` only when the corresponding deletion should be propagated. After repairing an already damaged remote projection, stop the worker and run `better-compact sync reconcile`; it marks the OpenCode checkpoints for a complete, forced rebuild without discarding the trusted count baseline, then start the worker again.
+If an older hand-written config enables sync without an S3 URL/token, `sync run` warns and performs only local compatibility staging; it does not write Postgres or pretend that a remote upload succeeded. Run `sync setup` before relying on remote durability.
 
-Idle sources skip discovery while their path fingerprint (directory mtime, entry count, and newest child mtime) is unchanged, bounded by `sync.rescan_interval_ms` (default 60 seconds) because the fingerprint only covers direct children and cannot see appends to existing deep session files. `sync run --once` bypasses the skip entirely so a single pass always inspects every source. Codex thread hierarchy (parent session, spawn depth, and agent nickname) is extracted from the `session_meta` header into `parent_session_id` plus `metadata.hierarchy` for newly scanned sessions; `better-compact sync backfill-hierarchy [--dry-run]` re-reads local headers for already-mirrored sessions and stages the same metadata without replaying message history, marking files that are not present locally as `hierarchy_status "unknown"` so another host can fill them in.
+Completed source snapshots are guarded against destructive partial reads in the legacy Postgres transport. An OpenCode database whose session/message/part/todo counts shrink, or a JSONL inventory whose files/bytes shrink, is uploaded as ordinary updates but is not allowed to emit tombstones until a complete stable snapshot is observed. The S3 transport emits no tombstones: S3 lifecycle policy owns retention and the VCC loader rebuilds from archives.
 
-Use `better-compact sync setup --url-stdin` to configure a server without putting the database password in shell history:
+Idle sources skip discovery while their path fingerprint (directory mtime, entry count, and newest child mtime) is unchanged, bounded by `sync.rescan_interval_ms` (default 60 seconds) because the fingerprint only covers direct children and cannot see appends to existing deep session files. `sync run --once` bypasses the skip entirely so a single pass always inspects every source. Codex thread hierarchy is extracted by the session-center VCC loader for S3 archives. The local `sync backfill-hierarchy` command remains a legacy-Postgres maintenance operation and refuses configured S3 transports.
+
+Use `better-compact sync setup --url-stdin` to configure a server without putting the session-center URL or bearer token in shell history:
 
 ```sh
-IFS= read -r -s DATABASE_URL
-printf '%s\n' "$DATABASE_URL" | better-compact sync setup --url-stdin
-unset DATABASE_URL
-# Run this once with admin credentials, then start the writer-only worker.
-better-compact sync migrate
+IFS= read -r SESSION_CENTER_URL
+IFS= read -r -s S3_SYNC_TOKEN
+printf '%s\n' "$SESSION_CENTER_URL" | S3_SYNC_TOKEN="$S3_SYNC_TOKEN" better-compact sync setup --url-stdin
+unset SESSION_CENTER_URL S3_SYNC_TOKEN
 better-compact sync install
 ```
 
-The command enables sync, stores the writer URL only in the mode-`0600` `~/.local/state/better-compact/sync.env`, and preserves an existing source list. If no sources are configured yet, it adds whichever standard OpenCode, Codex, and Pi paths already exist on that server. Use `--url URL` for a convenient non-interactive invocation, or omit the URL when the configured environment variable is already exported. `--allow-insecure-remote` is required for a trusted LAN Postgres server without certificate-verifying TLS. Setup does not run the privileged schema migration: run `better-compact sync migrate` once with admin credentials, then use `--install` (or `better-compact sync install`) to start the per-user worker. Manual `sync run` commands also read the stored `sync.env` value, so no separate `export` is needed.
+The command enables sync, stores the URL and token only in the mode-`0600` `~/.local/state/better-compact/sync.env`, and preserves an existing source list. For a new S3 configuration it discovers Codex and Pi JSONL roots only; OpenCode SQLite still needs session-center's separate normalized-record feeder and is not silently routed to the retired `opencode.*` writer. Use `--url URL` and `--token TOKEN` for a convenient non-interactive invocation, or omit them when the configured environment variables are already exported. `--allow-insecure-remote` is required for a trusted non-local HTTP session-center endpoint; HTTPS is preferred. Session-center owns the VCC schema and archive loader, so `sync migrate` is a no-op in the default S3 mode. Manual `sync run` commands also read the stored `sync.env` values, so no separate export is needed.
 
-If local Codex history has become large, stop the sync service and run `better-compact sync prune --missing-directories --yes`. It only removes files whose synced session metadata points at a missing project directory, after requiring the Codex source to be fully uploaded and confirming the files are unchanged. It enables `sync.keep_remote_on_missing`, so later scans retain those Postgres rows instead of interpreting the intentional local cleanup as a remote deletion. Sessions with blank directory metadata are not classified as missing-directory orphans; if the local client cannot resume those sessions either, use the separately explicit `better-compact sync prune --blank-directories --yes` mode. It applies the same upload-fence and race checks, and only removes files whose remote session row has no directory metadata.
+S3 sync does not delete archive objects when a local file disappears; retention is controlled by session-center/S3 lifecycle policy. Accordingly, the legacy `sync prune` and hierarchy-backfill commands refuse to run in S3 mode instead of querying the removed `opencode.*` schema.
 
-Remote Postgres URLs must use certificate-verifying TLS (`sslmode=verify-full`) unless the host is loopback. If a trusted LAN server genuinely has no TLS, `sync.allow_insecure_remote=true` is an explicit opt-in and emits a warning; it must not be enabled on an untrusted network. When no URL variable is set, the runner can compose one from `POSTGRES_*` plus `DB_WRITER_*` environment variables. Run `better-compact sync migrate` once with explicit admin credentials before starting the worker; it also installs the prefix-reconcile index used for deleted JSONL files. The long-running sync process is deliberately DDL-free and uses only writer privileges. Credentials stay in the environment or a separate mode-`0600` service environment file; they are never written to the JSON configuration. `better-compact sync install` installs the opt-in per-user service and preserves the same local state/outbox across restarts.
+The S3 bearer token stays in the environment or the separate mode-`0600` service environment file; it is never written to JSON configuration. `better-compact sync install` installs the opt-in per-user service and preserves the local path-version ledger across restarts. The explicit `transport: "postgres"` setting remains only as a migration compatibility path for hosts that have not moved to session-center yet.
 
-The optional RAG projection is separate from the existing 4096-dimensional Qwen table. Run `better-compact rag migrate` once with the admin environment variables to create `rag.embedding_current_384` and install the version-aware chunk uniqueness required for multiple reviewed chunkers, then use `better-compact rag status` to inspect model, dimension, row, and table-size metadata. The evaluated first-delivery default is `BAAI/bge-small-en-v1.5` (384 dimensions, 512-token chunks with 64-token overlap, fixed 0.8 vector / 0.2 lexical retrieval). The live table may contain an earlier pilot; old chunks remain valid while the active version is embedded separately. Embedding generation remains off the compaction request path and is performed by a bounded streaming worker:
+The optional RAG projection is separate from the S3 VCC path and is not yet a consumer of `vcc.*` archives. Its current worker reads legacy normalized `opencode.*` rows, so keep it disabled for an S3-only deployment until the session-center embedding hand-off is implemented. When using the explicit legacy transport, the existing 384-dimensional BGE projection remains available: run `better-compact rag migrate` once with the admin environment variables to create `rag.embedding_current_384` and install the version-aware chunk uniqueness required for multiple reviewed chunkers, then use `better-compact rag status` to inspect model, dimension, row, and table-size metadata. The evaluated first-delivery default is `BAAI/bge-small-en-v1.5` (384 dimensions, 512-token chunks with 64-token overlap, fixed 0.8 vector / 0.2 lexical retrieval). Embedding generation remains off the compaction request path and is performed by a bounded streaming worker:
 
 ```sh
 better-compact rag setup --model-path /absolute/path/to/bge-small-en-v1.5 --python /absolute/path/to/rag-venv/bin/python3
@@ -137,10 +169,8 @@ Example source configuration:
 ```json
 {
   "version": 1,
-  "sync": { "enabled": true, "allow_insecure_remote": false, "keep_remote_on_missing": false, "allow_source_shrink": false },
+  "sync": { "enabled": true, "transport": "s3", "s3_url_env": "SESSION_CENTER_URL", "s3_token_env": "S3_SYNC_TOKEN", "allow_insecure_remote": false },
   "sources": [
-    { "kind": "opencode-v1-sqlite", "database": "~/.local/share/opencode/opencode.db" },
-    { "kind": "opencode-v1-sessions", "database": "~/.local/share/opencode/opencode.db" },
     { "kind": "codex-jsonl", "database": "~/.codex/sessions" },
     { "kind": "codex-jsonl-sessions", "database": "~/.codex/sessions" },
     { "kind": "pi-jsonl", "database": "~/.pi/agent/sessions" }
@@ -291,8 +321,8 @@ pi -e /abs/path/to/dist/pi.js
 
 or add it to `~/.pi/agent/settings.json` packages/extensions. The extension registers:
 
-- `session_before_compact` — builds the bounded recovery ledger from the messages pi is about to summarize (plus the split-turn prefix), optionally chains a prior plugin-valid ledger found on the branch, asks the selected compaction model (or a pinned one) for the strict JSON projection, validates digest/refs, and returns either the rendered projection summary or the deterministic authoritative fallback. Any internal failure degrades to pi's default compaction.
-- `session_before_tree` — the same pipeline for `/tree` branch summarization when the user opts into a summary.
+- `session_before_compact` — in `offline`/`hybrid`, rebuilds the active Pi branch from `branchEntries`, recovers after a missing compact-all boundary, preserves custom and branch-summary messages, and cuts at a stable user-turn boundary before compiling the bounded recovery ledger. Offline makes zero provider calls; hybrid makes at most one request and falls back deterministically. Any internal failure returns `undefined` so Pi's native compaction remains the fallback.
+- `session_before_tree` — the same ledger/projection pipeline for `/tree` branch summarization when the user opts into a summary.
 - `/compaction-model` — pick a dedicated compaction model or "follow selected model". The choice is persisted to `<cwd>/.pi/safe-compaction.json` (mode `0600`, atomic rename).
 
 Plugin-side options are read from `<cwd>/.pi/safe-compaction.json`:
@@ -392,7 +422,7 @@ For a portability smoke test, copy or clone the repository outside any OpenCode 
 
 ## Evaluation
 
-The `eval/` directory contains 30 sanitized, synthetic transcripts. The runner evaluates three repetitions per case under four separately implemented conditions:
+The `eval/` directory contains 30 sanitized, synthetic transcripts. The runner evaluates three repetitions per case under four provider-backed conditions, plus a separate deterministic provider-free `offline` evaluator lane:
 
 - `baseline` uses a checked-in snapshot of the OpenCode 1.18.4 V1 compaction prompt. It is informational and does not import OpenCode core.
 - `plugin` reproduces the deterministic fallback contract: whatever the model produced, the accepted text is the ledger-grounded authoritative summary, and continuation is gated on its structure and digest.
@@ -401,14 +431,25 @@ The `eval/` directory contains 30 sanitized, synthetic transcripts. The runner e
 Provider transport is a separate adapter shared by all conditions. The default fixture adapter is deterministic and deliberately cycles through valid, malformed, and refusal responses so the harness and fallback path can be tested offline. For the `json` condition the valid response is a ledger-referenced JSON projection. It is not evidence of model quality or live-provider performance.
 
 ```sh
-# Offline harness/tests: 30 cases x 3 repetitions x 4 conditions
+# Offline harness/tests: 30 cases x 3 repetitions x 4 provider-backed conditions
 bun test eval
 
 # Print the deterministic report
 bun eval/run.ts --provider fixture --repetitions 3
+
+# Bound a live qualification to the first case while probing a provider
+bun eval/run.ts --provider opencode-cli --max-cases 1 --repetitions 3
 ```
 
-The report includes structural validity, plugin digest validity, invalid/empty auto-continuations, exact normalized key-fact recall, and matches against each case's explicit unsupported-material-claim list. The structural/digest denominator contains nonempty accepted responses; zero-text responses are reported separately because the runtime text hook cannot replace them. The plugin gate requires 100% structure/digest validity after applicable fallback, zero invalid or empty auto-continuations, at least 95% key-fact recall, zero listed unsupported claims, and zero provider errors. The same requirements apply to the Markdown and JSON projection conditions in `projection_gates`.
+The report includes per-condition provider-call counts, structural validity, plugin digest validity, invalid/empty auto-continuations, exact normalized key-fact recall, and matches against each case's explicit unsupported-material-claim list. The structural/digest denominator contains nonempty accepted responses; zero-text responses are reported separately because the runtime text hook cannot replace them. The plugin gate requires 100% structure/digest validity after applicable fallback, zero invalid or empty auto-continuations, at least 95% key-fact recall, zero listed unsupported claims, and zero provider errors. The same requirements apply to the Markdown and JSON projection conditions in `projection_gates`.
+
+The report also exposes `offline` metrics and `offline_gates` for the
+provider-free deterministic evaluator lane, plus `vcc_eval` for the
+provider-free 31-scenario VCC safety matrix. Its gates include an explicit
+zero-provider-call check, and the CLI exits nonzero if any VCC, offline,
+plugin, or projection gate fails. These lanes prove candidate compilation and
+the bounded safety contracts without a provider call; Pi uses the same
+provider-free candidate when `vcc_mode=offline`.
 
 The unsupported-claim metric is a closed, reproducible corpus check, not a general semantic hallucination judge. Review accepted summaries separately before treating a new provider/model as qualified.
 
@@ -420,7 +461,47 @@ SAFE_COMPACTION_EVAL_MODEL="opencode-go/glm-5.2" \
 bun eval/run.ts --provider opencode-cli --repetitions 3
 ```
 
-The adapter starts one non-interactive `opencode run --agent compaction` process per condition, case, and repetition, injects an evaluation-only `{"*":"deny"}` permission override for that agent, passes the tagged synthetic message sequence through stdin, and uses the selected model from the installed OpenCode configuration. A full 30-case, three-repetition comparison starts 360 isolated CLI runs and may consume provider quota. It strips ANSI presentation, normalizes line endings, removes the OpenCode assistant header, and preserves the complete requested baseline or plugin response from plain stdout so trailing material is validated. CLI stderr is consumed but never copied into the eval report or error log, avoiding accidental conversation-content logging.
+The adapter starts one non-interactive `opencode run --agent compaction` process per condition, case, and repetition, injects an evaluation-only `{"*":"deny"}` permission override for that agent, passes the tagged synthetic message sequence through stdin, and uses the selected model from the installed OpenCode configuration. A full 30-case, three-repetition comparison starts 360 isolated CLI runs and may consume provider quota. It requests OpenCode's JSON event format, extracts completed text parts, and records bounded latency plus `step-finish` input/output/reasoning/cache/cost telemetry when the host supplies it. CLI stderr is consumed but never copied into the eval report or error log, avoiding accidental conversation-content logging.
+
+Use `--max-cases N` to impose an explicit corpus budget; it selects the first
+`N` deterministic cases and reports that reduced denominator. Each CLI process
+also has a 120-second default wall-clock limit. Override it for a controlled
+qualification with `SAFE_COMPACTION_EVAL_TIMEOUT_MS` (positive integer, at most
+15 minutes). Use `--concurrency N` to run at most `N` isolated provider
+processes at once; it defaults to `1`, is capped at 16, and is deliberately
+independent from the compaction semantics. Repetitions are capped at 100 to
+keep the evaluator's work allocation bounded. A timeout is recorded as a
+provider error and never treated as a successful continuation or fallback.
+
+The report also includes a provider-free `offline` evaluator lane compiled from
+the deterministic candidate. This lane is evaluation evidence only: Pi
+`vcc_mode=offline` remains unavailable under the unchanged Pi core, and
+OpenCode V1 does not expose provider-free compaction.
+
+To measure behavior after the boundary, add `--continuation` to run one
+bounded follow-up provider turn after each accepted summary. The continuation
+report records compaction/continuation call counts, zero-text responses,
+provider errors, source-grounded next-action correctness, exact wording recall
+as a diagnostic, forbidden claims, and both phases' provider telemetry. The
+correctness gate uses a typed fixture oracle: the pending todo, target, required
+source atoms, at least one explicit action marker, and forbidden claims must
+all be satisfied. Action markers are fixture-defined alternatives for a
+paraphrasable action; source atoms remain exact. It does not use token
+similarity or an LLM judge. It is an evaluation probe, not
+a runtime retry or a second compaction call:
+
+```sh
+SAFE_COMPACTION_EVAL_OPENCODE="/absolute/path/to/opencode" \
+SAFE_COMPACTION_EVAL_MODEL="opencode-go/glm-5.2" \
+bun eval/run.ts --provider opencode-cli --continuation --max-cases 3 --repetitions 1
+```
+
+The continuation probe has separate hard gates and does not alter the normal
+compaction report or its fallback decisions. Continuation report schema v3
+also counts `oracle_violations` and requires zero high-risk violations for the
+qualified (non-baseline) conditions. `exact_next_action_recall` remains
+available as a wording-fidelity diagnostic; paraphrases can pass correctness
+only when the source-grounded oracle is fully satisfied.
 
 Alternatively, run the same corpus directly against an OpenAI-compatible chat-completions endpoint:
 

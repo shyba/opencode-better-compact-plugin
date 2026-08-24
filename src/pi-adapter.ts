@@ -24,6 +24,7 @@ export type PriorPluginSummary = {
 // preserve_recent_tokens and reserved_tokens are not persisted here.
 const PERSISTED_OPTION_KEYS = [
   "model",
+  "vcc_mode",
   "response_mode",
   "semantic_checkpoints",
   "max_semantic_source_bytes",
@@ -216,11 +217,12 @@ export async function savePiOptions(cwd: string, options: PluginOptions): Promis
   } catch {
     throw new Error(`safe-compaction pi configuration is busy: ${file}`)
   }
+  const temporary = `${file}.tmp-${process.pid}`
   try {
-    const temporary = `${file}.tmp-${process.pid}`
     await writeFile(temporary, `${JSON.stringify(persistedOptions(options), null, 2)}\n`, { mode: 0o600 })
     await rename(temporary, file)
   } finally {
+    await rm(temporary, { force: true })
     await rm(lock, { recursive: true, force: true })
   }
 }

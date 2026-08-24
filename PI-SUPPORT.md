@@ -1,6 +1,6 @@
 # Pi support plan for `opencode-safe-compaction`
 
-Status: implemented and merged into the standalone repository's `default` branch. The OpenCode and Pi entry points share the host-agnostic ledger, projection, and validation core while remaining separately loadable.
+Status: implemented in the checked-out plugin. The OpenCode and Pi entry points share the host-agnostic ledger, projection, and validation core while remaining separately loadable. Pi `offline` and `hybrid` are enabled; the extension uses Pi's complete compaction result contract and keeps native fallback on every unsafe/error path.
 Companion repo to add the entry point to: `shyba/opencode-better-compact-plugin` (vendored at `plugins/safe-compaction/` in the opencode monorepo).
 
 ## Goal

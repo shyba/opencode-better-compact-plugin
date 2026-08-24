@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test"
-import type { Config, Hooks, PluginInput } from "@opencode-ai/plugin"
+import type { Config, Hooks, PluginInput, ToolContext } from "@opencode-ai/plugin"
 import {
   buildRecoveryLedger,
   canonicalLedger,
@@ -12,7 +12,11 @@ import {
 } from "../src/ledger.js"
 import { ledgerReferenceID } from "../src/projection.js"
 import { parseOptions, resolveOptions } from "../src/options.js"
-import { decodedDataUrlBytes, sanitizeHistory, server } from "../src/server.js"
+import { decodedDataUrlBytes, prepareVccOpenCodeCompaction, sanitizeHistory, server } from "../src/server.js"
+import { validateVccAttempt } from "../src/state.js"
+import { canonicalSerialize, vccPatchBaseDigest } from "../src/vcc.js"
+import { isVccSuccessfulSummary, parseVccProjection } from "../src/vcc-wire.js"
+import { vccOpenCodeArchiveManifestDigest } from "../src/vcc-opencode-recall.js"
 import {
   REQUIRED_SECTIONS,
   buildAuthoritativeSummary,
@@ -34,6 +38,7 @@ type SessionFixture = {
   messages: StoredMessage[]
   todos: TodoRecord[]
   pages?: Array<{ messages: StoredMessage[]; nextCursor?: string }>
+  pageFactory?: () => Array<{ messages: StoredMessage[]; nextCursor?: string }>
   pageByCursor?: Record<string, number>
 }
 
@@ -86,11 +91,12 @@ function pluginInput(mock: MockState) {
         mock.messageCursors.push(input.query?.before)
         if (mock.messagesError) throw mock.messagesError
         const fixture = mock.sessions.get(input.path.id)
-        if (!fixture?.pages) return { data: fixture?.messages }
+        const pages = fixture?.pageFactory?.() ?? fixture?.pages
+        if (!pages) return { data: fixture?.messages }
         const pageIndex = input.query?.before
           ? fixture.pageByCursor?.[input.query.before] ?? Number(input.query.before.replace("cursor-", ""))
           : 0
-        const page = fixture.pages[pageIndex]
+        const page = pages[pageIndex]
         const headers = new Headers()
         if (page?.nextCursor) headers.set("X-Next-Cursor", page.nextCursor)
         return { data: page?.messages, response: new Response(null, { headers }) }
@@ -335,6 +341,332 @@ describe("admission limits", () => {
 })
 
 describe("configuration and model request parameters", () => {
+  test("rejects unsupported OpenCode vcc_mode=offline before mutating config", async () => {
+    const hooks = await server(pluginInput(state()), { ...TEST_OPTIONS, vcc_mode: "offline" })
+    const config = { agent: { compaction: { model: "existing/model", keep: "value" } } } as unknown as Config
+    await expect(hooks.config?.(config)).rejects.toThrow("provider-free compaction requires a host-core hook")
+    expect(config).toEqual({ agent: { compaction: { model: "existing/model", keep: "value" } } })
+  })
+
+  test("allows hybrid configuration to reach the preparation hook", async () => {
+    const sessionID = "hybrid-config"
+    const fixture = { messages: [user("hybrid-user", sessionID, "prepare only")], todos: [] }
+    const hooks = await server(pluginInput(state([sessionID, fixture])), { ...TEST_OPTIONS, vcc_mode: "hybrid" })
+    const config = { agent: { compaction: { model: "existing/model", keep: "value" } } } as unknown as Config
+    await expect(hooks.config?.(config)).resolves.toBeUndefined()
+    expect(config.agent?.compaction?.model).toBe(TEST_OPTIONS.model)
+  })
+
+  test("registers source-scoped vcc_recall with bounded discovery and exact expansion", async () => {
+    const sessionID = "recall-tool"
+    const fixture = { messages: [user("recall-decision", sessionID, "retain the deployment decision")], todos: [] }
+    const mock = state([sessionID, fixture])
+    const hooks = await server(pluginInput(mock), TEST_OPTIONS)
+    const recall = hooks.tool?.vcc_recall
+    expect(recall).toBeDefined()
+    const context: ToolContext = {
+      sessionID,
+      messageID: "tool-message",
+      agent: "default",
+      directory: "/tmp/project",
+      worktree: "/tmp/project",
+      abort: new AbortController().signal,
+      metadata: () => undefined,
+      ask: async () => undefined,
+    }
+    const discovered = await recall!.execute({ query: "deployment decision", max_bytes: 4_096 }, context)
+    const discoveryBody = JSON.parse(typeof discovered === "string" ? discovered : discovered.output) as { status: string; items: Array<{ handle: string }> }
+    expect(discoveryBody.status).toBe("ok")
+    expect(discoveryBody.items).toHaveLength(1)
+    const tiny = await recall!.execute({ query: "deployment decision", max_bytes: 256 }, context)
+    const tinyText = typeof tiny === "string" ? tiny : tiny.output
+    expect(utf8Bytes(tinyText)).toBeLessThanOrEqual(256)
+    expect(JSON.parse(tinyText)).toMatchObject({ status: "oversized" })
+    const expanded = await recall!.execute({ expand: [discoveryBody.items[0]!.handle], max_bytes: 4_096 }, context)
+    const expansionBody = JSON.parse(typeof expanded === "string" ? expanded : expanded.output) as { status: string; items: Array<{ status: string; item?: { payload: string } }> }
+    expect(expansionBody.status).toBe("ok")
+    expect(expansionBody.items[0]).toMatchObject({ status: "ok" })
+    expect(expansionBody.items[0]!.item?.payload).toContain("deployment decision")
+    if (typeof expanded !== "string") expect(expanded.metadata).toEqual({ status: "ok" })
+    expect(fixture.messages).toEqual([user("recall-decision", sessionID, "retain the deployment decision")])
+    const restarted = await server(pluginInput(state([sessionID, { messages: structuredClone(fixture.messages), todos: [] }])), TEST_OPTIONS)
+    const restartedExpansion = await restarted.tool!.vcc_recall.execute({ expand: [discoveryBody.items[0]!.handle], max_bytes: 4_096 }, context)
+    expect(JSON.parse(typeof restartedExpansion === "string" ? restartedExpansion : restartedExpansion.output)).toMatchObject({ status: "ok" })
+
+    const allScope = await recall!.execute({ query: "deployment", scope: "all" }, context)
+    expect(JSON.parse(typeof allScope === "string" ? allScope : allScope.output)).toMatchObject({ status: "unavailable", reason: "scope_unavailable" })
+    mock.messagesError = new Error("source unavailable")
+    const unavailable = await recall!.execute({ query: "deployment" }, context)
+    expect(JSON.parse(typeof unavailable === "string" ? unavailable : unavailable.output)).toMatchObject({ status: "incomplete", reason: "fetch_error" })
+  })
+
+  test("prepares a bounded multi-page hybrid envelope without raw source bytes", async () => {
+    const sessionID = "a2-complete"
+    const fixture: SessionFixture = {
+      messages: [],
+      todos: [],
+      pages: [
+        { messages: [user("a2-first", sessionID, "retain first fact")], nextCursor: "cursor-1" },
+        { messages: [user("a2-second", sessionID, "retain second fact")] },
+      ],
+      pageByCursor: { "cursor-1": 1 },
+    }
+    const mock = state([sessionID, fixture])
+    const options = resolveOptions(parseOptions({ ...TEST_OPTIONS, vcc_mode: "hybrid" }))
+    const prepared = await prepareVccOpenCodeCompaction(pluginInput(mock), sessionID, options)
+    const metadata = validateVccAttempt(prepared.metadata)
+    expect(metadata).toMatchObject({ sourceComplete: true, sourceReason: null, outcome: "candidate_ready", validation: "pending" })
+    expect(metadata?.manifestDigest).toMatch(/^[a-f0-9]{64}$/)
+    expect(metadata?.sourceIndexDigest).toMatch(/^[a-f0-9]{64}$/)
+    expect(metadata?.docketDigest).toMatch(/^[a-f0-9]{64}$/)
+    expect(metadata?.candidateDigest).toMatch(/^[a-f0-9]{64}$/)
+    expect(metadata?.compactionTargetID).toMatch(/^pending-text-complete:[a-f0-9]{64}$/)
+    expect(prepared.prompt).toContain("vcc_hybrid_patch_request")
+    expect(prepared.prompt).toContain("candidate_bytes")
+    expect(prepared.prompt).not.toContain("raw_source_bytes")
+    expect(utf8Bytes(prepared.prompt)).toBeLessThanOrEqual(131_072)
+    expect(mock.messageLimits).toEqual([256, 256])
+    expect(mock.messageCursors).toEqual([undefined, "cursor-1"])
+    const hookOutput = await compact(await server(pluginInput(state([sessionID, fixture])), { ...TEST_OPTIONS, vcc_mode: "hybrid" }), sessionID)
+    expect(hookOutput.prompt).toBe(prepared.prompt)
+  })
+
+  test("uses an explicit bounded sentinel for incomplete and generated-only sources", async () => {
+    const repeatedSession = "a2-repeated"
+    const repeatedMessage = user("a2-repeat-first", repeatedSession, "first")
+    const repeatedMock = state([repeatedSession, {
+      messages: [],
+      todos: [],
+      pages: [
+        { messages: [repeatedMessage], nextCursor: "repeat" },
+        { messages: [user("a2-repeat-second", repeatedSession, "second")], nextCursor: "repeat" },
+      ],
+      pageByCursor: { repeat: 1 },
+    }])
+    const generatedSession = "a2-generated"
+    const generated = storedMessage("a2-summary", generatedSession, "assistant", [textPart("a2-summary", generatedSession, "generated prose")], { summary: true })
+    const options = resolveOptions(parseOptions({ ...TEST_OPTIONS, vcc_mode: "hybrid" }))
+    const repeated = await prepareVccOpenCodeCompaction(pluginInput(repeatedMock), repeatedSession, options)
+    const generatedResult = await prepareVccOpenCodeCompaction(pluginInput(state([generatedSession, { messages: [generated], todos: [] }])), generatedSession, options)
+    expect(repeated.prompt).toContain("OPENCODE_SAFE_COMPACTION_VCC_SOURCE_INCOMPLETE_V1")
+    expect(repeated.prompt).toContain("reason=cursor_repeated")
+    expect(repeated.prompt).not.toContain("Compact the bounded recovery ledger")
+    expect(validateVccAttempt(repeated.metadata)).toMatchObject({ sourceComplete: false, sourceReason: "cursor_repeated", candidateDigest: null, outcome: "source_incomplete" })
+    expect(generatedResult.prompt).toContain("reason=unsupported_record")
+    expect(validateVccAttempt(generatedResult.metadata)).toMatchObject({ sourceComplete: false, sourceReason: "unsupported_record", candidateDigest: null, outcome: "source_incomplete" })
+  })
+
+  test("fails candidate preparation closed without falling through to a legacy prompt", async () => {
+    const sessionID = "a2-candidate-failure"
+    const oversized = user("a2-large", sessionID, "x".repeat(20_000))
+    const options = resolveOptions(parseOptions({ ...TEST_OPTIONS, vcc_mode: "hybrid" }))
+    const prepared = await prepareVccOpenCodeCompaction(pluginInput(state([sessionID, { messages: [oversized], todos: [] }])), sessionID, { ...options, max_summary_bytes: 1_024 })
+    expect(prepared.prompt).toContain("OPENCODE_SAFE_COMPACTION_VCC_SOURCE_INCOMPLETE_V1")
+    expect(prepared.prompt).not.toContain("vcc_hybrid_patch_request")
+    expect(validateVccAttempt(prepared.metadata)).toMatchObject({ sourceComplete: false, sourceReason: "unknown", candidateDigest: null, outcome: "source_incomplete" })
+  })
+
+  test("keeps vcc_mode=off on the existing legacy preparation path", async () => {
+    const sessionID = "a2-off"
+    const fixture = { messages: [user("a2-off-user", sessionID, "legacy request")], todos: [] }
+    const output = await compact(await server(pluginInput(state([sessionID, fixture])), TEST_OPTIONS), sessionID)
+    expect(output.prompt).toContain("Compact the bounded recovery ledger")
+    expect(output.prompt).not.toContain("vcc_hybrid_patch_request")
+    expect(output.prompt).not.toContain("OPENCODE_SAFE_COMPACTION_VCC_SOURCE_INCOMPLETE_V1")
+  })
+
+  test("treats a missing vcc_mode as byte-equivalent off behavior", async () => {
+    const sessionID = "mode-missing-default"
+    const fixture = { messages: [user("mode-default-user", sessionID, "legacy request")], todos: [] }
+    const missing = await compact(await server(pluginInput(state([sessionID, fixture])), TEST_OPTIONS), sessionID)
+    const explicit = await compact(await server(pluginInput(state([sessionID, structuredClone(fixture)])), { ...TEST_OPTIONS, vcc_mode: "off" }), sessionID)
+    expect(missing.prompt).toBe(explicit.prompt)
+  })
+
+  test("ignores generated prose during off to hybrid preparation and rejects unsupported offline config", async () => {
+    const sessionID = "mode-transition"
+    const exchange = compactionExchange(sessionID, "GENERATED MODEL ADVICE MUST NOT BECOME SOURCE")
+    const fixture = {
+      messages: [user("mode-transition-user", sessionID, "canonical request"), exchange.request, exchange.summary],
+      todos: [],
+    }
+    const prepared = await prepareVccOpenCodeCompaction(
+      pluginInput(state([sessionID, fixture])),
+      sessionID,
+      resolveOptions(parseOptions({ ...TEST_OPTIONS, vcc_mode: "hybrid" })),
+    )
+    expect(prepared.candidate).toBeDefined()
+    expect(prepared.candidate!.bytes).toContain("canonical request")
+    expect(prepared.candidate!.bytes).not.toContain("GENERATED MODEL ADVICE")
+
+    const offlineHooks = await server(pluginInput(state([sessionID, structuredClone(fixture)])), { ...TEST_OPTIONS, vcc_mode: "offline" })
+    const config = { agent: { compaction: { model: "existing/model" } } } as unknown as Config
+    await expect(offlineHooks.config?.(config)).rejects.toThrow("vcc_mode=offline is unsupported")
+    expect(config.agent?.compaction?.model).toBe("existing/model")
+  })
+
+  test("keeps a 256-record hybrid completion stable across generated-exchange page shifts", async () => {
+    const sessionID = "hybrid-page-boundary"
+    const records = Array.from({ length: 256 }, (_, index) => user(`boundary-${String(index).padStart(3, "0")}`, sessionID, "x"))
+    const exchange = compactionExchange(sessionID, "")
+    const request = exchange.request
+    const fixture: SessionFixture = {
+      messages: [...records],
+      todos: [],
+      pageFactory: () => fixture.messages.includes(exchange.summary)
+        ? [
+          { messages: [request, exchange.summary, ...records.slice(0, 254)], nextCursor: "cursor-1" },
+          { messages: records.slice(254) },
+        ]
+        : [{ messages: records }],
+      pageByCursor: { "cursor-1": 1 },
+    }
+    const hooks = await server(pluginInput(state([sessionID, fixture])), { ...TEST_OPTIONS, vcc_mode: "hybrid", max_summary_bytes: 2_000_000 })
+    await compact(hooks, sessionID)
+    const preflight = await prepareVccOpenCodeCompaction(pluginInput(state([sessionID, fixture])), sessionID, resolveOptions(parseOptions({ ...TEST_OPTIONS, vcc_mode: "hybrid", max_summary_bytes: 2_000_000 })))
+    expect(preflight.metadata.sourceReason).toBeNull()
+    fixture.messages.push(request, exchange.summary)
+    const completed = await complete(hooks, sessionID, exchange.summary.info.id, exchange.partIDs[0]!, "invalid patch", exchange.summary)
+    expect(completed).toContain("vcc-projection v1 start")
+    expect(await autocontinue(hooks, sessionID, true, request.info.id)).toBe(true)
+  })
+
+  test("completes a hybrid summary with one direct patch rehearsal and enables matching continuation", async () => {
+    const sessionID = "hybrid-complete"
+    const fixture = { messages: [user("hybrid-user", sessionID, "Retain this hybrid request")], todos: [] }
+    const mock = state([sessionID, fixture])
+    const options = { ...TEST_OPTIONS, vcc_mode: "hybrid" }
+    const hooks = await server(pluginInput(mock), options)
+    await compact(hooks, sessionID)
+    const prepared = await prepareVccOpenCodeCompaction(pluginInput(mock), sessionID, resolveOptions(parseOptions(options)))
+    expect(prepared.context).toBeDefined()
+    const exchange = compactionExchange(sessionID, "")
+    fixture.messages.push(exchange.request, exchange.summary)
+    const context = prepared.context!
+    const patch = {
+      version: 1,
+      base_digest: vccPatchBaseDigest(context.candidate.bytes, context.docket_bytes),
+      active_goal_ids: [],
+      relations: [],
+      episode_hints: [],
+      open_loop_hints: [],
+      artifact_hints: [],
+      drift: { state: "on_track", goal_ids: [], episode_ids: [] },
+      missing_from_projection_ids: [],
+    }
+    const completed = await complete(hooks, sessionID, exchange.summary.info.id, exchange.partIDs[0]!, canonicalSerialize(patch), exchange.summary)
+    expect(completed).toContain("opencode-safe-compaction vcc-projection v1 start")
+    const projection = parseVccProjection(completed.slice(completed.indexOf("<!-- opencode-safe-compaction vcc-projection v1 start -->"), completed.indexOf("<!-- opencode-safe-compaction vcc-projection v1 end -->") + "<!-- opencode-safe-compaction vcc-projection v1 end -->".length))!
+    expect(projection.archive_manifest_digest).toBe(vccOpenCodeArchiveManifestDigest(prepared.candidate!, sessionID, prepared.metadata.lineageID))
+    expect(isVccSuccessfulSummary(completed, {
+      source_manifest_digest: prepared.metadata.manifestDigest,
+      source_index_digest: prepared.metadata.sourceIndexDigest!,
+      archive_manifest_digest: projection.archive_manifest_digest,
+      candidate_digest: projection.candidate_digest,
+      patch_digest: sha256(canonicalSerialize(patch)),
+    })).toBe(true)
+    expect(await autocontinue(hooks, sessionID, true, exchange.request.info.id)).toBe(true)
+  })
+
+  test("renders degraded output and disables continuation when hybrid source reconstruction fails", async () => {
+    const sessionID = "hybrid-incomplete"
+    const fixture = { messages: [user("hybrid-incomplete-user", sessionID, "Retain this incomplete request")], todos: [] }
+    const mock = state([sessionID, fixture])
+    const hooks = await server(pluginInput(mock), { ...TEST_OPTIONS, vcc_mode: "hybrid" })
+    await compact(hooks, sessionID)
+    const exchange = compactionExchange(sessionID, "")
+    fixture.messages.push(exchange.request, exchange.summary)
+    mock.messagesError = new Error("source unavailable")
+    const completed = await complete(hooks, sessionID, exchange.summary.info.id, exchange.partIDs[0]!, "provider text must be ignored", exchange.summary)
+    expect(completed).toContain("partial source")
+    expect(completed).toContain("vcc-source-status v1 start")
+    expect(completed).not.toContain("vcc-projection v1 start")
+    expect(await autocontinue(hooks, sessionID, true, exchange.request.info.id)).toBe(false)
+  })
+
+  test("degrades closed when the canonical source changes after preparation", async () => {
+    const sessionID = "hybrid-source-changed"
+    const request = user("hybrid-source-user", sessionID, "Original source request")
+    const fixture = { messages: [request], todos: [] }
+    const hooks = await server(pluginInput(state([sessionID, fixture])), { ...TEST_OPTIONS, vcc_mode: "hybrid" })
+    await compact(hooks, sessionID)
+    ;(request.parts[0] as { text: string }).text = "Changed source request"
+    const exchange = compactionExchange(sessionID, "")
+    fixture.messages.push(exchange.request, exchange.summary)
+    const completed = await complete(hooks, sessionID, exchange.summary.info.id, exchange.partIDs[0]!, "provider text is not trusted", exchange.summary)
+    expect(completed).toContain('"reason":"source_shrink"')
+    expect(completed).not.toContain("vcc-projection v1 start")
+    expect(await autocontinue(hooks, sessionID, true, exchange.request.info.id)).toBe(false)
+  })
+
+  test("binds the first hybrid text part and blanks stale or later parts", async () => {
+    const sessionID = "hybrid-parts"
+    const fixture = { messages: [user("hybrid-parts-user", sessionID, "Retain multipart request")], todos: [] }
+    const hooks = await server(pluginInput(state([sessionID, fixture])), { ...TEST_OPTIONS, vcc_mode: "hybrid" })
+    await compact(hooks, sessionID)
+    const exchange = compactionExchange(sessionID, "", { partIDs: ["part-one", "part-two"] })
+    fixture.messages.push(exchange.request, exchange.summary)
+    const first = await complete(hooks, sessionID, exchange.summary.info.id, "part-one", "invalid patch", exchange.summary)
+    const second = await complete(hooks, sessionID, exchange.summary.info.id, "part-two", "later text", exchange.summary)
+    expect(first).not.toBe("invalid patch")
+    expect(second).toBe("")
+    expect(await autocontinue(hooks, sessionID, true, exchange.request.info.id)).toBe(true)
+  })
+
+  test("counts an empty first hybrid part as no-text and does not admit a later part", async () => {
+    const sessionID = "hybrid-no-text"
+    const fixture = { messages: [user("hybrid-no-text-user", sessionID, "Retain no-text request")], todos: [] }
+    const hooks = await server(pluginInput(state([sessionID, fixture])), { ...TEST_OPTIONS, vcc_mode: "hybrid" })
+    await compact(hooks, sessionID)
+    const exchange = compactionExchange(sessionID, "", { partIDs: ["empty-part", "later-part"] })
+    fixture.messages.push(exchange.request, exchange.summary)
+    expect(await complete(hooks, sessionID, exchange.summary.info.id, "empty-part", "", exchange.summary)).toBe("")
+    expect(await complete(hooks, sessionID, exchange.summary.info.id, "later-part", "provider text", exchange.summary)).toBe("")
+    expect(await autocontinue(hooks, sessionID, true, exchange.request.info.id)).toBe(false)
+  })
+
+  test("cleans a candidate when the host emits idle without a text-complete hook", async () => {
+    const sessionID = "hybrid-no-text-hook"
+    const fixture = { messages: [user("hybrid-no-text-hook-user", sessionID, "Retain no-text-hook request")], todos: [] }
+    const hooks = await server(pluginInput(state([sessionID, fixture])), { ...TEST_OPTIONS, vcc_mode: "hybrid" })
+    await compact(hooks, sessionID)
+    const exchange = compactionExchange(sessionID, "")
+    fixture.messages.push(exchange.request, exchange.summary)
+    await hooks.event?.({
+      event: { type: "session.idle", properties: { sessionID } } as unknown as Parameters<NonNullable<Hooks["event"]>>[0]["event"],
+    })
+    expect(await complete(hooks, sessionID, exchange.summary.info.id, exchange.partIDs[0]!, "provider text", exchange.summary)).toBe("")
+    expect(await autocontinue(hooks, sessionID, true, exchange.request.info.id)).toBe(false)
+  })
+
+  test("rejects a stale hybrid target before binding pending metadata", async () => {
+    const sessionID = "hybrid-stale-target"
+    const fixture = { messages: [user("hybrid-stale-user", sessionID, "Retain stale-target request")], todos: [] }
+    const mock = state([sessionID, fixture])
+    const hooks = await server(pluginInput(mock), { ...TEST_OPTIONS, vcc_mode: "hybrid" })
+    await compact(hooks, sessionID)
+    const exchange = compactionExchange(sessionID, "")
+    fixture.messages.push(exchange.request, exchange.summary)
+    expect(await complete(hooks, sessionID, "stale-summary", "stale-part", "provider text")).toBe("")
+    expect(mock.targetRequests).toContain(`${sessionID}:stale-summary`)
+    expect(await complete(hooks, sessionID, exchange.summary.info.id, exchange.partIDs[0]!, "provider text", exchange.summary)).not.toBe("")
+  })
+
+  test("rejects an existing summary whose parent differs from the prepared compaction target", async () => {
+    const sessionID = "hybrid-existing-stale-target"
+    const fixture = { messages: [user("existing-stale-user", sessionID, "Retain existing target request")], todos: [] }
+    const first = compactionExchange(sessionID, "", { suffix: "-first-a" })
+    const selected = compactionExchange(sessionID, "", { suffix: "-first-b" })
+    const stale = compactionExchange(sessionID, "", { suffix: "-second" })
+    fixture.messages.push(first.request, selected.request)
+    const hooks = await server(pluginInput(state([sessionID, fixture])), { ...TEST_OPTIONS, vcc_mode: "hybrid" })
+    await compact(hooks, sessionID)
+    fixture.messages.push(stale.request, stale.summary)
+    expect(await complete(hooks, sessionID, stale.summary.info.id, stale.partIDs[0]!, "provider text", stale.summary)).toBe("")
+    fixture.messages.push(selected.summary)
+    expect(await complete(hooks, sessionID, selected.summary.info.id, selected.partIDs[0]!, "provider text", selected.summary)).not.toBe("")
+  })
+
   test("applies explicit-over-existing precedence without rewriting providers", async () => {
     const hooks = await server(pluginInput(state()), {
       ...TEST_OPTIONS,

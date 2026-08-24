@@ -12,6 +12,7 @@ import { discoverJsonl, discoverJsonlSessions, inspectJsonl, readSessionHeader, 
 import type { JsonlCheckpoint, JsonlDiscoveryResult, JsonlReconcilePrefix, JsonlSessionCheckpoint } from "../src/jsonl.js"
 import { applyRemoteMigration, ensureRemoteSource, openPostgres, purgeRemoteTombstones, readRemoteFence, recordObservation, uploadFenced } from "../src/postgres.js"
 import { openSyncState, type NormalizedRecord } from "../src/sync-state.js"
+import { discoverS3JsonlFiles, hashS3File, planS3Upload, uploadS3File, validateS3Endpoint } from "../src/s3-sync.js"
 
 const installDir = path.resolve(process.env.OPENCODE_SAFE_COMPACTION_DIR ?? path.join(process.env.HOME ?? ".", ".local/share/opencode/plugins/safe-compaction"))
 const configDir = path.resolve(process.env.OPENCODE_SAFE_COMPACTION_CONFIG_DIR ?? process.env.OPENCODE_CONFIG_DIR ?? path.join(process.env.XDG_CONFIG_HOME ?? path.join(process.env.HOME ?? ".", ".config"), "opencode"))
@@ -73,7 +74,7 @@ if (command === "sync") {
   if (action === "compact") process.exit(await syncCompact(process.argv.includes("--yes")))
   if (action === "reconcile") process.exit(await syncReconcile())
   if (action === "backfill-hierarchy") process.exit(await syncBackfillHierarchy(process.argv.includes("--dry-run")))
-  console.error("Usage: better-compact sync setup [--url URL|--url-stdin] [--allow-insecure-remote] [--install] | run [--once] | status | migrate | install | uninstall | prune (--missing-directories|--blank-directories) --yes | compact --yes | reconcile | backfill-hierarchy [--dry-run]")
+  console.error("Usage: better-compact sync setup [--url URL|--url-stdin] [--token TOKEN|--token-stdin] [--allow-insecure-remote] [--install] | run [--once] | status | migrate | install | uninstall | prune (--missing-directories|--blank-directories) --yes | compact --yes | reconcile | backfill-hierarchy [--dry-run]")
   process.exit(2)
 }
 if (command === "rag") {
@@ -101,10 +102,10 @@ Usage:
   better-compact install pi  Register both extensions with Pi
   better-compact update   Update the managed checkout and verify configuration
   better-compact doctor   Check installation, OpenCode, configuration, and SQLite access
-  better-compact sync setup [--url URL|--url-stdin] [--allow-insecure-remote] [--install] Configure the Postgres destination
-  better-compact sync run [--once|--pass] [--config FILE] [--state FILE] Discover sources and deliver redacted records
+  better-compact sync setup [--url URL|--url-stdin] [--token TOKEN|--token-stdin] [--allow-insecure-remote] [--install] Configure session-center S3 ingest
+  better-compact sync run [--once|--pass] [--config FILE] [--state FILE] Archive JSONL sessions to session-center S3
   better-compact sync status Show local outbox status
-  better-compact sync migrate Apply the remote schema using explicit admin credentials
+  better-compact sync migrate No-op for S3 (session-center owns the VCC schema)
   better-compact sync install|uninstall Manage a systemd user service
   better-compact sync prune (--missing-directories|--blank-directories) --yes Delete local Codex files while retaining remote rows
   better-compact sync compact --yes  Remove acknowledged local cache rows and compact SQLite
@@ -254,10 +255,17 @@ async function doctor() {
   checks.push(["OpenCode executable", await commandWorks(process.env.OPENCODE_SAFE_COMPACTION_OPENCODE ?? "opencode", ["--version"]), process.env.OPENCODE_SAFE_COMPACTION_OPENCODE ?? "opencode"])
   checks.push(["Bun executable", await commandWorks(process.env.OPENCODE_SAFE_COMPACTION_BUN ?? "bun", ["--version"]), process.env.OPENCODE_SAFE_COMPACTION_BUN ?? "bun"])
   if (config.sync.enabled) {
-    const databaseURL = databaseURLFor(config)
-    let remoteOK = Boolean(databaseURL)
-    if (databaseURL) { try { assertPostgresTLS(databaseURL, config.sync.allow_insecure_remote) } catch { remoteOK = false } }
-    checks.push(["sync database URL", remoteOK, config.sync.database_url_env])
+    if (config.sync.transport === "s3") {
+      const endpoint = s3EndpointFor(config)
+      let remoteOK = Boolean(endpoint && s3TokenFor(config))
+      if (endpoint) { try { validateS3Endpoint(endpoint, config.sync.allow_insecure_remote) } catch { remoteOK = false } }
+      checks.push(["session-center S3 ingest", remoteOK, `${config.sync.s3_url_env} + ${config.sync.s3_token_env}`])
+    } else {
+      const databaseURL = databaseURLFor(config)
+      let remoteOK = Boolean(databaseURL)
+      if (databaseURL) { try { assertPostgresTLS(databaseURL, config.sync.allow_insecure_remote) } catch { remoteOK = false } }
+      checks.push(["legacy sync database URL", remoteOK, config.sync.database_url_env])
+    }
   }
 
   for (const [name, ok, detail] of checks) console.log(`${ok ? "OK" : "FAIL"} ${name}: ${detail}`)
@@ -298,7 +306,7 @@ async function syncRun(once: boolean, singlePass = false) {
     console.log("sync disabled; set sync.enabled=true in the better-compact config")
     return 0
   }
-  const databaseURL = databaseURLFor(config)
+  const remoteConfigured = config.sync.transport === "s3" ? Boolean(s3EndpointFor(config) && s3TokenFor(config)) : Boolean(databaseURLFor(config))
   const lock = `${paths.state}.lock`
   await mkdir(path.dirname(lock), { recursive: true, mode: 0o700 })
   try {
@@ -329,7 +337,7 @@ async function syncRun(once: boolean, singlePass = false) {
         const progress = await syncPass(config, controller.signal, { bypassSkip: once })
         if (progress.pending === 0) await compactStateIfIdle()
         if (progress.failed && (once || singlePass)) return 1
-        if (stopping || singlePass || (once && (!databaseURL || (!progress.progress && progress.pending === 0)))) return 0
+        if (stopping || singlePass || (once && (!remoteConfigured || (!progress.progress && progress.pending === 0)))) return 0
       } catch (error) {
         if (stopping) return 0
         console.error(`warning: sync pass failed: ${error instanceof Error ? error.message : String(error)}`)
@@ -352,6 +360,10 @@ async function syncReconcile() {
     try { process.kill(Number(lockPID.trim()), 0); console.error("sync is running; stop better-compact-sync.service before forcing a reconcile"); return 2 } catch {}
   }
   const config = await loadConfig(paths)
+  if (config.sync.transport === "s3") {
+    console.log("S3 sync has no remote snapshot fence; session-center archives are append-only and require no reconcile command")
+    return 0
+  }
   const sourceIDs = config.sources
     .filter((source) => source.kind === "opencode-v1-sqlite" || source.kind === "opencode-v1-sessions")
     .map((source) => createHash("sha256").update(`${source.kind}\n${path.resolve(source.database.replace(/^~(?=\/|$)/, process.env.HOME ?? "."))}`).digest("hex").slice(0, 32))
@@ -369,6 +381,10 @@ async function syncReconcile() {
  *  locally; files that are not present remain hierarchy_status "unknown". */
 async function syncBackfillHierarchy(dryRun: boolean) {
   const config = await loadConfig(paths)
+  if (config.sync.transport === "s3" && (s3EndpointFor(config) || s3TokenFor(config))) {
+    console.error("S3 sync archives source bytes; hierarchy backfill is performed by the session-center VCC loader")
+    return 2
+  }
   if (!config.sync.enabled) {
     console.log("sync disabled; set sync.enabled=true in the better-compact config")
     return 1
@@ -431,7 +447,17 @@ async function compactStateIfIdle() {
   }
 }
 
-async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>, signal?: AbortSignal, options: { bypassSkip?: boolean } = {}) {
+async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>, signal?: AbortSignal, options: { bypassSkip?: boolean; localOnly?: boolean } = {}) {
+  if (config.sync.transport === "s3") {
+    const endpoint = s3EndpointFor(config)
+    const token = s3TokenFor(config)
+    if (endpoint || token) return syncS3Pass(config, signal)
+    // A hand-written pre-S3 config may enable sync before setup has supplied
+    // the session-center credentials. Keep its local discovery usable for
+    // migration and diagnostics, but never claim that anything was uploaded.
+    console.error("warning: session-center S3 endpoint/token is not configured; running local compatibility staging only")
+    return syncPass({ ...config, sync: { ...config.sync, transport: "postgres" } }, signal, { ...options, localOnly: true })
+  }
   const state = await openSyncState(paths.state)
   let progressed = false
   let failed = false
@@ -489,8 +515,8 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>, signal?:
       progressed = progressed || discoveryResult.records.length > 0 || discoveryResult.reconcilePrefixes.length > 0
       console.log(`staged ${discoveryResult.records.length} records from ${filename}${discoveryResult.complete ? " (reconciled)" : discoveryResult.hasMore ? " (more pending)" : " (unchanged)"}`)
       if (signal?.aborted) break
-      const databaseURL = databaseURLFor(config)
-        if (databaseURL) {
+      const databaseURL = options.localOnly ? undefined : databaseURLFor(config)
+      if (databaseURL) {
         assertPostgresTLS(databaseURL, config.sync.allow_insecure_remote)
         const client = openPostgres(databaseURL)
         let rows: ReturnType<typeof state.claim> = []
@@ -531,7 +557,7 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>, signal?:
         } finally {
           await client.close()
         }
-        }
+      }
       } catch (error) {
         failed = true
         console.error(`warning: sync source ${source.kind} failed: ${error instanceof Error ? error.message : String(error)}`)
@@ -548,25 +574,104 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>, signal?:
   } finally { state.close() }
 }
 
+/** Upload the canonical source bytes to session-center. The local SQLite
+ * state records only the last acknowledged file version; S3 remains the
+ * durable source of truth and its file_id replay contract makes a crash
+ * between PUT and the local acknowledgement safe. */
+async function syncS3Pass(config: Awaited<ReturnType<typeof loadConfig>>, signal?: AbortSignal) {
+  const endpointValue = s3EndpointFor(config)
+  const token = s3TokenFor(config)
+  if (!endpointValue) {
+    console.error(`missing ${config.sync.s3_url_env}; configure the session-center base URL`)
+    return { progress: false, pending: 0, failed: true }
+  }
+  if (!token || token.length < 16) {
+    console.error(`missing ${config.sync.s3_token_env} (session-center requires a bearer token of at least 16 characters)`)
+    return { progress: false, pending: 0, failed: true }
+  }
+  const endpoint = validateS3Endpoint(endpointValue, config.sync.allow_insecure_remote)
+  const state = await openSyncState(paths.state)
+  let progressed = false
+  let failed = false
+  try {
+    const installation = state.ensureDefaultInstallation("default", "s3", "s3")
+    for (const source of config.sources) {
+      if (signal?.aborted) break
+      if (source.kind === "opencode-v1-sqlite" || source.kind === "opencode-v1-sessions") {
+        failed = true
+        console.error(`warning: S3 sync cannot archive ${source.kind} yet; session-center needs an OpenCode record feeder (source left untouched)`)
+        continue
+      }
+      if (source.kind !== "codex-jsonl" && source.kind !== "codex-jsonl-sessions" && source.kind !== "pi-jsonl") {
+        failed = true
+        console.error(`warning: unsupported S3 source adapter: ${source.kind}`)
+        continue
+      }
+      const root = path.resolve(source.database.replace(/^~(?=\/|$)/, process.env.HOME ?? "."))
+      const sourceID = createHash("sha256").update(`${source.kind}\n${root}`).digest("hex").slice(0, 32)
+      const sourceIncarnation = state.sourceIncarnation(sourceID)
+      state.upsertSource({ id: sourceID, installationID: installation.id, kind: source.kind, schemaVersion: 1, locator: root, incarnation: sourceIncarnation })
+      let uploaded = 0
+      try {
+        const files = await discoverS3JsonlFiles(root)
+        for (const filename of files) {
+          if (signal?.aborted) break
+          const metadata = await stat(filename)
+          const sourcePath = metadata.isFile() && (await stat(root)).isFile()
+            ? path.basename(filename)
+            : path.relative(root, filename)
+          if (!sourcePath || sourcePath.startsWith("..") || path.isAbsolute(sourcePath)) throw new Error(`invalid source path ${sourcePath}`)
+          const sha256 = await hashS3File(filename)
+          const previous = state.s3File(sourceID, sourcePath)
+          const plan = planS3Upload(sourcePath, metadata, sha256, previous)
+          if (plan.action === "skip") {
+            if (previous?.mtimeMs !== plan.version.mtimeMs) state.recordS3File(sourceID, sourcePath, plan.version)
+            continue
+          }
+          await uploadS3File({ endpoint, token, fileID: plan.fileID, sourcePath, filename, start: plan.start, full: plan.full, ...(signal ? { signal } : {}) })
+          state.recordS3File(sourceID, sourcePath, plan.version)
+          uploaded++
+          progressed = true
+        }
+        state.recordSourceComplete(sourceID, (await stat(root)).mtimeMs, files.length, Math.max(0, ...await Promise.all(files.map(async (file) => (await stat(file)).mtimeMs))))
+        console.log(`uploaded ${uploaded} changed JSONL file${uploaded === 1 ? "" : "s"} from ${root}`)
+      } catch (error) {
+        failed = true
+        console.error(`warning: S3 sync source ${source.kind} failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    return { progress: progressed, pending: 0, failed }
+  } finally {
+    state.close()
+  }
+}
+
 async function syncSetup() {
   try {
     const existing = await loadConfig(paths)
-    const databaseURL = await setupDatabaseURL(existing)
     const allowInsecureRemote = existing.sync.allow_insecure_remote || process.argv.includes("--allow-insecure-remote")
-    assertPostgresURL(databaseURL, allowInsecureRemote)
-    const sources = existing.sources.length ? existing.sources : await availableDefaultSyncSources()
-    const environmentFile = await writeSyncEnvironment(databaseURL, allowInsecureRemote)
+    const syncURL = await setupSyncURL(existing)
+    const transport = syncURL.startsWith("http://") || syncURL.startsWith("https://") ? "s3" as const : "postgres" as const
+    const token = transport === "s3" ? await setupS3Token(existing) : undefined
+    if (transport === "s3") {
+      validateS3Endpoint(syncURL, allowInsecureRemote)
+      if (!token || token.length < 16) throw new Error(`no session-center bearer token supplied; use --token, --token-stdin, or set ${existing.sync.s3_token_env}`)
+    } else {
+      assertPostgresURL(syncURL, allowInsecureRemote)
+    }
+    const sources = existing.sources.length ? existing.sources : await availableDefaultSyncSources(transport)
+    const environmentFile = await writeSyncEnvironment(syncURL, allowInsecureRemote, token, { ...existing, sync: { ...existing.sync, transport } })
     await saveConfig({
       ...existing,
-      sync: { ...existing.sync, enabled: true, allow_insecure_remote: allowInsecureRemote },
+      sync: { ...existing.sync, enabled: true, transport, allow_insecure_remote: allowInsecureRemote },
       sources,
     }, paths)
     console.log(`configured sync in ${paths.config}`)
     console.log(`stored the writer URL in ${environmentFile} (mode 0600)`)
     if (sources.length) console.log(`configured ${sources.length} session source${sources.length === 1 ? "" : "s"}`)
     else console.error(`warning: no standard session source was found; add sources to ${paths.config} before running sync`)
-    if (process.argv.includes("--install")) return syncInstall(databaseURL)
-    console.log("next: run better-compact sync migrate once with admin credentials, then better-compact sync install")
+    if (process.argv.includes("--install")) return syncInstall(syncURL)
+    console.log(transport === "s3" ? "next: run better-compact sync install (session-center performs archive loading separately)" : "next: run better-compact sync migrate once with admin credentials, then better-compact sync install")
     return 0
   } catch (error) {
     console.error(`sync setup failed: ${error instanceof Error ? error.message : String(error)}`)
@@ -574,14 +679,14 @@ async function syncSetup() {
   }
 }
 
-async function setupDatabaseURL(config: Awaited<ReturnType<typeof loadConfig>>) {
-  const environmentName = config.sync.database_url_env
+async function setupSyncURL(config: Awaited<ReturnType<typeof loadConfig>>) {
+  const environmentName = config.sync.transport === "s3" ? config.sync.s3_url_env : config.sync.database_url_env
   const fromFlag = process.argv.includes("--url")
   const fromStdin = process.argv.includes("--url-stdin")
   if (fromFlag && fromStdin) throw new Error("choose either --url or --url-stdin, not both")
   if (fromFlag) {
     const value = flagValue("--url")
-    if (!value || value.startsWith("--")) throw new Error("--url requires a Postgres URL")
+    if (!value || value.startsWith("--")) throw new Error("--url requires a session-center URL or Postgres URL")
     return value.trim()
   }
   if (fromStdin) {
@@ -589,16 +694,33 @@ async function setupDatabaseURL(config: Awaited<ReturnType<typeof loadConfig>>) 
     if (!value) throw new Error("--url-stdin received an empty value")
     return value
   }
-  const value = process.env[environmentName]?.trim() || syncEnvironmentValue(environmentName)?.trim() || databaseURLFor(config)
-  if (!value) throw new Error(`no Postgres URL supplied; use --url, --url-stdin, or set ${environmentName}`)
+  const value = process.env[environmentName]?.trim() || syncEnvironmentValue(environmentName)?.trim() || (config.sync.transport === "s3" ? s3EndpointFor(config) ?? databaseURLFor(config) : databaseURLFor(config))
+  if (!value) throw new Error(`no sync endpoint supplied; use --url, --url-stdin, or set ${environmentName}`)
   return value
 }
 
-async function availableDefaultSyncSources() {
+async function setupS3Token(config: Awaited<ReturnType<typeof loadConfig>>) {
+  const fromFlag = process.argv.includes("--token")
+  const fromStdin = process.argv.includes("--token-stdin")
+  if (fromFlag && fromStdin) throw new Error("choose either --token or --token-stdin, not both")
+  if (fromFlag) {
+    const value = flagValue("--token")
+    if (!value || value.startsWith("--")) throw new Error("--token requires a bearer token")
+    return value.trim()
+  }
+  if (fromStdin) {
+    const value = (await Bun.stdin.text()).trim()
+    if (!value) throw new Error("--token-stdin received an empty value")
+    return value
+  }
+  return s3TokenFor(config)
+}
+
+async function availableDefaultSyncSources(transport: "s3" | "postgres" = "postgres") {
   const openCodeDatabase = process.env.OPENCODE_DB ?? (process.env.XDG_DATA_HOME
     ? path.join(process.env.XDG_DATA_HOME, "opencode", "opencode.db")
     : "~/.local/share/opencode/opencode.db")
-  const candidates = await Promise.all(defaultSyncSources.map(async (source) => {
+  const candidates = await Promise.all(defaultSyncSources.filter((source) => transport === "postgres" || source.kind === "codex-jsonl" || source.kind === "codex-jsonl-sessions" || source.kind === "pi-jsonl").map(async (source) => {
     const database = source.kind.startsWith("opencode-") ? openCodeDatabase : source.database
     const filename = path.resolve(database.replace(/^~(?=\/|$)/, process.env.HOME ?? "."))
     if (!(await exists(filename))) return undefined
@@ -661,6 +783,14 @@ function databaseURLFor(config: Awaited<ReturnType<typeof loadConfig>>) {
   return buildDatabaseURL(host, port, database, user, password)
 }
 
+function s3EndpointFor(config: Awaited<ReturnType<typeof loadConfig>>) {
+  return process.env[config.sync.s3_url_env]?.trim() || syncEnvironmentValue(config.sync.s3_url_env)?.trim() || process.env.SESSION_CENTER_URL?.trim()
+}
+
+function s3TokenFor(config: Awaited<ReturnType<typeof loadConfig>>) {
+  return process.env[config.sync.s3_token_env]?.trim() || syncEnvironmentValue(config.sync.s3_token_env)?.trim() || process.env.S3_SYNC_TOKEN?.trim()
+}
+
 function adminDatabaseURLFor() {
   const explicit = process.env.OPENCODE_SYNC_ADMIN_DATABASE_URL
   if (explicit) return explicit
@@ -702,6 +832,7 @@ function assertPostgresURL(url: string, allowInsecureRemote: boolean) {
 }
 
 async function syncStatus() {
+  const config = await loadConfig(paths)
   console.log(`state: ${paths.state}`)
   if (!(await access(paths.state).then(() => true).catch(() => false))) {
     console.log("pending outbox: 0")
@@ -715,6 +846,14 @@ async function syncStatus() {
     const bytes = db.query("select coalesce(sum(length(coalesce(payload_json,'') || coalesce(routing_json,''))), 0) as value from outbox").get() as { value: number }
     console.log(`pending outbox: ${Number(pending.value)}`)
     console.log(`outbox bytes: ${Number(bytes.value)}`)
+    if (config.sync.transport === "s3") {
+      const hasS3FileTable = db.query("select 1 from sqlite_master where type='table' and name='s3_file'").get() !== null
+      const files = hasS3FileTable
+        ? db.query("select count(*) as value, coalesce(sum(size), 0) as bytes from s3_file").get() as { value: number; bytes: number }
+        : { value: 0, bytes: 0 }
+      console.log(`S3 file versions: ${Number(files.value)} / ${Number(files.bytes)} bytes acknowledged locally`)
+      console.log(`session-center: ${s3EndpointFor(config) ?? "not configured"}`)
+    }
     const cache = db.query("select count(*) as rows, coalesce(sum(length(coalesce(payload_json,'') || coalesce(routing_json,''))), 0) as bytes from normalized_record").get() as { rows: number; bytes: number }
     console.log(`staged local cache: ${Number(cache.rows)} rows / ${Number(cache.bytes)} bytes`)
     const sources = db.query("select id, remote_revision_high_water, last_seen_at from source order by id").all() as Array<{ id: string; remote_revision_high_water?: number; last_seen_at: number }>
@@ -749,6 +888,10 @@ async function syncPrune(confirmed: boolean, missingDirectories: boolean, blankD
   }
   const config = await loadConfig(paths)
   if (!config.sync.enabled) { console.error("sync is disabled; configure sync before pruning"); return 2 }
+  if (config.sync.transport === "s3") {
+    console.error("sync prune is unavailable for S3 archives; use the source's retention/lifecycle policy instead")
+    return 2
+  }
   const sourceConfig = config.sources.find((source) => source.kind === "codex-jsonl")
   if (!sourceConfig) { console.error("no codex-jsonl source is configured"); return 2 }
   const root = path.resolve(sourceConfig.database.replace(/^~(?=\/|$)/, process.env.HOME ?? "."))
@@ -849,6 +992,10 @@ async function syncCompact(confirmed: boolean) {
 
 async function syncMigrate() {
   const config = await loadConfig(paths)
+  if (config.sync.transport === "s3") {
+    console.log("session-center owns the S3/VCC schema; no local Postgres migration is required")
+    return 0
+  }
   const databaseURL = adminDatabaseURLFor()
   if (!databaseURL) {
     console.error("missing POSTGRES_SUPERUSER_USER/POSTGRES_SUPERUSER_PASSWORD (or OPENCODE_SYNC_ADMIN_DATABASE_URL)")
@@ -1156,6 +1303,10 @@ async function installationAdopt(confirmed: boolean) {
     return 2
   }
   const config = await loadConfig(paths)
+  if (config.sync.transport === "s3") {
+    console.error("installation adopt is a legacy Postgres operation; S3 file identities are replay-safe without adoption")
+    return 2
+  }
   const databaseURL = databaseURLFor(config)
   if (!databaseURL) { console.error(`missing ${config.sync.database_url_env}`); return 2 }
   assertPostgresTLS(databaseURL, config.sync.allow_insecure_remote)
@@ -1191,7 +1342,7 @@ async function installationAdopt(confirmed: boolean) {
   } finally { await client.close(); state.close() }
 }
 
-async function syncInstall(databaseURL?: string) {
+async function syncInstall(syncURL?: string) {
   const mode = await installationMode()
   if (mode !== "git" && mode !== "npm") {
     console.error("refusing to install a persistent service from an ephemeral package path; materialize the package first")
@@ -1211,7 +1362,7 @@ async function syncInstall(databaseURL?: string) {
   }
   await mkdir(serviceDirectory, { recursive: true, mode: 0o700 })
   const command = executable ? `${quoteSystemd(executable)} sync run` : `${quoteSystemd(process.execPath)} ${quoteSystemd(process.argv[1] ?? "")} sync run`
-  const environmentFile = await writeSyncEnvironment(databaseURL)
+  const environmentFile = await writeSyncEnvironment(syncURL)
   await writeFile(`${service}.tmp-${process.pid}`, `[Unit]\nDescription=Better Compact session sync\nAfter=default.target\n\n[Service]\nExecStart=${command}\n${environmentFile ? `EnvironmentFile=-${systemdEnvironmentFilePath(environmentFile)}\n` : ""}Restart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n`, { mode: 0o644 })
   await rename(`${service}.tmp-${process.pid}`, service)
   const reload = await run("systemctl", ["--user", "daemon-reload"], process.env)
@@ -1238,17 +1389,22 @@ async function launchdInstall(mode: string) {
   return result
 }
 
-async function writeSyncEnvironment(databaseURL?: string, allowInsecureRemote?: boolean) {
-  const config = await loadConfig(paths)
-  const value = databaseURL ?? databaseURLFor(config)
+async function writeSyncEnvironment(syncURL?: string, allowInsecureRemote?: boolean, token?: string, configOverride?: Awaited<ReturnType<typeof loadConfig>>) {
+  const config = configOverride ?? await loadConfig(paths)
+  const value = syncURL ?? (config.sync.transport === "s3" ? s3EndpointFor(config) : databaseURLFor(config))
   if (!value) return undefined
-  assertPostgresURL(value, allowInsecureRemote ?? config.sync.allow_insecure_remote)
+  const insecure = allowInsecureRemote ?? config.sync.allow_insecure_remote
+  if (config.sync.transport === "s3") validateS3Endpoint(value, insecure)
+  else assertPostgresURL(value, insecure)
+  const environmentName = config.sync.transport === "s3" ? config.sync.s3_url_env : config.sync.database_url_env
+  const environmentToken = config.sync.transport === "s3" ? token ?? s3TokenFor(config) : undefined
+  if (config.sync.transport === "s3" && (!environmentToken || environmentToken.length < 16)) throw new Error(`missing ${config.sync.s3_token_env}; session-center requires a bearer token of at least 16 characters`)
   await mkdir(paths.home, { recursive: true, mode: 0o700 })
   await chmod(paths.home, 0o700)
   const file = path.join(paths.home, "sync.env")
   const temporary = `${file}.tmp-${process.pid}`
   try {
-    await writeFile(temporary, `${config.sync.database_url_env}=${quoteSystemd(value)}\n`, { mode: 0o600 })
+    await writeFile(temporary, `${environmentName}=${quoteSystemd(value)}\n${environmentToken ? `${config.sync.s3_token_env}=${quoteSystemd(environmentToken)}\n` : ""}`, { mode: 0o600 })
     await chmod(temporary, 0o600)
     await rename(temporary, file)
   } finally { await rm(temporary, { force: true }) }

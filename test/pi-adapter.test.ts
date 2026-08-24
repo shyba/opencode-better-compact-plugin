@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { describe, expect, test } from "bun:test"
@@ -66,6 +66,10 @@ function toolResultMessage(toolCallId: string, toolName: string, text: string, i
     isError,
     timestamp: 1,
   } as unknown as AgentMessage
+}
+
+function branchMessage(id: string, parentId: string | null, message: AgentMessage): SessionEntry {
+  return { type: "message", id, parentId, timestamp: "2026-01-01T00:00:00.000Z", message } as SessionEntry
 }
 
 describe("isCatAttachment", () => {
@@ -274,15 +278,69 @@ describe("pi option persistence", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "sc-pi-"))
     try {
       await mkdir(path.join(dir, ".pi"), { recursive: true })
-      const resolved = resolveOptions(parseOptions({ model: "test/compactor", tail_turns: 6 }))
+      const resolved = resolveOptions(parseOptions({ model: "test/compactor", tail_turns: 6, vcc_mode: "off" }))
       await savePiOptions(dir, resolved)
       const loaded = resolveOptions(parseOptions(loadPiOptions(dir)))
       expect(loaded.model).toBe("test/compactor")
+      expect(loaded.vcc_mode).toBe("off")
       expect(loaded.tail_turns).toBe(6)
       expect(loaded.max_ledger_bytes).toBe(resolved.max_ledger_bytes)
       const raw = await readFile(path.join(dir, ".pi", "safe-compaction.json"), "utf8")
       expect(raw).not.toContain("preserve_recent_tokens")
       expect(raw).not.toContain("reserved_tokens")
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test.each(["off", "hybrid", "offline"] as const)("atomically round-trips vcc_mode=%s with unrelated settings and mode 0600", async (vcc_mode) => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "sc-pi-mode-roundtrip-"))
+    try {
+      const options = resolveOptions(parseOptions({
+        model: "test/compactor",
+        vcc_mode,
+        response_mode: "json",
+        max_output_tokens: 321,
+        max_user_text_bytes: 12_345,
+      }))
+      await savePiOptions(dir, options)
+      const loaded = resolveOptions(parseOptions(loadPiOptions(dir)))
+      expect(loaded).toMatchObject({
+        model: "test/compactor",
+        vcc_mode,
+        response_mode: "json",
+        max_output_tokens: 321,
+        max_user_text_bytes: 12_345,
+      })
+      expect((await stat(path.join(dir, ".pi", "safe-compaction.json"))).mode & 0o777).toBe(0o600)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("removes the temporary config when atomic rename fails", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "sc-pi-rename-failure-"))
+    try {
+      const configDir = path.join(dir, ".pi")
+      await mkdir(path.join(configDir, "safe-compaction.json"), { recursive: true })
+      const options = resolveOptions(parseOptions({ model: "test/compactor", vcc_mode: "off" }))
+      await expect(savePiOptions(dir, options)).rejects.toThrow()
+      expect(await stat(path.join(configDir, "safe-compaction.json"))).toBeDefined()
+      await expect(stat(path.join(configDir, `safe-compaction.json.tmp-${process.pid}`))).rejects.toThrow()
+      await expect(stat(path.join(configDir, "safe-compaction.json.lock"))).rejects.toThrow()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("leaves an unknown mode untouched for an older-plugin downgrade instead of silently rewriting it", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "sc-pi-downgrade-"))
+    try {
+      await mkdir(path.join(dir, ".pi"), { recursive: true })
+      const raw = `${JSON.stringify({ vcc_mode: "future-mode", model: "test/compactor" })}\n`
+      await writeFile(path.join(dir, ".pi", "safe-compaction.json"), raw, { mode: 0o600 })
+      expect(loadPiOptions(dir)).toEqual({})
+      expect(await readFile(path.join(dir, ".pi", "safe-compaction.json"), "utf8")).toBe(raw)
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
@@ -315,12 +373,16 @@ describe("Pi package integration", () => {
   test("registers both real extension entry points without host startup state", () => {
     const events = new Map<string, unknown[]>()
     const commands = new Map<string, unknown>()
+    const tools = new Map<string, unknown>()
     const api = {
       on(event: string, handler: unknown) {
         events.set(event, [...(events.get(event) ?? []), handler])
       },
       registerCommand(name: string, options: unknown) {
         commands.set(name, options)
+      },
+      registerTool(tool: { name: string }) {
+        tools.set(tool.name, tool)
       },
     } as unknown as ExtensionAPI
 
@@ -331,6 +393,66 @@ describe("Pi package integration", () => {
     expect(events.get("session_before_tree")).toHaveLength(1)
     expect(commands.has("compaction-model")).toBe(true)
     expect(commands.has("cat")).toBe(true)
+    expect(tools.has("vcc_recall")).toBe(true)
+  })
+
+  test.each(["offline", "hybrid"])("accepts Pi vcc_mode=%s at session start", async (vcc_mode) => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "sc-pi-mode-"))
+    try {
+      await mkdir(path.join(dir, ".pi"), { recursive: true })
+      await writeFile(path.join(dir, ".pi", "safe-compaction.json"), `${JSON.stringify({ vcc_mode })}\n`)
+      const events = new Map<string, unknown[]>()
+      const api = {
+        on(event: string, handler: unknown) {
+          events.set(event, [...(events.get(event) ?? []), handler])
+        },
+        registerCommand() {},
+        registerTool() {},
+      } as unknown as ExtensionAPI
+      piExtension(api)
+      const start = events.get("session_start")?.[0] as ((event: unknown, context: { cwd: string }) => unknown) | undefined
+      expect(start).toBeDefined()
+      expect(() => start?.({}, { cwd: dir })).not.toThrow()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("offline Pi VCC compacts its own branch cut without a provider call", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "sc-pi-offline-"))
+    try {
+      await mkdir(path.join(dir, ".pi"), { recursive: true })
+      await writeFile(path.join(dir, ".pi", "safe-compaction.json"), JSON.stringify({ vcc_mode: "offline", tail_turns: 1 }))
+      const events = new Map<string, unknown[]>()
+      const api = {
+        on(event: string, handler: unknown) { events.set(event, [...(events.get(event) ?? []), handler]) },
+        registerCommand() {},
+        registerTool() {},
+      } as unknown as ExtensionAPI
+      piExtension(api)
+      const branch = [
+        branchMessage("u-old", null, userMessage("old request")),
+        branchMessage("a-old", "u-old", assistantMessage([{ type: "text", text: "old result" }])),
+        branchMessage("u-current", "a-old", userMessage("current request")),
+        branchMessage("a-current", "u-current", assistantMessage([{ type: "text", text: "current result" }])),
+      ]
+      let providerCalls = 0
+      const ctx = {
+        cwd: dir,
+        model: undefined,
+        sessionManager: { getSessionId: () => "offline-session", getBranch: () => branch },
+        modelRegistry: { hasConfiguredAuth: () => { providerCalls++; return true }, complete: async () => { providerCalls++; throw new Error("offline must not call a provider") } },
+        getContextUsage: () => ({ tokens: 0, contextWindow: 20_000 }),
+      }
+      await (events.get("session_start")![0] as (event: unknown, context: unknown) => unknown)({}, ctx)
+      const handler = events.get("session_before_compact")![0] as (event: unknown, context: unknown) => Promise<unknown>
+      const result = await handler({ preparation: { messagesToSummarize: [], turnPrefixMessages: [], firstKeptEntryId: "host-cut", tokensBefore: 100 }, branchEntries: branch, signal: new AbortController().signal }, ctx)
+      expect(providerCalls).toBe(0)
+      expect((result as { compaction: { firstKeptEntryId: string } }).compaction.firstKeptEntryId).toBe("u-current")
+      expect((result as { compaction: { summary: string } }).compaction.summary).toContain("old request")
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 
   test("pins fresh files in the real compaction hook without dropping ordinary attachments", async () => {
@@ -347,6 +469,7 @@ describe("Pi package integration", () => {
           events.set(event, [...(events.get(event) ?? []), handler])
         },
         registerCommand() {},
+        registerTool() {},
       } as unknown as ExtensionAPI
       piExtension(api)
 
@@ -430,6 +553,7 @@ describe("Pi package integration", () => {
       const api = {
         on(event: string, handler: unknown) { events.set(event, [...(events.get(event) ?? []), handler]) },
         registerCommand() {},
+        registerTool() {},
       } as unknown as ExtensionAPI
       piExtension(api)
       const model = {
@@ -500,6 +624,7 @@ describe("Pi package integration", () => {
       const api = {
         on(event: string, handler: unknown) { events.set(event, [...(events.get(event) ?? []), handler]) },
         registerCommand() {},
+        registerTool() {},
       } as unknown as ExtensionAPI
       piExtension(api)
       const model = {

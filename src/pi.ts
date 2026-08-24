@@ -1,7 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core"
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent"
 import { sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent"
-import type { Api, Model, Usage } from "@earendil-works/pi-ai"
+import { Type, type Api, type Model, type Usage } from "@earendil-works/pi-ai"
 import { uuidv7 } from "@earendil-works/pi-ai"
 import { createHash } from "node:crypto"
 import { buildRecoveryLedger, utf8Bytes } from "./ledger.js"
@@ -11,6 +11,8 @@ import { parseProjectionEnvelope, remapProjection, renderProjection } from "./pr
 import { buildAuthoritativeSummary, buildCompactionPrompt, renderProjectedResponse } from "./validation.js"
 import { collectFiles, formatPinnedBlock, loadCatOptions, loadFixedPin, pinnedPathsOnlyBlock } from "./cat-core.js"
 import { SEMANTIC_CHECKPOINT_MAX_BYTES, SemanticStore, attachSemanticCheckpoint, repositoryIdentity, semanticArtifacts, semanticDatabasePath, semanticPromptExtension, validateSemanticDelta } from "./semantic.js"
+import { VCC_PI_RECALL_DEFAULT_MAX_BYTES, VCC_PI_RECALL_DEFAULT_MAX_RESULTS, VCC_PI_RECALL_MAX_BYTES, buildVccPiRecallIndex, discoverVccPiHandles, renderVccPiRecallEntry, resolveVccPiHandle, vccPiRecallToolResult } from "./vcc-pi-recall.js"
+import { buildPiVccCut } from "./pi-vcc-cut.js"
 
 export { loadPiOptions, savePiOptions, toMessageRecords, todosFromBranch, priorPluginSummary } from "./pi-adapter.js"
 export type { PriorPluginSummary } from "./pi-adapter.js"
@@ -19,8 +21,8 @@ export type PiPluginOptions = PluginOptions
 
 type PipelineResult = {
   summary: string
-  usage: Usage
-  details: { ledgerDigest: string; ledgerBytes: number }
+  usage?: Usage
+  details: { ledgerDigest: string; ledgerBytes: number; mode: PluginOptions["vcc_mode"] }
 }
 
 /** Keep the complete compaction artifact below a conservative context fraction
@@ -35,6 +37,72 @@ export default function piExtension(pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     cwd = ctx.cwd
     resolved = resolveOptions(parseOptions(loadPiOptions(cwd)))
+  })
+
+  pi.registerTool({
+    name: "vcc_recall",
+    label: "VCC Pi recall",
+    description: "Recall exact, source-scoped items from the active Pi session branch. Results are bounded and redacted; archive and all-session lookup are unavailable in Pi V1.",
+    promptSnippet: "Recall bounded source-backed items from this Pi branch",
+    parameters: Type.Object({
+      handle: Type.Optional(Type.String({ maxLength: 512 })),
+      query: Type.Optional(Type.String({ maxLength: 1_024 })),
+      expand: Type.Optional(Type.Array(Type.String({ maxLength: 512 }), { maxItems: 8 })),
+      page: Type.Optional(Type.Integer({ minimum: 1, maximum: 1_024 })),
+      max_results: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })),
+      max_bytes: Type.Optional(Type.Integer({ minimum: 256, maximum: VCC_PI_RECALL_MAX_BYTES })),
+      scope: Type.Optional(Type.Union([Type.Literal("session"), Type.Literal("all")])),
+    }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+      const max_bytes = Math.min(VCC_PI_RECALL_MAX_BYTES, Math.max(256, params.max_bytes ?? VCC_PI_RECALL_DEFAULT_MAX_BYTES))
+      if (params.scope === "all") return piRecallToolResponse(vccPiRecallToolResult("unavailable", { reason: "scope_unavailable", scope: "session" }, max_bytes))
+      const operations = [params.handle !== undefined, params.query !== undefined, params.expand !== undefined].filter(Boolean).length
+      if (operations !== 1) return piRecallToolResponse(vccPiRecallToolResult("error", { reason: "exactly_one_operation_required", operations: ["handle", "query", "expand"] }, max_bytes))
+      if (params.expand && (params.expand.length > 8 || new Set(params.expand).size !== params.expand.length)) return piRecallToolResponse(vccPiRecallToolResult("error", { reason: "duplicate_or_oversized_handles" }, max_bytes))
+      const sessionID = ctx.sessionManager.getSessionId()
+      if (!sessionID) return piRecallToolResponse(vccPiRecallToolResult("unavailable", { reason: "session_unavailable" }, max_bytes))
+      const index = buildVccPiRecallIndex({ session_id: sessionID, branch: ctx.sessionManager.getBranch() })
+      if (!index.complete) return piRecallToolResponse(vccPiRecallToolResult("incomplete", { reason: index.reason ?? "unsupported_record", scope: "active_branch" }, max_bytes))
+      if (!index.entries.length) return piRecallToolResponse(vccPiRecallToolResult("unavailable", { reason: "no_canonical_entries", scope: "active_branch" }, max_bytes))
+      if (params.handle !== undefined) {
+        const resolvedHandle = resolveVccPiHandle({ handle: params.handle, session_id: sessionID, lineage_id: index.lineage_id, entries: index.entries, max_bytes })
+        if (!resolvedHandle.ok) return piRecallToolResponse(vccPiRecallToolResult("unavailable", { reason: resolvedHandle.reason }, max_bytes))
+        const rendered = renderVccPiRecallEntry(resolvedHandle.entry, max_bytes)
+        return piRecallToolResponse(rendered === undefined
+          ? vccPiRecallToolResult("unavailable", { reason: "oversized" }, max_bytes)
+          : vccPiRecallToolResult("ok", { operation: "handle", item: JSON.parse(rendered) }, max_bytes))
+      }
+      if (params.expand !== undefined) {
+        const item_bytes = Math.max(256, Math.floor(max_bytes / Math.max(1, params.expand.length)))
+        const items = params.expand.map((handle) => {
+          const resolvedHandle = resolveVccPiHandle({ handle, session_id: sessionID, lineage_id: index.lineage_id, entries: index.entries, max_bytes: item_bytes })
+          if (!resolvedHandle.ok) return { handle, status: "unavailable", reason: resolvedHandle.reason }
+          const rendered = renderVccPiRecallEntry(resolvedHandle.entry, item_bytes)
+          return rendered === undefined ? { handle, status: "unavailable", reason: "oversized" } : { handle, status: "ok", item: JSON.parse(rendered) }
+        })
+        return piRecallToolResponse(vccPiRecallToolResult("ok", { operation: "expand", items }, max_bytes))
+      }
+      const query = params.query!.trim()
+      if (!query) return piRecallToolResponse(vccPiRecallToolResult("error", { reason: "empty_query" }, max_bytes))
+      const discovered = discoverVccPiHandles({ query, entries: index.entries, ...(params.page === undefined ? {} : { page: params.page }), max_results: params.max_results ?? VCC_PI_RECALL_DEFAULT_MAX_RESULTS })
+      return piRecallToolResponse(vccPiRecallToolResult("ok", {
+        operation: "discover",
+        page: discovered.page,
+        total_pages: discovered.total_pages,
+        total: discovered.total,
+        items: discovered.entries.map((entry) => ({
+          handle: entry.handle,
+          entry_id: entry.entry_id,
+          parent_id: entry.parent_id,
+          entry_type: entry.entry_type,
+          timestamp: entry.timestamp,
+          source_location: entry.source_location,
+          source_digest: entry.source_digest,
+          payload_digest: entry.payload_digest,
+          presentation: "transformed_redacted",
+        })),
+      }, max_bytes))
+    },
   })
 
   async function runPipeline(input: {
@@ -67,8 +135,13 @@ export default function piExtension(pi: ExtensionAPI) {
       ...(prior ? { priorSummary: { id: prior.id, ledger: prior.ledger } } : {}),
     })
     const projection = prior?.projection ? remapProjection(prior.projection, ledger) : undefined
+    const deterministic = () => ({
+      summary: buildAuthoritativeSummary({ ledger, maxBytes: resolved.max_summary_bytes }),
+      details: { ledgerDigest: ledger.digest, ledgerBytes: utf8Bytes(ledger.block), mode: resolved.vcc_mode },
+    } satisfies PipelineResult)
+    if (resolved.vcc_mode === "offline") return deterministic()
     const model = compactionModel(ctx, resolved.model)
-    if (!model) return
+    if (!model) return resolved.vcc_mode === "hybrid" ? deterministic() : undefined
     let semantic: { store: SemanticStore; repository: ReturnType<typeof repositoryIdentity>; extension: ReturnType<typeof semanticPromptExtension> } | undefined
     if (artifacts.length && resolved.response_mode === "json") {
       let store: SemanticStore | undefined
@@ -126,7 +199,7 @@ export default function piExtension(pi: ExtensionAPI) {
       }
     }
     summary ??= buildAuthoritativeSummary({ ledger, maxBytes: resolved.max_summary_bytes })
-    return { summary, usage: response.usage, details: { ledgerDigest: ledger.digest, ledgerBytes: utf8Bytes(ledger.block) } }
+    return { summary, usage: response.usage, details: { ledgerDigest: ledger.digest, ledgerBytes: utf8Bytes(ledger.block), mode: resolved.vcc_mode } }
   }
 
   /** When /cat --fixed pinned files for this session, re-collect them fresh and
@@ -155,9 +228,12 @@ export default function piExtension(pi: ExtensionAPI) {
   pi.on("session_before_compact", async (event, ctx) => {
     const sessionID = ctx.sessionManager.getSessionId() ?? "pi-session"
     try {
+      const branch = event.branchEntries ?? ctx.sessionManager.getBranch()
+      const cut = resolved.vcc_mode === "off" ? undefined : buildPiVccCut(branch, resolved.tail_turns)
+      if (resolved.vcc_mode !== "off" && !cut) return
       const result = await runPipeline({
-        messages: [...event.preparation.messagesToSummarize, ...event.preparation.turnPrefixMessages],
-        branch: ctx.sessionManager.getBranch(),
+        messages: cut?.messages ?? [...event.preparation.messagesToSummarize, ...event.preparation.turnPrefixMessages],
+        branch,
         sessionID,
         signal: event.signal,
         ctx,
@@ -166,9 +242,9 @@ export default function piExtension(pi: ExtensionAPI) {
       return {
         compaction: {
           summary: await withPinnedFiles(ctx, sessionID, result.summary),
-          firstKeptEntryId: event.preparation.firstKeptEntryId,
+          firstKeptEntryId: cut?.firstKeptEntryId ?? event.preparation.firstKeptEntryId,
           tokensBefore: event.preparation.tokensBefore,
-          usage: result.usage,
+          ...(result.usage ? { usage: result.usage } : {}),
           details: result.details,
         },
       }
@@ -191,7 +267,7 @@ export default function piExtension(pi: ExtensionAPI) {
         ctx,
       })
       if (!result) return
-      return { summary: { summary: await withPinnedFiles(ctx, sessionID, result.summary), usage: result.usage, details: result.details } }
+      return { summary: { summary: await withPinnedFiles(ctx, sessionID, result.summary), ...(result.usage ? { usage: result.usage } : {}), details: result.details } }
     } catch (error) {
       warnHook("session_before_tree", sessionID, error)
       return
@@ -225,6 +301,10 @@ export default function piExtension(pi: ExtensionAPI) {
       }
     },
   })
+}
+
+function piRecallToolResponse(result: ReturnType<typeof vccPiRecallToolResult>) {
+  return { content: [{ type: "text" as const, text: result.output }], details: result.metadata }
 }
 
 function compactionModel(ctx: ExtensionContext, spec: string): Model<Api> | undefined {

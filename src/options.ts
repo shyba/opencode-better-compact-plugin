@@ -1,5 +1,6 @@
 export const OPTION_KEYS = [
   "model",
+  "vcc_mode",
   "response_mode",
   "semantic_checkpoints",
   "max_semantic_source_bytes",
@@ -16,9 +17,12 @@ export const OPTION_KEYS = [
 
 export const RESPONSE_MODES = ["json", "markdown"] as const
 export type ResponseMode = (typeof RESPONSE_MODES)[number]
+export const VCC_MODES = ["off", "offline", "hybrid"] as const
+export type VccMode = (typeof VCC_MODES)[number]
 
 export type PluginOptions = {
   model: string
+  vcc_mode: VccMode
   response_mode: ResponseMode
   semantic_checkpoints: boolean
   max_semantic_source_bytes: number
@@ -45,6 +49,7 @@ export type ExistingOptions = {
 export const SELECTED_MODEL = "selected"
 
 export const DEFAULT_OPTIONS = {
+  vcc_mode: "off",
   response_mode: "json",
   semantic_checkpoints: false,
   max_semantic_source_bytes: 262_144,
@@ -68,7 +73,7 @@ export const MAX_OPTIONS = {
   max_inline_data_bytes: 64 * 1_024 * 1_024,
   max_historical_part_bytes: 1 * 1_024 * 1_024,
   max_ledger_bytes: 256 * 1_024,
-  max_summary_bytes: 1 * 1_024 * 1_024,
+  max_summary_bytes: 2 * 1_024 * 1_024,
   max_semantic_source_bytes: 4 * 1_024 * 1_024,
 } as const
 
@@ -95,12 +100,19 @@ export function parseOptions(input: Record<string, unknown> | undefined) {
     result.response_mode = value.response_mode as ResponseMode
   }
 
+  if (value.vcc_mode !== undefined) {
+    if (typeof value.vcc_mode !== "string" || !(VCC_MODES as readonly string[]).includes(value.vcc_mode)) {
+      throw new TypeError(`Option "vcc_mode" must be one of: ${VCC_MODES.join(", ")}`)
+    }
+    result.vcc_mode = value.vcc_mode as VccMode
+  }
+
   if (value.semantic_checkpoints !== undefined) {
     if (typeof value.semantic_checkpoints !== "boolean") throw new TypeError('Option "semantic_checkpoints" must be boolean')
     result.semantic_checkpoints = value.semantic_checkpoints
   }
 
-  for (const key of OPTION_KEYS.filter((item) => item !== "model" && item !== "response_mode" && item !== "semantic_checkpoints")) {
+  for (const key of OPTION_KEYS.filter((item) => item !== "model" && item !== "vcc_mode" && item !== "response_mode" && item !== "semantic_checkpoints")) {
     if (value[key] === undefined) continue
     if (!Number.isSafeInteger(value[key]) || (key === "tail_turns" ? Number(value[key]) < 0 : Number(value[key]) <= 0)) {
       throw new TypeError(`Option "${key}" must be a ${key === "tail_turns" ? "non-negative" : "positive"} integer`)
@@ -113,6 +125,7 @@ export function parseOptions(input: Record<string, unknown> | undefined) {
 export function resolveOptions(options: ParsedOptions, existing: ExistingOptions = {}) {
   const result: PluginOptions = {
     model: options.model ?? existing.model ?? SELECTED_MODEL,
+    vcc_mode: options.vcc_mode ?? DEFAULT_OPTIONS.vcc_mode,
     response_mode: options.response_mode ?? DEFAULT_OPTIONS.response_mode,
     semantic_checkpoints: options.semantic_checkpoints ?? DEFAULT_OPTIONS.semantic_checkpoints,
     max_semantic_source_bytes: options.max_semantic_source_bytes ?? DEFAULT_OPTIONS.max_semantic_source_bytes,
@@ -143,6 +156,12 @@ export function resolveOptions(options: ParsedOptions, existing: ExistingOptions
   }
   if (result.response_mode === "json" && result.max_summary_bytes < result.max_ledger_bytes + 4_096 + 2_048) {
     throw new TypeError('Option "max_summary_bytes" must leave at least 2048 bytes for the JSON projection after ledger and rendering overhead')
+  }
+  if (result.vcc_mode !== "off" && result.response_mode === "markdown") {
+    throw new TypeError('Option "response_mode" must be "json" when vcc_mode is enabled')
+  }
+  if (result.vcc_mode !== "off" && result.semantic_checkpoints) {
+    throw new TypeError('Option "semantic_checkpoints" must be false when vcc_mode is enabled')
   }
   return result
 }

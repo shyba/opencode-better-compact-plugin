@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "cases": {
+    "direct_human": {
+      "host": "opencode-v1",
+      "provenance": "human_direct",
+      "stable_source_id": "msg-human-001",
+      "content": "Keep the public API stable."
+    },
+    "question_tool_human": {
+      "host": "opencode-v1",
+      "provenance": "human_tool_answer",
+      "stable_source_id": "tool-question-001-answer",
+      "pair_id": "question-001",
+      "content": "Yes, preserve the migration boundary."
+    },
+    "supersession": {
+      "host": "opencode-v1",
+      "provenance": "human_direct",
+      "stable_source_id": "msg-human-002",
+      "supersedes_event_ids": ["ev:opencode-v1:msg-human-001"],
+      "content": "Correction: only change the parser."
+    },
+    "incomplete_source": {
+      "host": "opencode-v1",
+      "terminal_cursor": "cursor-next",
+      "reason": "page_limit"
+    },
+    "duplicate_identity": {
+      "host": "opencode-v1",
+      "stable_source_id": "msg-duplicate-001"
+    },
+    "malformed_patch": {
+      "duplicate_key": "{\"version\":1,\"version\":1}",
+      "unknown_key": "{\"version\":1,\"base_digest\":\""
+    }
+  }
+}

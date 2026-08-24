@@ -47,6 +47,7 @@ export class SyncState {
       create index if not exists normalized_record_retention_idx on normalized_record(observed_at);
       create index if not exists outbox_record_idx on outbox(source_id, record_kind, natural_key);
       create table if not exists source_scan (source_id text primary key references source(id) on delete cascade, path_mtime_ms integer not null, path_size_or_count integer not null, child_max_mtime_ms integer not null, last_complete_scan_at integer not null);
+      create table if not exists s3_file (source_id text not null references source(id) on delete cascade, path text not null, file_id text not null, size integer not null, mtime_ms real not null, sha256 text not null, updated_at integer not null, primary key (source_id, path));
     `)
     this.db.query("insert or ignore into schema_migration(version, applied_at) values (1, ?)").run(Date.now())
     this.applyLocalMigrations()
@@ -83,17 +84,17 @@ export class SyncState {
 
   close() { this.db.close() }
 
-  ensureInstallation(id: string, incarnation: string, name = "default") {
+  ensureInstallation(id: string, incarnation: string, name = "default", destinationID = "postgres", destinationKind = "postgres") {
     const now = Date.now()
     this.db.query("insert into installation(id, incarnation, created_at) values (?, ?, ?) on conflict(id) do nothing").run(id, incarnation, now)
-    this.db.query("insert into destination(id, kind, config_ref, created_at) values (?, 'postgres', ?, ?) on conflict(id) do nothing").run("postgres", name, now)
+    this.db.query("insert into destination(id, kind, config_ref, created_at) values (?, ?, ?, ?) on conflict(id) do nothing").run(destinationID, destinationKind, name, now)
   }
 
-  ensureDefaultInstallation() {
+  ensureDefaultInstallation(name = "default", destinationID = "postgres", destinationKind = "postgres") {
     const existing = this.db.query("select id, incarnation from installation order by created_at limit 1").get() as { id: string; incarnation: string } | null
     if (existing) return existing
     const value = { id: randomUUID(), incarnation: randomUUID() }
-    this.ensureInstallation(value.id, value.incarnation)
+    this.ensureInstallation(value.id, value.incarnation, name, destinationID, destinationKind)
     return value
   }
 
@@ -206,6 +207,19 @@ export class SyncState {
     const checkpoint = this.checkpoint(sourceID)
     const files = checkpoint?.files && typeof checkpoint.files === "object" && !Array.isArray(checkpoint.files) ? checkpoint.files as Record<string, { sessionID?: unknown; mtimeMs?: unknown }> : undefined
     return Object.entries(files ?? {}).map(([path, saved]) => ({ path, ...(typeof saved?.sessionID === "string" ? { sessionID: saved.sessionID } : {}), mtimeMs: Number(saved?.mtimeMs ?? 0) }))
+  }
+
+  /** Last successfully acknowledged S3 version for one source file. The S3
+   *  service is idempotent by file_id, so this row is only a local hint for
+   *  selecting an append suffix versus a full replacement after a crash. */
+  s3File(sourceID: string, filePath: string): { fileID: string; size: number; mtimeMs: number; sha256: string } | undefined {
+    const row = this.db.query("select file_id, size, mtime_ms, sha256 from s3_file where source_id=? and path=?").get(sourceID, filePath) as { file_id: string; size: number; mtime_ms: number; sha256: string } | null
+    if (!row) return undefined
+    return { fileID: row.file_id, size: Number(row.size), mtimeMs: Number(row.mtime_ms), sha256: row.sha256 }
+  }
+
+  recordS3File(sourceID: string, filePath: string, value: { fileID: string; size: number; mtimeMs: number; sha256: string }): void {
+    this.db.query("insert into s3_file(source_id, path, file_id, size, mtime_ms, sha256, updated_at) values (?, ?, ?, ?, ?, ?, ?) on conflict(source_id, path) do update set file_id=excluded.file_id, size=excluded.size, mtime_ms=excluded.mtime_ms, sha256=excluded.sha256, updated_at=excluded.updated_at").run(sourceID, filePath, value.fileID, value.size, value.mtimeMs, value.sha256, Date.now())
   }
 
   hierarchyBackfillSHA(sourceID: string, path: string): string | undefined {

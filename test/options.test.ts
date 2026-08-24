@@ -5,6 +5,7 @@ describe("plugin option validation", () => {
   test("accepts every documented snake-case option", () => {
     const input = {
       model: "opencode-go/glm-5.2",
+      vcc_mode: "off",
       response_mode: "json",
       semantic_checkpoints: true,
       max_semantic_source_bytes: 262_145,
@@ -27,10 +28,36 @@ describe("plugin option validation", () => {
     expect(parseOptions({ response_mode: "markdown" })).toEqual({ response_mode: "markdown" })
   })
 
+  test.each(["off", "offline", "hybrid"])("accepts vcc_mode=%s", (vcc_mode) => {
+    expect(parseOptions({ vcc_mode })).toEqual({ vcc_mode })
+  })
+
+  test("rejects unknown vcc modes", () => {
+    expect(() => parseOptions({ vcc_mode: "carrier" })).toThrow('Option "vcc_mode" must be one of: off, offline, hybrid')
+  })
+
   test("keeps semantic checkpoints explicitly opt-in", () => {
     expect(resolveOptions({}).semantic_checkpoints).toBe(false)
     expect(parseOptions({ semantic_checkpoints: true })).toEqual({ semantic_checkpoints: true })
     expect(() => parseOptions({ semantic_checkpoints: "yes" })).toThrow('Option "semantic_checkpoints" must be boolean')
+  })
+
+  test("keeps the legacy default and rejects confusing VCC combinations", () => {
+    expect(resolveOptions({}).vcc_mode).toBe("off")
+    expect(() => resolveOptions(parseOptions({ vcc_mode: "hybrid", response_mode: "markdown" }))).toThrow(
+      'Option "response_mode" must be "json" when vcc_mode is enabled',
+    )
+    expect(() => resolveOptions(parseOptions({ vcc_mode: "offline", semantic_checkpoints: true }))).toThrow(
+      'Option "semantic_checkpoints" must be false when vcc_mode is enabled',
+    )
+  })
+
+  test("keeps every mode transition explicit without changing the default", () => {
+    expect(resolveOptions(parseOptions({})).vcc_mode).toBe("off")
+    expect(resolveOptions(parseOptions({ vcc_mode: "off" })).vcc_mode).toBe("off")
+    expect(resolveOptions(parseOptions({ vcc_mode: "hybrid" })).vcc_mode).toBe("hybrid")
+    expect(resolveOptions(parseOptions({ vcc_mode: "offline" })).vcc_mode).toBe("offline")
+    expect(() => parseOptions({ vcc_mode: "legacy" })).toThrow('Option "vcc_mode" must be one of: off, offline, hybrid')
   })
 
   test.each(["jsonc", "text", "json-projection", 1, null])(

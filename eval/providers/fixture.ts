@@ -3,10 +3,17 @@ import { buildFallback, parsePluginLedger } from "../../src/validation.js"
 import type { ProjectedAction, ProjectedFile, ProjectionClaim, ProjectedSummary } from "../../src/projection.js"
 import type { RecoveryLedger } from "../../src/ledger.js"
 import type { Condition, ProviderAdapter } from "../types.js"
+import { cases } from "../cases.js"
 
 export const fixtureProvider: ProviderAdapter = {
   name: "fixture",
   async complete(request) {
+    if (request.caseID.endsWith(":continuation")) {
+      const test = cases.find((value) => value.id === request.caseID.slice(0, -":continuation".length))
+      if (!test) return { text: "Continue from the accepted summary." }
+      const action = test.next_action
+      return { text: `Next verified action: ${test.todos.find((todo) => todo.id === action.todo_id)?.content ?? "Continue from the accepted summary."} at ${action.target}; ${action.required_atoms.join("; ")}` }
+    }
     const prompt = request.messages.at(-1)?.content ?? ""
     const transcript = request.messages.slice(0, -1).map((message) => message.content).join("\n")
     if (request.condition === "baseline") {

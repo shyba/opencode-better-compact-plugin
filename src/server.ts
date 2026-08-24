@@ -1,8 +1,9 @@
-import type { Config, Hooks, PluginInput, PluginOptions as OpenCodePluginOptions } from "@opencode-ai/plugin"
-import { LEDGER_LIMITS, buildRecoveryLedger, record, summaryText, utf8Bytes, type MessageRecord } from "./ledger.js"
+import { tool, type Config, type Hooks, type PluginInput, type PluginOptions as OpenCodePluginOptions } from "@opencode-ai/plugin"
+import { z } from "zod"
+import { LEDGER_LIMITS, buildRecoveryLedger, redact, record, sha256, summaryText, truncateUtf8, utf8Bytes, type MessageRecord, type TodoRecord, type RecoveryLedger } from "./ledger.js"
 import { SELECTED_MODEL, parseOptions, resolveOptions, type PluginOptions } from "./options.js"
 import { decodedDataUrlBytes, sanitizeHistory } from "./sanitize.js"
-import { AttemptStore, type Attempt } from "./state.js"
+import { AttemptStore, VccAttemptStore, type Attempt, type VccAttempt } from "./state.js"
 import { remapProjection } from "./projection.js"
 import {
   buildAuthoritativeSummary,
@@ -13,6 +14,28 @@ import {
   recoveryContext,
   renderProjectedResponse,
 } from "./validation.js"
+import { buildVccHybridRequest, VCC_HYBRID_DEFAULT_MAX_REQUEST_BYTES } from "./vcc-hybrid.js"
+import { renderVccOpenCodeDegraded, renderVccOpenCodeProjection } from "./vcc-opencode-render.js"
+import {
+  collectVccOpenCodeSession,
+  VCC_OPENCODE_DEFAULT_MAX_BYTES,
+  VCC_OPENCODE_DEFAULT_MAX_DOCKET_BYTES,
+  VCC_OPENCODE_DEFAULT_MAX_PAGES,
+} from "./vcc-opencode-session.js"
+import { canonicalSerialize, rehearseVccPatch, VCC_SOURCE_INCOMPLETE_REASONS, type VccCandidate, type VccSourceIncompleteReason } from "./vcc.js"
+import { isVccSuccessfulSummary, vccAttemptDigest } from "./vcc-wire.js"
+import {
+  buildVccOpenCodeRecallIndex,
+  discoverVccOpenCodeHandles,
+  renderVccOpenCodeRecallEntry,
+  resolveVccOpenCodeHandle,
+  vccOpenCodeArchiveManifestDigest,
+  VCC_RECALL_DEFAULT_MAX_BYTES,
+  VCC_RECALL_DEFAULT_MAX_RESULTS,
+  VCC_RECALL_MAX_BYTES,
+  VCC_RECALL_MAX_EXPANSIONS,
+  VCC_RECALL_MAX_RESULTS,
+} from "./vcc-opencode-recall.js"
 
 // The 1.18.4 V1 SDK type omits compaction fields that the 1.18.4 runtime schema accepts.
 type RuntimeConfig = Config & {
@@ -29,19 +52,40 @@ type RuntimeConfig = Config & {
 type ProviderMessage = Parameters<typeof sanitizeHistory>[0][number]
 type SessionMessagesOptions = Parameters<PluginInput["client"]["session"]["messages"]>[0]
 type SessionMessagesQuery = NonNullable<SessionMessagesOptions["query"]> & { before?: string }
+type VccTextCompleteInput = Parameters<NonNullable<Hooks["experimental.text.complete"]>>[0]
+type VccTextCompleteOutput = Parameters<NonNullable<Hooks["experimental.text.complete"]>>[1]
 
 const REPLAY_SIGNATURE_MAX_BYTES = 8 * 1_024 * 1_024
 const REPLAY_SIGNATURE_MAX_NODES = 8_192
 const REPLAY_SIGNATURE_MAX_DEPTH = 32
+const VCC_OPENCODE_PAGE_SIZE = 256
+const VCC_INCOMPLETE_SENTINEL = "OPENCODE_SAFE_COMPACTION_VCC_SOURCE_INCOMPLETE_V1"
+const VCC_RECALL_ARGS = {
+  handle: z.string().max(512).optional(),
+  query: z.string().max(512).optional(),
+  expand: z.array(z.string().max(512)).max(VCC_RECALL_MAX_EXPANSIONS).optional(),
+  page: z.number().int().min(1).max(1_024).optional(),
+  max_results: z.number().int().min(1).max(VCC_RECALL_MAX_RESULTS).optional(),
+  max_bytes: z.number().int().min(256).max(VCC_RECALL_MAX_BYTES).optional(),
+  scope: z.enum(["session", "all"]).optional(),
+}
 
 export { decodedDataUrlBytes, sanitizeHistory } from "./sanitize.js"
 
 export async function server(input: PluginInput, rawOptions?: OpenCodePluginOptions): Promise<Hooks> {
   const parsed = parseOptions(rawOptions)
   const attempts = new AttemptStore()
+  const vccAttempts = new VccAttemptStore()
   let settings: PluginOptions | undefined
 
   const hooks = {
+    tool: {
+      vcc_recall: tool({
+        description: "Recall exact, source-scoped OpenCode V1 VCC material by verified archive handle or bounded keyword discovery.",
+        args: VCC_RECALL_ARGS,
+        execute: async (args, context) => executeVccOpenCodeRecall(input, args, context.sessionID),
+      }),
+    },
     async config(output) {
       const config = output as RuntimeConfig
       settings = resolveOptions(parsed, {
@@ -50,6 +94,7 @@ export async function server(input: PluginInput, rawOptions?: OpenCodePluginOpti
         preserve_recent_tokens: config.compaction?.preserve_recent_tokens,
         reserved_tokens: config.compaction?.reserved,
       })
+      assertSupportedOpenCodeMode(settings.vcc_mode)
       const compactionAgent = {
         ...config.agent?.compaction,
         temperature: 0,
@@ -119,6 +164,13 @@ export async function server(input: PluginInput, rawOptions?: OpenCodePluginOpti
     async "experimental.session.compacting"({ sessionID }, output) {
       await guardInternalHook("experimental.session.compacting", sessionID, async () => {
         const options = requireSettings(settings, parsed)
+        if (options.vcc_mode === "hybrid") {
+          const prepared = await prepareVccOpenCodeCompaction(input, sessionID, options)
+          const compactionTargetID = newestOpenCodeCompactionParent(prepared.source_records, sessionID)
+          vccAttempts.set(compactionTargetID ? { ...prepared.metadata, compactionTargetID } : prepared.metadata)
+          output.prompt = prepared.prompt
+          return
+        }
         const data = await loadSession(input, sessionID)
         const priorSummary = await newestPriorPluginSummaryFromSession(
           input,
@@ -146,6 +198,7 @@ export async function server(input: PluginInput, rawOptions?: OpenCodePluginOpti
         output.prompt = buildCompactionPrompt(ledger, options.max_summary_bytes, projection, options.response_mode)
       }, () => {
         attempts.delete(sessionID)
+        vccAttempts.deleteSession(sessionID)
       })
     },
 
@@ -253,6 +306,10 @@ export async function server(input: PluginInput, rawOptions?: OpenCodePluginOpti
     async "experimental.text.complete"(hookInput, output) {
       await guardInternalHook("experimental.text.complete", hookInput.sessionID, async () => {
         const options = requireSettings(settings, parsed)
+        if (options.vcc_mode === "hybrid") {
+          await handleVccTextComplete(input, hookInput, output, options, vccAttempts)
+          return
+        }
         const target = await input.client.session.message({
           path: { id: hookInput.sessionID, messageID: hookInput.messageID },
           throwOnError: true,
@@ -303,6 +360,8 @@ export async function server(input: PluginInput, rawOptions?: OpenCodePluginOpti
         const retryOutput = output as typeof output & { retry?: boolean }
         retryOutput.retry = true
       }, () => {
+        if (settings?.vcc_mode === "hybrid") output.text = ""
+        vccAttempts.deleteSession(hookInput.sessionID)
         const attempt = attempts.get(hookInput.sessionID)
         if (!attempt) return
         attempt.summaryMessageID = hookInput.messageID
@@ -314,6 +373,10 @@ export async function server(input: PluginInput, rawOptions?: OpenCodePluginOpti
       if (!output.enabled) return
       await guardInternalHook("experimental.compaction.autocontinue", hookInput.sessionID, async () => {
         const options = requireSettings(settings, parsed)
+        if (options.vcc_mode === "hybrid") {
+          await handleVccAutoContinue(input, hookInput, output, options, vccAttempts)
+          return
+        }
         const active = attempts.get(hookInput.sessionID)
         const data = await loadSession(input, hookInput.sessionID)
         const current = compactionSummaryForParent(data.messages, hookInput.message.id)
@@ -350,27 +413,36 @@ export async function server(input: PluginInput, rawOptions?: OpenCodePluginOpti
       await guardInternalHook("event", sessionID, async () => {
         if (event.type === "session.compacted") {
           attempts.delete(sessionID)
+          vccAttempts.deleteSession(sessionID)
           return
         }
         if (event.type === "session.idle") {
           const attempt = sessionID ? attempts.get(sessionID) : undefined
           if (attempt?.recoveryUserID) attempt.recoveryComplete = true
           else attempts.delete(sessionID)
+          vccAttempts.deleteSession(sessionID)
           return
         }
         if (event.type === "session.status" && record(properties?.status)?.type === "idle") {
           const attempt = sessionID ? attempts.get(sessionID) : undefined
           if (attempt?.recoveryUserID) attempt.recoveryComplete = true
           else attempts.delete(sessionID)
+          vccAttempts.deleteSession(sessionID)
           return
         }
         if (event.type === "session.deleted") {
           attempts.delete(sessionID)
+          vccAttempts.deleteSession(sessionID)
           return
         }
         if (event.type === "session.error") {
-          if (sessionID) attempts.delete(sessionID)
-          else attempts.cleanupExpired()
+          if (sessionID) {
+            attempts.delete(sessionID)
+            vccAttempts.deleteSession(sessionID)
+          } else {
+            attempts.cleanupExpired()
+            vccAttempts.cleanupExpired()
+          }
           return
         }
         attempts.cleanupExpired()
@@ -379,6 +451,7 @@ export async function server(input: PluginInput, rawOptions?: OpenCodePluginOpti
 
     async dispose() {
       attempts.clear()
+      vccAttempts.clear()
     },
   } satisfies Hooks
 
@@ -408,6 +481,474 @@ async function guardInternalHook(
     } catch {
       // Logging is best-effort and must never affect the host.
     }
+  }
+}
+
+async function handleVccTextComplete(
+  input: PluginInput,
+  hookInput: VccTextCompleteInput,
+  output: VccTextCompleteOutput,
+  options: PluginOptions,
+  vccAttempts: VccAttemptStore,
+) {
+  let active = vccAttempts.getSession(hookInput.sessionID)
+  if (!active) {
+    output.text = ""
+    return
+  }
+  if (active.textPartID && (active.textPartID !== hookInput.partID || active.summaryMessageID !== hookInput.messageID)) {
+    output.text = ""
+    return
+  }
+  if (active.summaryMessageID && active.summaryMessageID !== hookInput.messageID) {
+    output.text = ""
+    return
+  }
+  const target = await input.client.session.message({
+    path: { id: hookInput.sessionID, messageID: hookInput.messageID },
+    throwOnError: true,
+  })
+  if (!compactionTargetTextParts(target.data, hookInput)) {
+    output.text = ""
+    return
+  }
+  const targetInfo = record(record(target.data)?.info)
+  if (typeof targetInfo?.parentID !== "string") {
+    output.text = ""
+    return
+  }
+  const parent = await input.client.session.message({
+    path: { id: hookInput.sessionID, messageID: targetInfo.parentID },
+    throwOnError: true,
+  })
+  if (!isCompactionParent(record(parent.data) as MessageRecord, hookInput.sessionID, targetInfo.parentID)) {
+    output.text = ""
+    return
+  }
+  if (!active.summaryMessageID) {
+    if (!active.compactionTargetID.startsWith("pending-text-complete:") && targetInfo.parentID !== active.compactionTargetID) {
+      output.text = ""
+      return
+    }
+    active = {
+      ...active,
+      compactionTargetID: targetInfo.parentID,
+      summaryMessageID: hookInput.messageID,
+      textPartID: hookInput.partID,
+    }
+    vccAttempts.set(active)
+  }
+  if (!output.text.trim()) {
+    vccAttempts.set({ ...active, outcome: "no_text", validation: "invalid" })
+    return
+  }
+
+  const prepared = await prepareVccOpenCodeCompaction(input, hookInput.sessionID, options)
+  const ledger = prepared.source_records ? await buildVccLedger(input, hookInput.sessionID, prepared.source_records, options) : undefined
+  if (!ledger) {
+    output.text = ""
+    vccAttempts.deleteSession(hookInput.sessionID)
+    return
+  }
+  const sameCompleteSource = Boolean(
+    active.sourceComplete &&
+      prepared.context &&
+      prepared.candidate &&
+      prepared.source?.complete &&
+      prepared.metadata.sourceComplete &&
+      prepared.metadata.manifestDigest === active.manifestDigest &&
+      prepared.metadata.sourceIndexDigest === active.sourceIndexDigest &&
+      prepared.metadata.docketDigest === active.docketDigest &&
+      prepared.metadata.candidateDigest === active.candidateDigest,
+  )
+  if (!sameCompleteSource) {
+    const reason = prepared.metadata.sourceReason ?? (prepared.source?.complete ? "source_shrink" : "unknown")
+    const manifestDigest = prepared.metadata.manifestDigest
+    const degraded = renderVccOpenCodeDegraded({
+      ledger,
+      status: {
+        reason,
+        manifest_digest: manifestDigest,
+        attempt_digest: vccAttemptDigest(hookInput.sessionID, active.compactionTargetID, manifestDigest),
+      },
+      max_bytes: options.max_summary_bytes,
+    })
+    output.text = degraded ?? ""
+    vccAttempts.set({
+      ...active,
+      sourceComplete: false,
+      sourceReason: reason,
+      sourceIndexDigest: null,
+      docketDigest: null,
+      candidateDigest: null,
+      patchDigest: null,
+      outcome: "degraded_summary",
+      validation: "invalid",
+    })
+    return
+  }
+
+  const rehearsal = rehearseVccPatch(prepared.context!, output.text)
+  const candidate: VccCandidate = rehearsal.accepted
+    ? {
+      ...prepared.candidate!,
+      bytes: rehearsal.candidate_bytes,
+      digest: rehearsal.candidate_digest,
+      selected_episode_ids: rehearsal.selected_episode_ids,
+    }
+    : prepared.candidate!
+  const patchDigest = rehearsal.accepted ? rehearsal.patch_digest : null
+  const archiveManifestDigest = vccOpenCodeArchiveManifestDigest(candidate, hookInput.sessionID, prepared.metadata.lineageID)
+  const rendered = renderVccOpenCodeProjection({
+    candidate,
+    patch_digest: patchDigest,
+    archive_manifest_digest: archiveManifestDigest ?? emptyOpenCodeArchiveManifestDigest(prepared.metadata.lineageID, hookInput.sessionID),
+    ledger,
+    max_bytes: options.max_summary_bytes,
+  })
+  if (!rendered) {
+    output.text = ""
+    vccAttempts.deleteSession(hookInput.sessionID)
+    return
+  }
+  output.text = rendered
+  vccAttempts.set({
+    ...active,
+    sourceComplete: true,
+    sourceReason: null,
+    sourceIndexDigest: prepared.candidate!.source_index_digest,
+    docketDigest: sha256(prepared.context!.docket_bytes),
+    candidateDigest: candidate.digest,
+    patchDigest,
+    outcome: "vcc_success",
+    validation: rehearsal.accepted ? "provider" : "fallback",
+  })
+}
+
+async function buildVccLedger(input: PluginInput, sessionID: string, messages: MessageRecord[], options: PluginOptions): Promise<RecoveryLedger | undefined> {
+  const todos = await input.client.session.todo({ path: { id: sessionID }, throwOnError: true })
+  if (!todos.data) return
+  try {
+    return buildRecoveryLedger({
+      messages,
+      todos: todos.data as TodoRecord[],
+      tailTurns: options.tail_turns,
+      maxBytes: options.max_ledger_bytes,
+    })
+  } catch {
+    return
+  }
+}
+
+async function handleVccAutoContinue(
+  input: PluginInput,
+  hookInput: Parameters<NonNullable<Hooks["experimental.compaction.autocontinue"]>>[0],
+  output: { enabled: boolean },
+  options: PluginOptions,
+  vccAttempts: VccAttemptStore,
+) {
+  const active = vccAttempts.getSession(hookInput.sessionID)
+  if (!active || active.mode !== "hybrid" || active.outcome !== "vcc_success" || active.validation === "invalid") {
+    output.enabled = false
+    return
+  }
+  if (!active.summaryMessageID || !active.textPartID || !active.sourceComplete || !active.candidateDigest || !active.sourceIndexDigest || !active.docketDigest) {
+    output.enabled = false
+    return
+  }
+  const data = await loadSession(input, hookInput.sessionID)
+  const current = compactionSummaryForParent(data.messages, hookInput.message.id)
+  if (!current || current.info.id !== active.summaryMessageID) {
+    output.enabled = false
+    return
+  }
+  const textPart = current.parts.find((part) => {
+    const value = record(part)
+    return value?.type === "text" && value.id === active.textPartID && value.messageID === current.info.id && value.sessionID === hookInput.sessionID
+  })
+  const text = textPart ? record(textPart)?.text : undefined
+  if (typeof text !== "string" || !text.trim()) {
+    output.enabled = false
+    return
+  }
+  const prepared = await prepareVccOpenCodeCompaction(input, hookInput.sessionID, options)
+  const archiveManifestDigest = prepared.candidate && prepared.metadata.manifestDigest === active.manifestDigest && prepared.candidate.source_index_digest === active.sourceIndexDigest
+    ? vccOpenCodeArchiveManifestDigest(prepared.candidate, hookInput.sessionID, active.lineageID)
+    : undefined
+  if (!archiveManifestDigest) {
+    output.enabled = false
+    vccAttempts.deleteSession(hookInput.sessionID)
+    return
+  }
+  output.enabled = isVccSuccessfulSummary(text, {
+    source_manifest_digest: active.manifestDigest,
+    source_index_digest: active.sourceIndexDigest,
+    archive_manifest_digest: archiveManifestDigest,
+    candidate_digest: active.candidateDigest,
+    patch_digest: active.patchDigest,
+  })
+  vccAttempts.deleteSession(hookInput.sessionID)
+}
+
+function emptyOpenCodeArchiveManifestDigest(lineageID: string, sessionID: string) {
+  return sha256(canonicalSerialize({
+    version: 1,
+    kind: "vcc_opencode_empty_archive_manifest",
+    host: "opencode-v1",
+    session_id: sessionID,
+    lineage_id: lineageID,
+    archive_handles: [],
+    completeness: "not_claimed",
+  }))
+}
+
+function newestOpenCodeCompactionParent(messages: MessageRecord[], sessionID: string) {
+  return messages
+    .filter((message) => isCompactionParent(message, sessionID, message.info.id))
+    .sort((left, right) => {
+      const leftCreated = left.info.time?.created
+      const rightCreated = right.info.time?.created
+      if (typeof leftCreated === "number" && typeof rightCreated === "number" && leftCreated !== rightCreated) return rightCreated - leftCreated
+      return compareCodePoints(right.info.id, left.info.id)
+    })[0]?.info.id
+}
+
+function compareCodePoints(left: string, right: string) {
+  const leftPoints = Array.from(left)
+  const rightPoints = Array.from(right)
+  for (let index = 0; index < Math.min(leftPoints.length, rightPoints.length); index++) {
+    const difference = leftPoints[index]!.codePointAt(0)! - rightPoints[index]!.codePointAt(0)!
+    if (difference !== 0) return difference
+  }
+  return leftPoints.length - rightPoints.length
+}
+
+export async function prepareVccOpenCodeCompaction(input: PluginInput, sessionID: string, options: PluginOptions) {
+  const lineageID = `opencode-v1:${sha256(sessionID)}`
+  let collected
+  try {
+    collected = await collectVccOpenCodeSession({
+      session_id: sessionID,
+      lineage_id: lineageID,
+      max_pages: VCC_OPENCODE_DEFAULT_MAX_PAGES,
+      max_bytes: VCC_OPENCODE_DEFAULT_MAX_BYTES,
+      max_candidate_bytes: Math.min(2 * 1_048_576, Math.max(1_024, options.max_summary_bytes)),
+      max_docket_bytes: Math.min(VCC_OPENCODE_DEFAULT_MAX_DOCKET_BYTES, Math.max(1_024, options.max_summary_bytes)),
+      fetch_page: (cursor) => fetchVccOpenCodePage(input, sessionID, cursor),
+    })
+  } catch {
+    const manifestDigest = sha256(`vcc-source-error-v1\0${sessionID}\0${lineageID}`)
+    return {
+      prompt: incompleteVccPrompt("unsupported_record", manifestDigest),
+      source_records: [],
+      metadata: vccAttemptMetadata({
+        sessionID,
+        lineageID,
+        manifestDigest,
+        reason: "unsupported_record",
+      }),
+    }
+  }
+
+  if (collected.failure || !collected.candidate || !collected.context || !collected.docket_bytes) {
+    const reason = vccFailureReason(collected.failure)
+    return {
+      prompt: incompleteVccPrompt(reason, collected.source.digest),
+      source_records: collected.source_records,
+      source: collected.source,
+      metadata: vccAttemptMetadata({
+        sessionID,
+        lineageID,
+        manifestDigest: collected.source.digest,
+        reason,
+      }),
+    }
+  }
+
+  try {
+    const request = buildVccHybridRequest(collected.context, VCC_HYBRID_DEFAULT_MAX_REQUEST_BYTES)
+    const prompt = vccPreparationPrompt(request.bytes)
+    if (utf8Bytes(prompt) > VCC_HYBRID_DEFAULT_MAX_REQUEST_BYTES) throw new RangeError("VCC preparation prompt exceeds byte bound")
+    return {
+      prompt,
+      source: collected.source,
+      source_records: collected.source_records,
+      context: collected.context,
+      candidate: collected.candidate,
+      metadata: vccAttemptMetadata({
+        sessionID,
+        lineageID,
+        manifestDigest: collected.source.digest,
+        sourceIndexDigest: collected.candidate.source_index_digest,
+        docketDigest: sha256(collected.docket_bytes),
+        candidateDigest: collected.candidate.digest,
+      }),
+    }
+  } catch {
+    return {
+      prompt: incompleteVccPrompt("byte_limit", collected.source.digest),
+      source_records: collected.source_records,
+      source: collected.source,
+      metadata: vccAttemptMetadata({
+        sessionID,
+        lineageID,
+        manifestDigest: collected.source.digest,
+        reason: "byte_limit",
+      }),
+    }
+  }
+}
+
+async function fetchVccOpenCodePage(input: PluginInput, sessionID: string, cursor: string | null) {
+  const response = await input.client.session.messages({
+    path: { id: sessionID },
+    query: { limit: VCC_OPENCODE_PAGE_SIZE, ...(cursor ? { before: cursor } : {}) },
+    throwOnError: true,
+  })
+  if (!response.data) throw new Error("OpenCode V1 returned no message page")
+  return {
+    records: response.data as MessageRecord[],
+    next_cursor: response.response?.headers.get("X-Next-Cursor") || null,
+  }
+}
+
+type VccRecallArgs = {
+  handle?: string | undefined
+  query?: string | undefined
+  expand?: string[] | undefined
+  page?: number | undefined
+  max_results?: number | undefined
+  max_bytes?: number | undefined
+  scope?: "session" | "all" | undefined
+}
+
+async function executeVccOpenCodeRecall(input: PluginInput, args: VccRecallArgs, sessionID: string) {
+  const max_bytes = Math.min(VCC_RECALL_MAX_BYTES, Math.max(1, args.max_bytes ?? VCC_RECALL_DEFAULT_MAX_BYTES))
+  if (args.scope === "all") return recallToolResult("unavailable", { reason: "scope_unavailable", scope: "session" }, max_bytes)
+  const operations = [args.handle !== undefined, args.query !== undefined, args.expand !== undefined].filter(Boolean).length
+  if (operations !== 1) return recallToolResult("error", { reason: "exactly_one_operation_required", operations: ["handle", "query", "expand"] }, max_bytes)
+  if (args.expand && new Set(args.expand).size !== args.expand.length) return recallToolResult("error", { reason: "duplicate_handles" }, max_bytes)
+
+  let collected
+  try {
+    const lineageID = `opencode-v1:${sha256(sessionID)}`
+    collected = await collectVccOpenCodeSession({
+      session_id: sessionID,
+      lineage_id: lineageID,
+      max_pages: VCC_OPENCODE_DEFAULT_MAX_PAGES,
+      max_bytes: VCC_OPENCODE_DEFAULT_MAX_BYTES,
+      max_candidate_bytes: 1_024,
+      compile_candidate: false,
+      fetch_page: (cursor) => fetchVccOpenCodePage(input, sessionID, cursor),
+    })
+  } catch {
+    return recallToolResult("unavailable", { reason: "archive_unavailable" }, max_bytes)
+  }
+  if (!collected.source.complete) return recallToolResult("incomplete", { reason: collected.source.reason ?? "unknown", manifest_digest: collected.source.digest }, max_bytes)
+  const entries = buildVccOpenCodeRecallIndex({ session_id: sessionID, lineage_id: collected.source.lineage_id, result: collected })
+  if (entries.length === 0) return recallToolResult("unavailable", { reason: "index_unavailable", manifest_digest: collected.source.digest }, max_bytes)
+
+  if (args.handle !== undefined) {
+    const resolved = resolveVccOpenCodeHandle({ handle: args.handle, session_id: sessionID, lineage_id: collected.source.lineage_id, entries, max_bytes })
+    if (!resolved.ok) return recallToolResult("unavailable", { reason: resolved.reason, handle: args.handle }, max_bytes)
+    const rendered = renderVccOpenCodeRecallEntry(resolved.entry, max_bytes)
+    return rendered === undefined
+      ? recallToolResult("unavailable", { reason: "oversized", handle: args.handle }, max_bytes)
+      : recallToolResult("ok", { operation: "handle", item: JSON.parse(rendered) }, max_bytes)
+  }
+
+  if (args.expand !== undefined) {
+    const item_bytes = Math.max(256, Math.floor(max_bytes / Math.max(1, args.expand.length)))
+    const items = args.expand.map((handle) => {
+      const resolved = resolveVccOpenCodeHandle({ handle, session_id: sessionID, lineage_id: collected.source.lineage_id, entries, max_bytes: item_bytes })
+      if (!resolved.ok) return { handle, status: "unavailable", reason: resolved.reason }
+      const rendered = renderVccOpenCodeRecallEntry(resolved.entry, item_bytes)
+      return rendered === undefined ? { handle, status: "unavailable", reason: "oversized" } : { handle, status: "ok", item: JSON.parse(rendered) }
+    })
+    return recallToolResult("ok", { operation: "expand", items }, max_bytes)
+  }
+
+  const query = args.query!.trim()
+  if (!query) return recallToolResult("error", { reason: "empty_query" }, max_bytes)
+  const discovered = discoverVccOpenCodeHandles({
+    query,
+    entries,
+    ...(args.page === undefined ? {} : { page: args.page }),
+    max_results: args.max_results ?? VCC_RECALL_DEFAULT_MAX_RESULTS,
+  })
+  return recallToolResult("ok", {
+    operation: "discover",
+    query,
+    page: discovered.page,
+    total_pages: discovered.total_pages,
+    total: discovered.total,
+    items: discovered.entries.map((entry) => ({
+      handle: entry.handle,
+      event_id: entry.event.id,
+      source_location: entry.event.source_location,
+      kind: entry.event.kind,
+      provenance: entry.event.provenance,
+      source_digest: entry.source_digest,
+      payload_digest: entry.payload_digest,
+      excerpt: truncateUtf8(redact(entry.event.content), Math.min(512, max_bytes)),
+    })),
+  }, max_bytes)
+}
+
+function recallToolResult(status: string, body: Record<string, unknown>, max_bytes: number) {
+  const output = canonicalSerialize({ version: 1, kind: "vcc_recall", status, ...body })
+  if (utf8Bytes(output) <= max_bytes) return { title: `VCC recall: ${status}`, output, metadata: { status } }
+  const bounded = canonicalSerialize({ version: 1, kind: "vcc_recall", status: "oversized", requested_bytes: max_bytes })
+  return {
+    title: "VCC recall: oversized",
+    output: bounded,
+    metadata: { status: "oversized", requested_bytes: max_bytes },
+  }
+}
+
+function vccPreparationPrompt(requestBytes: string) {
+  return `OpenCode V1 hybrid preparation is active. Do not write a summary and do not call a provider. Read the bounded request envelope below and return exactly one allowed patch JSON object for the later completion step. Preserve protected material, whole causal episodes, and source-index references.\n\n${requestBytes}`
+}
+
+function incompleteVccPrompt(reason: VccSourceIncompleteReason, manifestDigest: string) {
+  return `${VCC_INCOMPLETE_SENTINEL}\nreason=${reason}\nmanifest_digest=${manifestDigest}\nNo VCC candidate is available; completion handling must remain pending.`
+}
+
+function vccFailureReason(value: string | undefined): VccSourceIncompleteReason {
+  if (value && VCC_SOURCE_INCOMPLETE_REASONS.includes(value as VccSourceIncompleteReason)) return value as VccSourceIncompleteReason
+  if (value === "no_canonical_events") return "unsupported_record"
+  if (value === "candidate_failed" || value === "docket_oversized") return "unknown"
+  return "unknown"
+}
+
+function vccAttemptMetadata(input: {
+  sessionID: string
+  lineageID: string
+  manifestDigest: string
+  reason?: VccSourceIncompleteReason
+  sourceIndexDigest?: string
+  docketDigest?: string
+  candidateDigest?: string
+}): VccAttempt {
+  const attemptID = `vcc-attempt:${sha256(`vcc-attempt-v1\0${input.sessionID}\0${input.lineageID}\0${input.manifestDigest}`)}`
+  return {
+    attemptID,
+    sessionID: input.sessionID,
+    lineageID: input.lineageID,
+    compactionTargetID: `pending-text-complete:${sha256(input.sessionID)}`,
+    summaryMessageID: null,
+    textPartID: null,
+    mode: "hybrid",
+    createdAt: Date.now(),
+    sourceComplete: !input.reason,
+    sourceReason: input.reason ?? null,
+    manifestDigest: input.manifestDigest,
+    sourceIndexDigest: input.sourceIndexDigest ?? null,
+    docketDigest: input.docketDigest ?? null,
+    candidateDigest: input.candidateDigest ?? null,
+    patchDigest: null,
+    outcome: input.reason ? "source_incomplete" : "candidate_ready",
+    validation: "pending",
   }
 }
 
@@ -492,7 +1033,16 @@ async function loadMessagePage(input: PluginInput, sessionID: string, limit: num
 }
 
 function requireSettings(settings: PluginOptions | undefined, parsed: ReturnType<typeof parseOptions>) {
-  return settings ?? resolveOptions(parsed)
+  const result = settings ?? resolveOptions(parsed)
+  assertSupportedOpenCodeMode(result.vcc_mode)
+  return result
+}
+
+function assertSupportedOpenCodeMode(mode: PluginOptions["vcc_mode"]) {
+  if (mode === "off") return
+  if (mode === "offline") {
+    throw new Error("opencode-safe-compaction vcc_mode=offline is unsupported by the OpenCode V1 plugin API; provider-free compaction requires a host-core hook")
+  }
 }
 
 function newestCompactionSummary(messages: MessageRecord[]) {
