@@ -628,7 +628,7 @@ async function syncS3Pass(config: Awaited<ReturnType<typeof loadConfig>>, signal
             if (previous?.mtimeMs !== plan.version.mtimeMs) state.recordS3File(sourceID, sourcePath, plan.version)
             continue
           }
-          await uploadS3File({ endpoint, token, fileID: plan.fileID, sourcePath, filename, start: plan.start, full: plan.full, ...(signal ? { signal } : {}) })
+          await uploadS3File({ endpoint, token, fileID: plan.fileID, sourcePath, filename, size: plan.version.size, start: plan.start, full: plan.full, ...(signal ? { signal } : {}) })
           state.recordS3File(sourceID, sourcePath, plan.version)
           uploaded++
           progressed = true

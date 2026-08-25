@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto"
 import { createReadStream } from "node:fs"
 import { readdir, stat } from "node:fs/promises"
+import { Readable } from "node:stream"
 import path from "node:path"
 
 export type S3FileVersion = {
@@ -16,6 +17,7 @@ export type S3Upload = {
   fileID: string
   sourcePath: string
   filename: string
+  size: number
   start: number
   full: boolean
   signal?: AbortSignal
@@ -74,13 +76,20 @@ export function s3FileID(sourcePath: string, metadata: { size: number; mtimeMs: 
 }
 
 export async function uploadS3File(input: S3Upload): Promise<{ status: number; sha256?: string; size: number }> {
-  const body = Bun.file(input.filename).slice(input.start)
+  const size = Math.max(0, input.size - input.start)
+  // Bun's sliced File body can advertise a sentinel-sized content length when
+  // the slice is created lazily. A bounded native stream keeps the body
+  // byte-exact without buffering the session file in memory.
+  const body = size === 0
+    ? new Uint8Array()
+    : Readable.toWeb(createReadStream(input.filename, { start: input.start, end: input.size - 1 })) as unknown as globalThis.ReadableStream<Uint8Array>
   const url = new URL(`file/${encodeURIComponent(input.fileID)}`, input.endpoint.endsWith("/") ? input.endpoint : `${input.endpoint}/`)
   const response = await fetch(url, {
     method: "PUT",
     headers: {
       Authorization: `Bearer ${input.token}`,
       "content-type": "application/octet-stream",
+      "content-length": String(size),
       "x-vcc-path": input.sourcePath,
       ...(input.full ? { "x-vcc-full": "true" } : {}),
     },
@@ -92,7 +101,7 @@ export async function uploadS3File(input: S3Upload): Promise<{ status: number; s
     throw new Error(`session-center S3 ingest failed (${response.status})${detail ? `: ${detail}` : ""}`)
   }
   const sha256 = response.headers.get("x-sha256")
-  return { status: response.status, ...(sha256 ? { sha256 } : {}), size: body.size }
+  return { status: response.status, ...(sha256 ? { sha256 } : {}), size }
 }
 
 export function validateS3Endpoint(value: string, allowInsecureRemote = false): string {

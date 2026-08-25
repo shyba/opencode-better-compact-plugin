@@ -64,8 +64,8 @@ describe("session-center S3 source transport", () => {
       const filename = path.join(root, "session.jsonl")
       await writeFile(filename, "alpha\nbeta\n")
       const endpoint = `http://127.0.0.1:${server.port}`
-      await uploadS3File({ endpoint, token: "token-token-token", fileID: "version-1", sourcePath: "session.jsonl", filename, start: 6, full: false })
-      await uploadS3File({ endpoint, token: "token-token-token", fileID: "version-2", sourcePath: "session.jsonl", filename, start: 0, full: true })
+      await uploadS3File({ endpoint, token: "token-token-token", fileID: "version-1", sourcePath: "session.jsonl", filename, size: 11, start: 6, full: false })
+      await uploadS3File({ endpoint, token: "token-token-token", fileID: "version-2", sourcePath: "session.jsonl", filename, size: 11, start: 0, full: true })
       expect(requests).toEqual([
         { path: "/file/version-1", full: null, body: "beta\n" },
         { path: "/file/version-2", full: "true", body: "alpha\nbeta\n" },
