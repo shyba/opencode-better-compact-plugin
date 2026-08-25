@@ -25,9 +25,9 @@ describe("session-center S3 source transport", () => {
       const filename = path.join(root, "session.jsonl")
       await writeFile(filename, "hello\n")
       expect(await hashS3File(filename)).toBe("5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03")
-      expect(s3FileID("session.jsonl", { size: 6, mtimeMs: 10 }, "a")).toBe(s3FileID("session.jsonl", { size: 6, mtimeMs: 10 }, "a"))
-      expect(s3FileID("session.jsonl", { size: 6, mtimeMs: 10 }, "b")).not.toBe(s3FileID("session.jsonl", { size: 6, mtimeMs: 10 }, "a"))
-      expect(s3FileID("session.jsonl", { size: 7, mtimeMs: 10 }, "a")).not.toBe(s3FileID("session.jsonl", { size: 6, mtimeMs: 10 }, "a"))
+      expect(s3FileID("session.jsonl", { size: 6, mtimeMs: 10 }, "a", 0, true)).toBe(s3FileID("session.jsonl", { size: 6, mtimeMs: 10 }, "a", 0, true))
+      expect(s3FileID("session.jsonl", { size: 6, mtimeMs: 10 }, "b", 0, true)).not.toBe(s3FileID("session.jsonl", { size: 6, mtimeMs: 10 }, "a", 0, true))
+      expect(s3FileID("session.jsonl", { size: 6, mtimeMs: 10 }, "a", 1, false)).not.toBe(s3FileID("session.jsonl", { size: 6, mtimeMs: 10 }, "a", 0, true))
     } finally {
       await rm(root, { recursive: true, force: true })
     }

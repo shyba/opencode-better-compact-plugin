@@ -35,8 +35,9 @@ export function planS3Upload(sourcePath: string, metadata: { size: number; mtime
     return { action: "skip", version: { ...previous, mtimeMs: metadata.mtimeMs } }
   }
   const full = !previous || metadata.size < previous.size || (metadata.size === previous.size && previous.sha256 !== sha256)
-  const version = { fileID: s3FileID(sourcePath, metadata, sha256), size: metadata.size, mtimeMs: metadata.mtimeMs, sha256 }
-  return { action: "upload", version, fileID: version.fileID, start: full ? 0 : Math.min(previous!.size, metadata.size), full }
+  const start = full ? 0 : Math.min(previous!.size, metadata.size)
+  const version = { fileID: s3FileID(sourcePath, metadata, sha256, start, full), size: metadata.size, mtimeMs: metadata.mtimeMs, sha256 }
+  return { action: "upload", version, fileID: version.fileID, start, full }
 }
 
 /** Walk only regular JSONL files. The session-center frame contract carries
@@ -71,8 +72,8 @@ export async function hashS3File(filename: string): Promise<string> {
 
 /** Match session-center's version identity: an uploaded mtime/size version gets
  *  a fresh id, while replaying the same bytes is skipped or answered with 204. */
-export function s3FileID(sourcePath: string, metadata: { size: number; mtimeMs: number }, sha256: string): string {
-  return createHash("sha1").update(`${sourcePath}:${metadata.mtimeMs}:${metadata.size}:${sha256}`).digest("hex").slice(0, 24)
+export function s3FileID(sourcePath: string, metadata: { size: number; mtimeMs: number }, sha256: string, start: number, full: boolean): string {
+  return createHash("sha1").update(`${sourcePath}:${metadata.mtimeMs}:${metadata.size}:${sha256}:${start}:${full ? "full" : "append"}`).digest("hex").slice(0, 24)
 }
 
 export async function uploadS3File(input: S3Upload): Promise<{ status: number; sha256?: string; size: number }> {
@@ -91,6 +92,7 @@ export async function uploadS3File(input: S3Upload): Promise<{ status: number; s
       "content-type": "application/octet-stream",
       "content-length": String(size),
       "x-vcc-path": input.sourcePath,
+      "x-vcc-start": String(input.start),
       ...(input.full ? { "x-vcc-full": "true" } : {}),
     },
     body,
