@@ -35,7 +35,7 @@ export function planS3Upload(sourcePath: string, metadata: { size: number; mtime
     return { action: "skip", version: { ...previous, mtimeMs: metadata.mtimeMs } }
   }
   const full = !previous || metadata.size < previous.size || (metadata.size === previous.size && previous.sha256 !== sha256)
-  const version = { fileID: s3FileID(sourcePath, metadata), size: metadata.size, mtimeMs: metadata.mtimeMs, sha256 }
+  const version = { fileID: s3FileID(sourcePath, metadata, sha256), size: metadata.size, mtimeMs: metadata.mtimeMs, sha256 }
   return { action: "upload", version, fileID: version.fileID, start: full ? 0 : Math.min(previous!.size, metadata.size), full }
 }
 
@@ -71,8 +71,8 @@ export async function hashS3File(filename: string): Promise<string> {
 
 /** Match session-center's version identity: an uploaded mtime/size version gets
  *  a fresh id, while replaying the same bytes is skipped or answered with 204. */
-export function s3FileID(sourcePath: string, metadata: { size: number; mtimeMs: number }): string {
-  return createHash("sha1").update(`${sourcePath}:${metadata.mtimeMs}:${metadata.size}`).digest("hex").slice(0, 24)
+export function s3FileID(sourcePath: string, metadata: { size: number; mtimeMs: number }, sha256: string): string {
+  return createHash("sha1").update(`${sourcePath}:${metadata.mtimeMs}:${metadata.size}:${sha256}`).digest("hex").slice(0, 24)
 }
 
 export async function uploadS3File(input: S3Upload): Promise<{ status: number; sha256?: string; size: number }> {
