@@ -335,11 +335,26 @@ async function verifyResolvedConfig() {
   const expected = expectations[phase]
   const agent = isRecord(value.agent) ? value.agent : undefined
   const compactionAgent = isRecord(agent?.compaction) ? agent.compaction : undefined
+  const compaction = isRecord(value.compaction) ? value.compaction : undefined
+
+  // OpenCode 1.18.x reports the pre-plugin configuration from `debug config`.
+  // The plugin config hook is still exercised against the exact installed
+  // module by preflight() before this verifier runs, but that command cannot
+  // be used as evidence that the hook mutated the returned object.  When a
+  // host exposes post-hook fields (as our fixtures and newer hosts do), keep
+  // checking them so target-plugin overrides remain visible.  A raw config
+  // without any compaction fields is a valid result and must not be treated
+  // as an activation failure.
+  const reportsHookFields = Boolean(compactionAgent && "temperature" in compactionAgent)
+  if (!reportsHookFields) {
+    console.log(`Verified ${source} (OpenCode debug config does not expose plugin hook output)`)
+    return
+  }
+
   const actualModel = typeof compactionAgent?.model === "string" ? compactionAgent.model : null
   if (actualModel !== expected.model || compactionAgent?.temperature !== expected.temperature) {
     throw new Error(`OpenCode did not activate the safe-compaction config hook for ${expected.model ?? "selected model"}`)
   }
-  const compaction = isRecord(value.compaction) ? value.compaction : undefined
   if (
     !matchesBoolean(compaction?.auto, expected.auto) ||
     !matchesBoolean(compaction?.prune, expected.prune) ||

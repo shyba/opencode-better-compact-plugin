@@ -11,6 +11,26 @@ afterEach(async () => {
 })
 
 describe("installer", () => {
+  test("ships runtime entrypoints that load without checkout dependencies", async () => {
+    const root = await directory()
+    const home = path.join(root, "home")
+    const configHome = path.join(root, "config-home")
+    const server = pathToFileURL(path.join(process.cwd(), "runtime/server.js")).href
+    const tui = pathToFileURL(path.join(process.cwd(), "runtime/tui.js")).href
+    const result = await command(
+      [
+        process.execPath,
+        "-e",
+        'const server = await import(process.argv[1]); const tui = await import(process.argv[2]); console.log(`${server.default?.id}:${typeof server.default?.server}:${tui.default?.id}:${typeof tui.default?.tui}`)',
+        server,
+        tui,
+      ],
+      { PATH: process.env.PATH ?? "", HOME: home, XDG_CONFIG_HOME: configHome },
+    )
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout.trim()).toBe("opencode-safe-compaction:function:opencode-safe-compaction-settings:function")
+  })
+
   test("preserves JSONC comments and existing plugin entries", async () => {
     const root = await directory()
     const config = path.join(root, "config")
@@ -318,9 +338,8 @@ describe("installer", () => {
     const root = await directory()
     const config = path.join(root, "config")
     const install = path.join(root, "install")
-    await mkdir(path.join(install, "src"), { recursive: true })
-    await Bun.write(path.join(install, "src/index.ts"), source)
     await cp(path.join(process.cwd(), "runtime"), path.join(install, "runtime"), { recursive: true })
+    await Bun.write(path.join(install, "runtime/server.js"), source)
 
     const result = await configure(config, install)
     expect(result.exitCode).not.toBe(0)
@@ -556,7 +575,7 @@ exit 1
     expect(await Array.fromAsync(new Bun.Glob("*.safe-compaction-backup-*").scan(config))).toHaveLength(0)
   })
 
-  test("rolls back when OpenCode reports the tuple without activating the plugin hook", async () => {
+  test("accepts OpenCode debug config output that omits plugin hook mutations", async () => {
     const root = await directory()
     const origin = await installerOrigin(root)
     const install = path.join(root, "installed")
@@ -573,7 +592,8 @@ if [ "$1" = "--version" ]; then
   exit 0
 fi
 if [ "$1" = "debug" ] && [ "$2" = "config" ]; then
-  sed -n '1,240p' "$OPENCODE_CONFIG_DIR/opencode.jsonc"
+  printf '{"plugin":[["%s/runtime",{"model":"%s"}]]}\n' \\
+    "$OPENCODE_SAFE_COMPACTION_DIR" "$OPENCODE_SAFE_COMPACTION_MODEL"
   exit 0
 fi
 exit 1
@@ -590,10 +610,9 @@ exit 1
       OPENCODE_SAFE_COMPACTION_OPENCODE: fakeOpenCode,
     })
 
-    expect(result.exitCode).not.toBe(0)
-    expect(result.stderr).toContain("did not activate the plugin config hook")
-    expect(await Bun.file(file).text()).toBe(original)
-    expect(await Bun.file(install).exists()).toBe(false)
+    expect(result.exitCode).toBe(0)
+    expect(await Bun.file(file).text()).not.toBe(original)
+    expect(await Bun.file(path.join(install, ".git/HEAD")).exists()).toBe(true)
   })
 
   test("preserves the checkout when rollback refuses a concurrent configuration edit", async () => {

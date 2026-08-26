@@ -473,11 +473,11 @@ verify_debug_output() {
 }
 
 debug_output=$(debug_config isolated) || fail "OpenCode could not load the isolated plugin configuration"
-verify_debug_output isolated "$debug_output" || fail "OpenCode loaded the isolated configuration but did not activate the plugin config hook"
+verify_debug_output isolated "$debug_output" || fail "OpenCode failed verification of the isolated plugin configuration"
 
 say "verifying compatibility with the target OpenCode configuration"
 debug_output=$(debug_config target) || fail "OpenCode could not load the installed configuration"
-verify_debug_output target "$debug_output" || fail "OpenCode loaded the configuration but did not activate the plugin config hook"
+verify_debug_output target "$debug_output" || fail "OpenCode failed verification of the installed plugin configuration"
 
 OPENCODE_SAFE_COMPACTION_ACTION=commit \
 OPENCODE_SAFE_COMPACTION_STATE_FILE=$state_file \
