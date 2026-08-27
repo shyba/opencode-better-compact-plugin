@@ -46,8 +46,10 @@ export class SyncState {
       create index if not exists outbox_ready_idx on outbox(destination_id, state, next_attempt_at, record_revision);
       create index if not exists normalized_record_retention_idx on normalized_record(observed_at);
       create index if not exists outbox_record_idx on outbox(source_id, record_kind, natural_key);
-      create table if not exists source_scan (source_id text primary key references source(id) on delete cascade, path_mtime_ms integer not null, path_size_or_count integer not null, child_max_mtime_ms integer not null, last_complete_scan_at integer not null);
+      create table if not exists source_scan (source_id text primary key references source(id) on delete cascade, path_mtime_ms integer not null, path_size_or_count integer not null, child_max_mtime_ms integer not null, last_complete_scan_at integer not null, last_full_scan_at integer);
       create table if not exists s3_file (source_id text not null references source(id) on delete cascade, path text not null, file_id text not null, size integer not null, mtime_ms real not null, sha256 text not null, updated_at integer not null, primary key (source_id, path));
+      create table if not exists s3_failure (source_id text not null references source(id) on delete cascade, path text not null, size integer not null, mtime_ms real not null, attempt_count integer not null default 0, next_attempt_at integer not null, exhausted integer not null default 0, last_error text, updated_at integer not null, primary key (source_id, path));
+      create index if not exists s3_failure_due_idx on s3_failure(next_attempt_at);
     `)
     this.db.query("insert or ignore into schema_migration(version, applied_at) values (1, ?)").run(Date.now())
     this.applyLocalMigrations()
@@ -79,6 +81,11 @@ export class SyncState {
     }
     this.db.exec("create table if not exists hierarchy_backfill (source_id text not null references source(id) on delete cascade, path text not null, payload_sha256 text not null, hierarchy_status text not null, updated_at integer not null, primary key (source_id, path))")
     this.db.query("insert or ignore into schema_migration(version, applied_at) values (12, ?)").run(Date.now())
+    const sourceScanColumns = (this.db.query("pragma table_info(source_scan)").all() as Array<{ name: string }>).some((row) => row.name === "last_full_scan_at")
+    if (!sourceScanColumns) this.db.exec("alter table source_scan add column last_full_scan_at integer")
+    this.db.query("insert or ignore into schema_migration(version, applied_at) values (13, ?)").run(Date.now())
+    this.db.exec("create table if not exists s3_failure (source_id text not null references source(id) on delete cascade, path text not null, size integer not null, mtime_ms real not null, attempt_count integer not null default 0, next_attempt_at integer not null, exhausted integer not null default 0, last_error text, updated_at integer not null, primary key (source_id, path)); create index if not exists s3_failure_due_idx on s3_failure(next_attempt_at)")
+    this.db.query("insert or ignore into schema_migration(version, applied_at) values (14, ?)").run(Date.now())
     this.db.exec("update source set local_revision=max(local_revision, coalesce((select max(record_revision) from normalized_record where normalized_record.source_id=source.id), 0))")
   }
 
@@ -183,10 +190,20 @@ export class SyncState {
 
   /** Record a successful complete scan of a source. The fingerprint lets the
    *  next syncPass detect "nothing changed" without re-running discovery. */
-  recordSourceComplete(sourceID: string, pathMtimeMs: number, pathSizeOrCount: number, childMaxMtimeMs: number): void {
+  recordSourceComplete(sourceID: string, pathMtimeMs: number, pathSizeOrCount: number, childMaxMtimeMs: number, now = Date.now()): void {
     this.db.query(
       "insert into source_scan(source_id, path_mtime_ms, path_size_or_count, child_max_mtime_ms, last_complete_scan_at) values(?, ?, ?, ?, ?) on conflict(source_id) do update set path_mtime_ms=excluded.path_mtime_ms, path_size_or_count=excluded.path_size_or_count, child_max_mtime_ms=excluded.child_max_mtime_ms, last_complete_scan_at=excluded.last_complete_scan_at"
-    ).run(sourceID, pathMtimeMs, pathSizeOrCount, childMaxMtimeMs, Date.now())
+    ).run(sourceID, pathMtimeMs, pathSizeOrCount, childMaxMtimeMs, now)
+  }
+
+  recordS3SourceComplete(sourceID: string, pathMtimeMs: number, pathSizeOrCount: number, childMaxMtimeMs: number, fullScan: boolean, now = Date.now()): void {
+    this.recordSourceComplete(sourceID, pathMtimeMs, pathSizeOrCount, childMaxMtimeMs, now)
+    if (fullScan) this.db.query("update source_scan set last_full_scan_at=? where source_id=?").run(now, sourceID)
+  }
+
+  s3FullScanDue(sourceID: string, intervalMs: number, now = Date.now()): boolean {
+    const row = this.db.query("select last_full_scan_at from source_scan where source_id=?").get(sourceID) as { last_full_scan_at?: number } | null
+    return !row || row.last_full_scan_at === undefined || row.last_full_scan_at === null || Number(row.last_full_scan_at) <= now - intervalMs
   }
 
   /** Return true iff the source has been fully scanned before AND its current
@@ -220,6 +237,36 @@ export class SyncState {
 
   recordS3File(sourceID: string, filePath: string, value: { fileID: string; size: number; mtimeMs: number; sha256: string }): void {
     this.db.query("insert into s3_file(source_id, path, file_id, size, mtime_ms, sha256, updated_at) values (?, ?, ?, ?, ?, ?, ?) on conflict(source_id, path) do update set file_id=excluded.file_id, size=excluded.size, mtime_ms=excluded.mtime_ms, sha256=excluded.sha256, updated_at=excluded.updated_at").run(sourceID, filePath, value.fileID, value.size, value.mtimeMs, value.sha256, Date.now())
+  }
+
+  s3Failure(sourceID: string, filePath: string): { size: number; mtimeMs: number; attemptCount: number; nextAttemptAt: number; exhausted: boolean; lastError?: string } | undefined {
+    const row = this.db.query("select size, mtime_ms, attempt_count, next_attempt_at, exhausted, last_error from s3_failure where source_id=? and path=?").get(sourceID, filePath) as { size: number; mtime_ms: number; attempt_count: number; next_attempt_at: number; exhausted: number; last_error?: string } | null
+    if (!row) return undefined
+    return { size: Number(row.size), mtimeMs: Number(row.mtime_ms), attemptCount: Number(row.attempt_count), nextAttemptAt: Number(row.next_attempt_at), exhausted: Number(row.exhausted) !== 0, ...(typeof row.last_error === "string" ? { lastError: row.last_error } : {}) }
+  }
+
+  s3FailureDue(sourceID: string, filePath: string, now = Date.now()): boolean {
+    const row = this.s3Failure(sourceID, filePath)
+    return !row || (!row.exhausted && row.nextAttemptAt <= now)
+  }
+
+  recordS3Failure(sourceID: string, filePath: string, value: { size: number; mtimeMs: number }, error: string, maxAttempts: number, retryIntervalMs: number, now = Date.now()): { attemptCount: number; nextAttemptAt: number; exhausted: boolean } {
+    const previous = this.s3Failure(sourceID, filePath)
+    const sameVersion = previous?.size === value.size && previous.mtimeMs === value.mtimeMs
+    const attemptCount = sameVersion && previous && !previous.exhausted ? previous.attemptCount + 1 : 1
+    const exhausted = attemptCount >= maxAttempts
+    // Exhaustion is a durable stop for this exact file version. A forced
+    // `sync run --once`, or a metadata change, clears it and starts a fresh
+    // retry series; the daemon must not hammer a permanently failing file.
+    const nextAttemptAt = exhausted ? Number.MAX_SAFE_INTEGER : now + retryIntervalMs
+    this.db.query(`insert into s3_failure(source_id, path, size, mtime_ms, attempt_count, next_attempt_at, exhausted, last_error, updated_at)
+      values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      on conflict(source_id, path) do update set size=excluded.size, mtime_ms=excluded.mtime_ms, attempt_count=excluded.attempt_count, next_attempt_at=excluded.next_attempt_at, exhausted=excluded.exhausted, last_error=excluded.last_error, updated_at=excluded.updated_at`).run(sourceID, filePath, value.size, value.mtimeMs, attemptCount, nextAttemptAt, exhausted ? 1 : 0, error.slice(0, 1000), now)
+    return { attemptCount, nextAttemptAt, exhausted }
+  }
+
+  clearS3Failure(sourceID: string, filePath: string): void {
+    this.db.query("delete from s3_failure where source_id=? and path=?").run(sourceID, filePath)
   }
 
   hierarchyBackfillSHA(sourceID: string, path: string): string | undefined {

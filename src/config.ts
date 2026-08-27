@@ -11,6 +11,8 @@ export type SyncConfig = {
   database_url_env: string
   poll_interval_ms: number
   rescan_interval_ms: number
+  failure_retry_attempts: number
+  failure_retry_interval_ms: number
   batch_size: number
   max_outbox_bytes: number
   include_parts: boolean
@@ -74,8 +76,10 @@ const defaults: BetterCompactConfig = {
     s3_url_env: "SESSION_CENTER_URL",
     s3_token_env: "S3_SYNC_TOKEN",
     database_url_env: "OPENCODE_SYNC_DATABASE_URL",
-    poll_interval_ms: 2_000,
-    rescan_interval_ms: 60_000,
+    poll_interval_ms: 30_000,
+    rescan_interval_ms: 300_000,
+    failure_retry_attempts: 3,
+    failure_retry_interval_ms: 300_000,
     batch_size: 100,
     max_outbox_bytes: 268_435_456,
     include_parts: true,
@@ -179,7 +183,7 @@ export function validateConfig(value: unknown): BetterCompactConfig {
   for (const key of ["s3_url_env", "s3_token_env", "database_url_env"] as const) {
     if (typeof result.sync[key] !== "string" || !/^[A-Z_][A-Z0-9_]*$/.test(result.sync[key])) throw new TypeError(`sync.${key} must be an environment variable name`)
   }
-  for (const key of ["poll_interval_ms", "rescan_interval_ms", "batch_size", "max_outbox_bytes", "retention_days"] as const) {
+  for (const key of ["poll_interval_ms", "rescan_interval_ms", "failure_retry_attempts", "failure_retry_interval_ms", "batch_size", "max_outbox_bytes", "retention_days"] as const) {
     if (!Number.isSafeInteger(result.sync[key]) || result.sync[key] <= 0) throw new TypeError(`sync.${key} must be a positive integer`)
   }
   if (typeof result.sync.include_parts !== "boolean" || typeof result.sync.include_tool_output !== "boolean" || typeof result.sync.allow_insecure_remote !== "boolean" || typeof result.sync.keep_remote_on_missing !== "boolean" || typeof result.sync.allow_source_shrink !== "boolean") throw new TypeError("sync include flags must be boolean")

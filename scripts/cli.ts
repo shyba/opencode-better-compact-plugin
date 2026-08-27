@@ -12,13 +12,15 @@ import { discoverJsonl, discoverJsonlSessions, inspectJsonl, readSessionHeader, 
 import type { JsonlCheckpoint, JsonlDiscoveryResult, JsonlReconcilePrefix, JsonlSessionCheckpoint } from "../src/jsonl.js"
 import { applyRemoteMigration, ensureRemoteSource, openPostgres, purgeRemoteTombstones, readRemoteFence, recordObservation, uploadFenced } from "../src/postgres.js"
 import { openSyncState, type NormalizedRecord } from "../src/sync-state.js"
-import { discoverS3JsonlFiles, hashS3File, planS3Upload, uploadS3File, validateS3Endpoint } from "../src/s3-sync.js"
+import { discoverS3JsonlSnapshot, hashS3File, planS3Upload, uploadS3File, validateS3Endpoint } from "../src/s3-sync.js"
 
 const installDir = path.resolve(process.env.OPENCODE_SAFE_COMPACTION_DIR ?? path.join(process.env.HOME ?? ".", ".local/share/opencode/plugins/safe-compaction"))
 const configDir = path.resolve(process.env.OPENCODE_SAFE_COMPACTION_CONFIG_DIR ?? process.env.OPENCODE_CONFIG_DIR ?? path.join(process.env.XDG_CONFIG_HOME ?? path.join(process.env.HOME ?? ".", ".config"), "opencode"))
 const databasePath = path.resolve(process.env.OPENCODE_DB ?? path.join(process.env.XDG_DATA_HOME ?? path.join(process.env.HOME ?? ".", ".local/share"), "opencode", "opencode.db"))
 const maxUploadBatchesPerSource = 8
 const remoteTombstonePurgeIntervalMs = 24 * 60 * 60 * 1000
+const s3SourceFailurePath = "\u0000source"
+const s3SourceKinds = new Set(["codex-jsonl", "codex-jsonl-sessions", "pi-jsonl"])
 const idleCompactionMinBytes = 8 * 1024 * 1024
 const idleCompactionMinFreePages = 1024
 const idleCompactionMinFreeRatio = 0.2
@@ -451,7 +453,7 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>, signal?:
   if (config.sync.transport === "s3") {
     const endpoint = s3EndpointFor(config)
     const token = s3TokenFor(config)
-    if (endpoint || token) return syncS3Pass(config, signal)
+    if (endpoint || token) return syncS3Pass(config, signal, options)
     // A hand-written pre-S3 config may enable sync before setup has supplied
     // the session-center credentials. Keep its local discovery usable for
     // migration and diagnostics, but never claim that anything was uploaded.
@@ -578,7 +580,7 @@ async function syncPass(config: Awaited<ReturnType<typeof loadConfig>>, signal?:
  * state records only the last acknowledged file version; S3 remains the
  * durable source of truth and its file_id replay contract makes a crash
  * between PUT and the local acknowledgement safe. */
-async function syncS3Pass(config: Awaited<ReturnType<typeof loadConfig>>, signal?: AbortSignal) {
+async function syncS3Pass(config: Awaited<ReturnType<typeof loadConfig>>, signal?: AbortSignal, options: { bypassSkip?: boolean } = {}) {
   const endpointValue = s3EndpointFor(config)
   const token = s3TokenFor(config)
   if (!endpointValue) {
@@ -595,6 +597,7 @@ async function syncS3Pass(config: Awaited<ReturnType<typeof loadConfig>>, signal
   let failed = false
   try {
     const installation = state.ensureDefaultInstallation("default", "s3", "s3")
+    const seenRoots = new Set<string>()
     for (const source of config.sources) {
       if (signal?.aborted) break
       if (source.kind === "opencode-v1-sqlite" || source.kind === "opencode-v1-sessions") {
@@ -608,37 +611,92 @@ async function syncS3Pass(config: Awaited<ReturnType<typeof loadConfig>>, signal
         continue
       }
       const root = path.resolve(source.database.replace(/^~(?=\/|$)/, process.env.HOME ?? "."))
+      if (s3SourceKinds.has(source.kind)) {
+        if (seenRoots.has(root)) {
+          console.error(`warning: skipping duplicate S3 source ${source.kind} at ${root}`)
+          continue
+        }
+        seenRoots.add(root)
+      }
       const sourceID = createHash("sha256").update(`${source.kind}\n${root}`).digest("hex").slice(0, 32)
       const sourceIncarnation = state.sourceIncarnation(sourceID)
       state.upsertSource({ id: sourceID, installationID: installation.id, kind: source.kind, schemaVersion: 1, locator: root, incarnation: sourceIncarnation })
-      let uploaded = 0
-      try {
-        const files = await discoverS3JsonlFiles(root)
-        for (const filename of files) {
-          if (signal?.aborted) break
-          const metadata = await stat(filename)
-          const sourcePath = metadata.isFile() && (await stat(root)).isFile()
-            ? path.basename(filename)
-            : path.relative(root, filename)
-          if (!sourcePath || sourcePath.startsWith("..") || path.isAbsolute(sourcePath)) throw new Error(`invalid source path ${sourcePath}`)
-          const sha256 = await hashS3File(filename)
-          const previous = state.s3File(sourceID, sourcePath)
-          const plan = planS3Upload(sourcePath, metadata, sha256, previous)
-          if (plan.action === "skip") {
-            if (previous?.mtimeMs !== plan.version.mtimeMs) state.recordS3File(sourceID, sourcePath, plan.version)
-            continue
-          }
-          await uploadS3File({ endpoint, token, fileID: plan.fileID, sourcePath, filename, size: plan.version.size, start: plan.start, full: plan.full, ...(signal ? { signal } : {}) })
-          state.recordS3File(sourceID, sourcePath, plan.version)
-          uploaded++
-          progressed = true
+      const sourceFailure = state.s3Failure(sourceID, s3SourceFailurePath)
+      if (options.bypassSkip) state.clearS3Failure(sourceID, s3SourceFailurePath)
+      if (!options.bypassSkip && sourceFailure) {
+        const rootMetadata = await stat(root).catch(() => ({ size: 0, mtimeMs: 0 }))
+        const rootChanged = rootMetadata.size !== sourceFailure.size || rootMetadata.mtimeMs !== sourceFailure.mtimeMs
+        if (rootChanged) state.clearS3Failure(sourceID, s3SourceFailurePath)
+        if (!rootChanged && !state.s3FailureDue(sourceID, s3SourceFailurePath)) {
+          failed = true
+          continue
         }
-        state.recordSourceComplete(sourceID, (await stat(root)).mtimeMs, files.length, Math.max(0, ...await Promise.all(files.map(async (file) => (await stat(file)).mtimeMs))))
-        console.log(`uploaded ${uploaded} changed JSONL file${uploaded === 1 ? "" : "s"} from ${root}`)
-      } catch (error) {
-        failed = true
-        console.error(`warning: S3 sync source ${source.kind} failed: ${error instanceof Error ? error.message : String(error)}`)
       }
+      let uploaded = 0
+      let sourceComplete = true
+      let fullScanComplete = true
+      let failureRecorded = false
+      try {
+        const snapshot = await discoverS3JsonlSnapshot(root)
+        const fullScan = options.bypassSkip || state.s3FullScanDue(sourceID, config.sync.rescan_interval_ms)
+        fullScanComplete = fullScan
+        for (const file of snapshot.files) {
+          if (signal?.aborted) break
+          const previous = state.s3File(sourceID, file.sourcePath)
+          const failure = state.s3Failure(sourceID, file.sourcePath)
+          if (!options.bypassSkip && failure && !state.s3FailureDue(sourceID, file.sourcePath)) {
+            const metadataChanged = failure.size !== file.size || failure.mtimeMs !== file.mtimeMs
+            if (!metadataChanged) {
+              failed = true
+              sourceComplete = false
+              fullScanComplete = false
+              continue
+            }
+            state.clearS3Failure(sourceID, file.sourcePath)
+          }
+          if (options.bypassSkip) state.clearS3Failure(sourceID, file.sourcePath)
+          const metadataChanged = !previous || previous.size !== file.size || previous.mtimeMs !== file.mtimeMs
+          if (!fullScan && !metadataChanged && !failure) continue
+          try {
+            const sha256 = await hashS3File(file.filename)
+            const plan = planS3Upload(file.sourcePath, file, sha256, previous)
+            if (plan.action === "skip") {
+              if (previous?.mtimeMs !== plan.version.mtimeMs) state.recordS3File(sourceID, file.sourcePath, plan.version)
+              state.clearS3Failure(sourceID, file.sourcePath)
+              continue
+            }
+            await uploadS3File({ endpoint, token, fileID: plan.fileID, sourcePath: file.sourcePath, filename: file.filename, size: plan.version.size, start: plan.start, full: plan.full, ...(signal ? { signal } : {}) })
+            state.recordS3File(sourceID, file.sourcePath, plan.version)
+            state.clearS3Failure(sourceID, file.sourcePath)
+            uploaded++
+            progressed = true
+          } catch (error) {
+            if (signal?.aborted) break
+            const message = error instanceof Error ? error.message : String(error)
+            const retry = state.recordS3Failure(sourceID, file.sourcePath, { size: file.size, mtimeMs: file.mtimeMs }, message, config.sync.failure_retry_attempts, config.sync.failure_retry_interval_ms)
+            failed = true
+            sourceComplete = false
+            fullScanComplete = false
+            failureRecorded = true
+            console.error(`warning: S3 file ${source.kind}/${file.sourcePath} failed (attempt ${retry.attemptCount}/${config.sync.failure_retry_attempts}); ${retry.exhausted ? "no automatic retry for this file version" : `next retry after ${new Date(retry.nextAttemptAt).toISOString()}`}: ${message}`)
+            break
+          }
+        }
+        if (!signal?.aborted && sourceComplete) {
+          state.recordS3SourceComplete(sourceID, snapshot.rootMtimeMs, snapshot.files.length, Math.max(0, ...snapshot.files.map((file) => file.mtimeMs)), fullScan && fullScanComplete)
+          state.clearS3Failure(sourceID, s3SourceFailurePath)
+          console.log(`uploaded ${uploaded} changed JSONL file${uploaded === 1 ? "" : "s"} from ${root}`)
+        }
+      } catch (error) {
+        if (signal?.aborted) break
+        failed = true
+        const message = error instanceof Error ? error.message : String(error)
+        const rootMetadata = await stat(root).catch(() => ({ size: 0, mtimeMs: 0 }))
+        const retry = state.recordS3Failure(sourceID, s3SourceFailurePath, { size: rootMetadata.size, mtimeMs: rootMetadata.mtimeMs }, message, config.sync.failure_retry_attempts, config.sync.failure_retry_interval_ms)
+        failureRecorded = true
+        console.error(`warning: S3 sync source ${source.kind} failed (attempt ${retry.attemptCount}/${config.sync.failure_retry_attempts}); ${retry.exhausted ? "no automatic retry for this source version" : `next retry after ${new Date(retry.nextAttemptAt).toISOString()}`}: ${message}`)
+      }
+      if (failureRecorded) continue
     }
     return { progress: progressed, pending: 0, failed }
   } finally {
@@ -720,7 +778,7 @@ async function availableDefaultSyncSources(transport: "s3" | "postgres" = "postg
   const openCodeDatabase = process.env.OPENCODE_DB ?? (process.env.XDG_DATA_HOME
     ? path.join(process.env.XDG_DATA_HOME, "opencode", "opencode.db")
     : "~/.local/share/opencode/opencode.db")
-  const candidates = await Promise.all(defaultSyncSources.filter((source) => transport === "postgres" || source.kind === "codex-jsonl" || source.kind === "codex-jsonl-sessions" || source.kind === "pi-jsonl").map(async (source) => {
+  const candidates = await Promise.all(defaultSyncSources.filter((source) => transport === "postgres" || source.kind === "codex-jsonl" || source.kind === "pi-jsonl").map(async (source) => {
     const database = source.kind.startsWith("opencode-") ? openCodeDatabase : source.database
     const filename = path.resolve(database.replace(/^~(?=\/|$)/, process.env.HOME ?? "."))
     if (!(await exists(filename))) return undefined
@@ -852,6 +910,11 @@ async function syncStatus() {
         ? db.query("select count(*) as value, coalesce(sum(size), 0) as bytes from s3_file").get() as { value: number; bytes: number }
         : { value: 0, bytes: 0 }
       console.log(`S3 file versions: ${Number(files.value)} / ${Number(files.bytes)} bytes acknowledged locally`)
+      const hasS3FailureTable = db.query("select 1 from sqlite_master where type='table' and name='s3_failure'").get() !== null
+      const failures = hasS3FailureTable
+        ? db.query("select count(*) as value, coalesce(sum(exhausted), 0) as exhausted from s3_failure").get() as { value: number; exhausted: number }
+        : { value: 0, exhausted: 0 }
+      console.log(`S3 retry failures: ${Number(failures.value)} (${Number(failures.exhausted)} exhausted)`)
       console.log(`session-center: ${s3EndpointFor(config) ?? "not configured"}`)
     }
     const cache = db.query("select count(*) as rows, coalesce(sum(length(coalesce(payload_json,'') || coalesce(routing_json,''))), 0) as bytes from normalized_record").get() as { rows: number; bytes: number }

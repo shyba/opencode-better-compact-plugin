@@ -117,13 +117,13 @@ The generated wrapper points at the persistent checkout and also falls back to t
 
 `doctor` checks the managed checkout, both OpenCode configuration surfaces, the OpenCode and Bun executables, and performs a read-only SQLite probe. `update` runs the same rollback-safe checkout/configuration transaction as the installer. If Bun was bootstrapped temporarily during installation, install Bun separately or invoke the CLI with `OPENCODE_SAFE_COMPACTION_BUN=/path/to/bun`.
 
-The default sync transport is session-center S3 ingest. The runner reads configured Codex JSONL and Pi JSONL sources read-only, uploads only changed bytes to `PUT /file/<file_id>`, and marks shrink/same-size rewrites with `x-vcc-full: true`. The local SQLite state stores the last acknowledged path version so an interrupted PUT can be replayed safely; S3 archives remain the durable source of truth and `vcc_load.py` projects them into `vcc.*`. OpenCode V1 SQLite remains an explicit warning until session-center's normalized-record feeder is enabled; it is never sent to the retired `opencode.*` writer. `better-compact sync status` reports acknowledged S3 file versions, and `better-compact sync compact --yes` vacuums only the local cache.
+The default sync transport is session-center S3 ingest. The runner reads configured Codex JSONL and Pi JSONL sources read-only, uploads only changed bytes to `PUT /file/<file_id>`, and marks shrink/same-size rewrites with `x-vcc-full: true`. The local SQLite state stores the last acknowledged path version so an interrupted PUT can be replayed safely; S3 archives remain the durable source of truth and `vcc_load.py` projects them into `vcc.*`. OpenCode V1 SQLite remains an explicit warning until session-center's normalized-record feeder is enabled; it is never sent to the retired `opencode.*` writer. `better-compact sync status` reports acknowledged S3 file versions and retry failures, and `better-compact sync compact --yes` vacuums only the local cache.
 
 If an older hand-written config enables sync without an S3 URL/token, `sync run` warns and performs only local compatibility staging; it does not write Postgres or pretend that a remote upload succeeded. Run `sync setup` before relying on remote durability.
 
 Completed source snapshots are guarded against destructive partial reads in the legacy Postgres transport. An OpenCode database whose session/message/part/todo counts shrink, or a JSONL inventory whose files/bytes shrink, is uploaded as ordinary updates but is not allowed to emit tombstones until a complete stable snapshot is observed. The S3 transport emits no tombstones: S3 lifecycle policy owns retention and the VCC loader rebuilds from archives.
 
-Idle sources skip discovery while their path fingerprint (directory mtime, entry count, and newest child mtime) is unchanged, bounded by `sync.rescan_interval_ms` (default 60 seconds) because the fingerprint only covers direct children and cannot see appends to existing deep session files. `sync run --once` bypasses the skip entirely so a single pass always inspects every source. Codex thread hierarchy is extracted by the session-center VCC loader for S3 archives. The local `sync backfill-hierarchy` command remains a legacy-Postgres maintenance operation and refuses configured S3 transports.
+For S3, every poll performs a metadata-only JSONL walk (regular files are `stat`ed but unchanged bytes are not opened); only new/changed files are hashed and uploaded. The safe defaults are a 30-second `sync.poll_interval_ms` and a 5-minute `sync.rescan_interval_ms` full-content validation, so same-size rewrites and coarse timestamp files are caught without hashing the corpus continuously. Duplicate configured roots are scanned once, preferring the first source entry. A file or source failure is persisted and retried `sync.failure_retry_attempts` times (default 3) at `sync.failure_retry_interval_ms` (default 5 minutes); after exhaustion that exact version is left alone until its metadata changes or an explicit `sync run --once` clears the retry state. `sync run --once` bypasses scan and retry skips entirely. Codex thread hierarchy is extracted by the session-center VCC loader for S3 archives. The local `sync backfill-hierarchy` command remains a legacy-Postgres maintenance operation and refuses configured S3 transports.
 
 Use `better-compact sync setup --url-stdin` to configure a server without putting the session-center URL or bearer token in shell history:
 
@@ -169,10 +169,9 @@ Example source configuration:
 ```json
 {
   "version": 1,
-  "sync": { "enabled": true, "transport": "s3", "s3_url_env": "SESSION_CENTER_URL", "s3_token_env": "S3_SYNC_TOKEN", "allow_insecure_remote": false },
+  "sync": { "enabled": true, "transport": "s3", "s3_url_env": "SESSION_CENTER_URL", "s3_token_env": "S3_SYNC_TOKEN", "allow_insecure_remote": false, "poll_interval_ms": 30000, "rescan_interval_ms": 300000, "failure_retry_attempts": 3, "failure_retry_interval_ms": 300000 },
   "sources": [
     { "kind": "codex-jsonl", "database": "~/.codex/sessions" },
-    { "kind": "codex-jsonl-sessions", "database": "~/.codex/sessions" },
     { "kind": "pi-jsonl", "database": "~/.pi/agent/sessions" }
   ],
   "installation": { "name": "workstation" }

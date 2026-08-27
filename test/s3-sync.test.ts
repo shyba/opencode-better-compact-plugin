@@ -2,7 +2,7 @@ import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { describe, expect, test } from "bun:test"
-import { discoverS3JsonlFiles, hashS3File, planS3Upload, s3FileID, uploadS3File, validateS3Endpoint } from "../src/s3-sync.js"
+import { discoverS3JsonlFiles, discoverS3JsonlSnapshot, hashS3File, planS3Upload, s3FileID, uploadS3File, validateS3Endpoint } from "../src/s3-sync.js"
 
 describe("session-center S3 source transport", () => {
   test("discovers only regular JSONL files and preserves relative ordering", async () => {
@@ -14,6 +14,10 @@ describe("session-center S3 source transport", () => {
       await writeFile(path.join(root, "notes.txt"), "do not archive\n")
       await symlink(path.join(root, "z.jsonl"), path.join(root, "nested", "link.jsonl"))
       expect((await discoverS3JsonlFiles(root)).map((file) => path.relative(root, file))).toEqual(["nested/a.jsonl", "z.jsonl"])
+      expect((await discoverS3JsonlSnapshot(root)).files).toEqual([
+        expect.objectContaining({ sourcePath: "nested/a.jsonl", size: 2 }),
+        expect.objectContaining({ sourcePath: "z.jsonl", size: 2 }),
+      ])
     } finally {
       await rm(root, { recursive: true, force: true })
     }

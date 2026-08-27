@@ -209,4 +209,46 @@ describe("portable better-compact state", () => {
     expect(state.shouldSkipSource("source-1", 9999, 100, 200, undefined, Date.now() + 10 * 3_600_000)).toBe(true)
     state.close()
   })
+
+  test("tracks the S3 full-scan interval separately from metadata scans", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "better-compact-state-"))
+    temporary.push(directory)
+    const state = await openSyncState(path.join(directory, "state.sqlite"))
+    state.ensureInstallation("installation-1", "incarnation-1")
+    state.upsertSource({ id: "source-1", installationID: "installation-1", kind: "codex-jsonl", schemaVersion: 1, locator: "/sessions", incarnation: "source-incarnation-1" })
+
+    expect(state.s3FullScanDue("source-1", 1_000, 10_000)).toBe(true)
+    state.recordS3SourceComplete("source-1", 1, 2, 3, true, 10_000)
+    expect(state.s3FullScanDue("source-1", 1_000, 10_999)).toBe(false)
+    expect(state.s3FullScanDue("source-1", 1_000, 11_000)).toBe(true)
+
+    // A metadata-only pass updates the ordinary completion timestamp but does
+    // not postpone the next deep/hash validation.
+    state.recordS3SourceComplete("source-1", 2, 2, 3, false, 11_100)
+    expect(state.s3FullScanDue("source-1", 1_000, 11_500)).toBe(true)
+    state.close()
+  })
+
+  test("spaces S3 failures and stops after the configured attempt budget", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "better-compact-state-"))
+    temporary.push(directory)
+    const state = await openSyncState(path.join(directory, "state.sqlite"))
+    state.ensureInstallation("installation-1", "incarnation-1")
+    state.upsertSource({ id: "source-1", installationID: "installation-1", kind: "codex-jsonl", schemaVersion: 1, locator: "/sessions", incarnation: "source-incarnation-1" })
+    const version = { size: 10, mtimeMs: 20 }
+
+    expect(state.recordS3Failure("source-1", "sessions/a.jsonl", version, "first", 3, 1_000, 100)).toEqual({ attemptCount: 1, nextAttemptAt: 1_100, exhausted: false })
+    expect(state.s3FailureDue("source-1", "sessions/a.jsonl", 1_099)).toBe(false)
+    expect(state.s3FailureDue("source-1", "sessions/a.jsonl", 1_100)).toBe(true)
+    expect(state.recordS3Failure("source-1", "sessions/a.jsonl", version, "second", 3, 1_000, 1_100)).toEqual({ attemptCount: 2, nextAttemptAt: 2_100, exhausted: false })
+    expect(state.recordS3Failure("source-1", "sessions/a.jsonl", version, "third", 3, 1_000, 2_100)).toEqual({ attemptCount: 3, nextAttemptAt: Number.MAX_SAFE_INTEGER, exhausted: true })
+    expect(state.s3FailureDue("source-1", "sessions/a.jsonl", Number.MAX_SAFE_INTEGER)).toBe(false)
+
+    // A changed file version starts a fresh series; a forced caller can also
+    // clear the row before retrying without waiting for a stale timer.
+    expect(state.recordS3Failure("source-1", "sessions/a.jsonl", { size: 11, mtimeMs: 21 }, "new version", 3, 1_000, 3_000)).toMatchObject({ attemptCount: 1, exhausted: false, nextAttemptAt: 4_000 })
+    state.clearS3Failure("source-1", "sessions/a.jsonl")
+    expect(state.s3Failure("source-1", "sessions/a.jsonl")).toBeUndefined()
+    state.close()
+  })
 })

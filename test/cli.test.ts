@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
+import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises"
 import { createHash } from "node:crypto"
 import os from "node:os"
 import path from "node:path"
@@ -247,6 +247,127 @@ describe("better-compact sync run --once", () => {
     const keys = db.query("select natural_key from normalized_record where record_kind='message' order by natural_key").all().map((row) => String((row as { natural_key: string }).natural_key))
     db.close()
     expect(keys).toContain("2026/08/14/rollout-once.jsonl|line:1")
+  })
+})
+
+describe("better-compact S3 sync scanning", () => {
+  test("deduplicates roots, skips unchanged files, sends appends, and catches same-size rewrites on a full scan", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "better-compact-cli-"))
+    temporary.push(root)
+    const sessions = path.join(root, "sessions", "2026", "08", "14")
+    await mkdir(sessions, { recursive: true })
+    const filename = path.join(sessions, "session.jsonl")
+    await writeFile(filename, "one\n")
+    const requests: Array<{ full: string | null; body: string }> = []
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        requests.push({ full: request.headers.get("x-vcc-full"), body: await request.text() })
+        return new Response(null, { status: 204, headers: { "x-sha256": "remote-digest" } })
+      },
+    })
+    try {
+      const config = path.join(root, "config.json")
+      const state = path.join(root, "state.sqlite")
+      await writeFile(config, JSON.stringify({
+        version: 1,
+        sync: { enabled: true, transport: "s3", rescan_interval_ms: 60_000 },
+        sources: [
+          { kind: "codex-jsonl", database: path.join(root, "sessions") },
+          { kind: "codex-jsonl-sessions", database: path.join(root, "sessions") },
+        ],
+      }))
+      const environment = {
+        HOME: root,
+        BETTER_COMPACT_CONFIG: config,
+        BETTER_COMPACT_STATE: state,
+        SESSION_CENTER_URL: `http://127.0.0.1:${server.port}`,
+        S3_SYNC_TOKEN: "token-token-token",
+      }
+
+      expect((await runCLI(["sync", "run", "--pass"], environment)).exitCode).toBe(0)
+      expect(requests).toHaveLength(1)
+      expect(requests[0]).toEqual({ full: "true", body: "one\n" })
+
+      expect((await runCLI(["sync", "run", "--pass"], environment)).exitCode).toBe(0)
+      expect(requests).toHaveLength(1)
+
+      await appendFile(filename, "two\n")
+      expect((await runCLI(["sync", "run", "--pass"], environment)).exitCode).toBe(0)
+      expect(requests).toHaveLength(2)
+      expect(requests[1]).toEqual({ full: null, body: "two\n" })
+
+      const beforeRewrite = await stat(filename)
+      await writeFile(filename, "replace\n")
+      await utimes(filename, beforeRewrite.atime, beforeRewrite.mtime)
+      const db = new Database(state)
+      db.query("update source_scan set last_full_scan_at=0").run()
+      db.close()
+
+      expect((await runCLI(["sync", "run", "--pass"], environment)).exitCode).toBe(0)
+      expect(requests).toHaveLength(3)
+      expect(requests[2]).toEqual({ full: "true", body: "replace\n" })
+
+      const readonly = new Database(state, { readonly: true })
+      const sourceKinds = readonly.query("select kind from source").all().map((row) => String((row as { kind: string }).kind))
+      const files = Number((readonly.query("select count(*) as value from s3_file").get() as { value: number }).value)
+      readonly.close()
+      expect(sourceKinds).toEqual(["codex-jsonl"])
+      expect(files).toBe(1)
+    } finally {
+      server.stop(true)
+    }
+  })
+
+  test("spaces transient S3 failures and stops after exhaustion", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "better-compact-cli-"))
+    temporary.push(root)
+    const sessions = path.join(root, "sessions")
+    await mkdir(sessions, { recursive: true })
+    await writeFile(path.join(sessions, "session.jsonl"), "session\n")
+    let requests = 0
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        requests++
+        await request.arrayBuffer()
+        return new Response("temporary", { status: 503 })
+      },
+    })
+    try {
+      const config = path.join(root, "config.json")
+      const state = path.join(root, "state.sqlite")
+      await writeFile(config, JSON.stringify({
+        version: 1,
+        sync: { enabled: true, transport: "s3", failure_retry_attempts: 2, failure_retry_interval_ms: 60_000 },
+        sources: [{ kind: "codex-jsonl", database: sessions }],
+      }))
+      const environment = {
+        HOME: root,
+        BETTER_COMPACT_CONFIG: config,
+        BETTER_COMPACT_STATE: state,
+        SESSION_CENTER_URL: `http://127.0.0.1:${server.port}`,
+        S3_SYNC_TOKEN: "token-token-token",
+      }
+
+      expect((await runCLI(["sync", "run", "--pass"], environment)).exitCode).toBe(1)
+      expect(requests).toBe(1)
+      expect((await runCLI(["sync", "run", "--pass"], environment)).exitCode).toBe(1)
+      expect(requests).toBe(1)
+
+      const db = new Database(state)
+      db.query("update s3_failure set next_attempt_at=0").run()
+      db.close()
+      const exhausted = await runCLI(["sync", "run", "--pass"], environment)
+      expect(exhausted.exitCode).toBe(1)
+      expect(requests).toBe(2)
+      expect(exhausted.stderr).toContain("no automatic retry for this file version")
+      expect(exhausted.stderr).not.toContain("Invalid time value")
+      expect((await runCLI(["sync", "run", "--pass"], environment)).exitCode).toBe(1)
+      expect(requests).toBe(2)
+    } finally {
+      server.stop(true)
+    }
   })
 })
 

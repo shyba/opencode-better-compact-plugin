@@ -23,6 +23,18 @@ export type S3Upload = {
   signal?: AbortSignal
 }
 
+export type S3DiscoveredFile = {
+  filename: string
+  sourcePath: string
+  size: number
+  mtimeMs: number
+}
+
+export type S3SourceSnapshot = {
+  rootMtimeMs: number
+  files: S3DiscoveredFile[]
+}
+
 export type S3UploadPlan =
   | { action: "skip"; version: S3FileVersion }
   | { action: "upload"; version: S3FileVersion; fileID: string; start: number; full: boolean }
@@ -44,10 +56,22 @@ export function planS3Upload(sourcePath: string, metadata: { size: number; mtime
  *  the relative path, so symlinks and non-JSONL artifacts are intentionally
  *  ignored rather than accidentally archiving credentials or databases. */
 export async function discoverS3JsonlFiles(root: string): Promise<string[]> {
+  return (await discoverS3JsonlSnapshot(root)).files.map((file) => file.filename)
+}
+
+/** Walk JSONL sources once and retain the metadata needed by the incremental
+ * scanner. Stat results are collected during discovery so an unchanged file
+ * can be skipped without opening it for hashing. */
+export async function discoverS3JsonlSnapshot(root: string): Promise<S3SourceSnapshot> {
   const metadata = await stat(root)
-  if (metadata.isFile()) return root.endsWith(".jsonl") ? [root] : []
-  if (!metadata.isDirectory()) return []
-  const files: string[] = []
+  if (metadata.isFile()) {
+    return {
+      rootMtimeMs: metadata.mtimeMs,
+      files: root.endsWith(".jsonl") ? [{ filename: root, sourcePath: path.basename(root), size: metadata.size, mtimeMs: metadata.mtimeMs }] : [],
+    }
+  }
+  if (!metadata.isDirectory()) return { rootMtimeMs: metadata.mtimeMs, files: [] }
+  const files: S3DiscoveredFile[] = []
   async function walk(directory: string): Promise<void> {
     const entries = await readdir(directory, { withFileTypes: true })
     entries.sort((left, right) => left.name.localeCompare(right.name))
@@ -57,11 +81,14 @@ export async function discoverS3JsonlFiles(root: string): Promise<string[]> {
         await walk(filename)
         continue
       }
-      if (entry.isFile() && entry.name.endsWith(".jsonl")) files.push(filename)
+      if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue
+      const fileMetadata = await stat(filename)
+      files.push({ filename, sourcePath: path.relative(root, filename).split(path.sep).join("/"), size: fileMetadata.size, mtimeMs: fileMetadata.mtimeMs })
     }
   }
   await walk(root)
-  return files
+  files.sort((left, right) => left.sourcePath.localeCompare(right.sourcePath))
+  return { rootMtimeMs: metadata.mtimeMs, files }
 }
 
 export async function hashS3File(filename: string): Promise<string> {
