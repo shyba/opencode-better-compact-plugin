@@ -75,8 +75,9 @@ if (command === "sync") {
   if (action === "prune") process.exit(await syncPrune(process.argv.includes("--yes"), process.argv.includes("--missing-directories"), process.argv.includes("--blank-directories")))
   if (action === "compact") process.exit(await syncCompact(process.argv.includes("--yes")))
   if (action === "reconcile") process.exit(await syncReconcile())
+  if (action === "retry-s3") process.exit(await syncRetryS3())
   if (action === "backfill-hierarchy") process.exit(await syncBackfillHierarchy(process.argv.includes("--dry-run")))
-  console.error("Usage: better-compact sync setup [--url URL|--url-stdin] [--token TOKEN|--token-stdin] [--allow-insecure-remote] [--install] | run [--once] | status | migrate | install | uninstall | prune (--missing-directories|--blank-directories) --yes | compact --yes | reconcile | backfill-hierarchy [--dry-run]")
+  console.error("Usage: better-compact sync setup [--url URL|--url-stdin] [--token TOKEN|--token-stdin] [--allow-insecure-remote] [--install] | run [--once] | status | migrate | install | uninstall | prune (--missing-directories|--blank-directories) --yes | compact --yes | reconcile | retry-s3 --kind KIND --path PATH [--root ROOT] | backfill-hierarchy [--dry-run]")
   process.exit(2)
 }
 if (command === "rag") {
@@ -112,6 +113,8 @@ Usage:
   better-compact sync prune (--missing-directories|--blank-directories) --yes Delete local Codex files while retaining remote rows
   better-compact sync compact --yes  Remove acknowledged local cache rows and compact SQLite
   better-compact sync reconcile    Force the next OpenCode source pass to rebuild a complete snapshot
+  better-compact sync retry-s3 --kind KIND --path PATH [--root ROOT]
+                                   Clear one failed S3 archive retry row without resetting checkpoints
   better-compact sync backfill-hierarchy [--dry-run]
                                    Re-read local Codex session headers and stage hierarchy metadata
                                    (parent session, depth, nickname) for already-mirrored sessions
@@ -302,13 +305,7 @@ async function sqliteProbe(filename: string) {
   } catch { return false }
 }
 
-async function syncRun(once: boolean, singlePass = false) {
-  const config = await loadConfig(paths)
-  if (!config.sync.enabled) {
-    console.log("sync disabled; set sync.enabled=true in the better-compact config")
-    return 0
-  }
-  const remoteConfigured = config.sync.transport === "s3" ? Boolean(s3EndpointFor(config) && s3TokenFor(config)) : Boolean(databaseURLFor(config))
+async function acquireSyncLock(action: string): Promise<{ release: () => Promise<void> } | undefined> {
   const lock = `${paths.state}.lock`
   await mkdir(path.dirname(lock), { recursive: true, mode: 0o700 })
   try {
@@ -316,18 +313,33 @@ async function syncRun(once: boolean, singlePass = false) {
   } catch {
     let lockPID = ""
     try { lockPID = (await readFile(path.join(lock, "pid"), "utf8")).trim() } catch {}
-    let running = false
-    if (lockPID && /^\d+$/.test(lockPID)) {
-      try { process.kill(Number(lockPID), 0); running = true } catch {}
+    // A missing PID may belong to a process between mkdir and writeFile.
+    // Refuse an indeterminate lock rather than deleting another writer's lock.
+    let active = !/^\d+$/.test(lockPID) || Number(lockPID) <= 0
+    if (!active) {
+      try { process.kill(Number(lockPID), 0); active = true }
+      catch (error) { active = !(error instanceof Error && "code" in error && error.code === "ESRCH") }
     }
-    if (running) {
-      console.error(`sync is already running; lock exists at ${lock}`)
-      return 1
+    if (active) {
+      console.error(`sync lock is active or indeterminate; stop better-compact-sync.service before ${action}`)
+      return undefined
     }
     await rm(lock, { recursive: true, force: true })
     await mkdir(lock, { recursive: false, mode: 0o700 })
   }
   await writeFile(path.join(lock, "pid"), `${process.pid}\n`, { mode: 0o600 })
+  return { release: () => rm(lock, { recursive: true, force: true }) }
+}
+
+async function syncRun(once: boolean, singlePass = false) {
+  const config = await loadConfig(paths)
+  if (!config.sync.enabled) {
+    console.log("sync disabled; set sync.enabled=true in the better-compact config")
+    return 0
+  }
+  const remoteConfigured = config.sync.transport === "s3" ? Boolean(s3EndpointFor(config) && s3TokenFor(config)) : Boolean(databaseURLFor(config))
+  const lock = await acquireSyncLock("running sync")
+  if (!lock) return 1
   let stopping = false
   const controller = new AbortController()
   const stop = () => { stopping = true; controller.abort() }
@@ -351,7 +363,7 @@ async function syncRun(once: boolean, singlePass = false) {
   } finally {
     process.off("SIGTERM", stop)
     process.off("SIGINT", stop)
-    await rm(lock, { recursive: true, force: true })
+    await lock.release()
   }
 }
 
@@ -375,6 +387,42 @@ async function syncReconcile() {
     console.log(`scheduled ${changed} OpenCode source${changed === 1 ? "" : "s"} for a complete reconcile`)
     return 0
   } finally { state.close() }
+}
+
+async function syncRetryS3() {
+  const kind = flagValue("--kind")
+  const rawPath = flagValue("--path")
+  const rootOverride = flagValue("--root")
+  if (!kind || !rawPath || kind.startsWith("--") || rawPath.startsWith("--") || rootOverride?.startsWith("--")) {
+    console.error("Usage: better-compact sync retry-s3 --kind KIND --path PATH [--root ROOT]")
+    return 2
+  }
+  if (kind !== "codex-jsonl" && kind !== "codex-jsonl-sessions" && kind !== "pi-jsonl") {
+    console.error("sync retry-s3 supports codex-jsonl, codex-jsonl-sessions, and pi-jsonl")
+    return 2
+  }
+  const lock = await acquireSyncLock("clearing a targeted S3 retry")
+  if (!lock) return 2
+  try {
+    const config = await loadConfig(paths)
+    if (config.sync.transport !== "s3") { console.error("sync retry-s3 is only for S3 transport"); return 2 }
+    const candidates = config.sources.filter((source) => source.kind === kind && (!rootOverride || path.resolve(source.database.replace(/^~(?=\/|$)/, process.env.HOME ?? ".")) === path.resolve(rootOverride.replace(/^~(?=\/|$)/, process.env.HOME ?? "."))))
+    if (candidates.length !== 1) {
+      console.error(candidates.length === 0 ? "no matching S3 source is configured" : "multiple matching S3 sources; pass --root to select one")
+      return 2
+    }
+    const root = path.resolve(candidates[0]!.database.replace(/^~(?=\/|$)/, process.env.HOME ?? "."))
+    const sourceID = createHash("sha256").update(`${kind}\n${root}`).digest("hex").slice(0, 32)
+    const failurePath = rawPath === "__source__" ? s3SourceFailurePath : rawPath
+    const state = await openSyncState(paths.state)
+    try {
+      const failure = state.s3Failure(sourceID, failurePath)
+      if (!failure) { console.log(`no S3 retry failure recorded for ${kind}/${rawPath}`); return 0 }
+      state.clearS3FailureWithAudit(sourceID, failurePath, "retry-s3")
+      console.log(`cleared S3 retry failure for ${kind}/${rawPath}; next sync pass will retry without resetting checkpoints`)
+      return 0
+    } finally { state.close() }
+  } finally { await lock.release() }
 }
 
 /** Re-read local Codex session headers and stage updated session records so
@@ -629,10 +677,12 @@ async function syncS3Pass(config: Awaited<ReturnType<typeof loadConfig>>, signal
         if (rootChanged) state.clearS3Failure(sourceID, s3SourceFailurePath)
         if (!rootChanged && !state.s3FailureDue(sourceID, s3SourceFailurePath)) {
           failed = true
+          console.error(`warning: S3 sync source ${source.kind} at ${root} has a deferred ${sourceFailure.exhausted ? "exhausted" : "retry"} failure (attempt ${sourceFailure.attemptCount}/${config.sync.failure_retry_attempts}); ${sourceFailure.exhausted ? "run better-compact sync retry-s3 for this source version" : `next retry after ${new Date(sourceFailure.nextAttemptAt).toISOString()}`}`)
           continue
         }
       }
       let uploaded = 0
+      let deferredFailures = 0
       let sourceComplete = true
       let fullScanComplete = true
       let failureRecorded = false
@@ -650,6 +700,8 @@ async function syncS3Pass(config: Awaited<ReturnType<typeof loadConfig>>, signal
               failed = true
               sourceComplete = false
               fullScanComplete = false
+              deferredFailures++
+              console.error(`warning: S3 file ${source.kind}/${file.sourcePath} has a deferred ${failure.exhausted ? "exhausted" : "retry"} failure (attempt ${failure.attemptCount}/${config.sync.failure_retry_attempts}); ${failure.exhausted ? "run better-compact sync retry-s3 for this file version" : `next retry after ${new Date(failure.nextAttemptAt).toISOString()}`}`)
               continue
             }
             state.clearS3Failure(sourceID, file.sourcePath)
@@ -682,10 +734,13 @@ async function syncS3Pass(config: Awaited<ReturnType<typeof loadConfig>>, signal
             break
           }
         }
-        if (!signal?.aborted && sourceComplete) {
-          state.recordS3SourceComplete(sourceID, snapshot.rootMtimeMs, snapshot.files.length, Math.max(0, ...snapshot.files.map((file) => file.mtimeMs)), fullScan && fullScanComplete)
-          state.clearS3Failure(sourceID, s3SourceFailurePath)
-          console.log(`uploaded ${uploaded} changed JSONL file${uploaded === 1 ? "" : "s"} from ${root}`)
+        if (!signal?.aborted && (sourceComplete || uploaded > 0 || deferredFailures > 0)) {
+          if (sourceComplete) {
+            state.recordS3SourceComplete(sourceID, snapshot.rootMtimeMs, snapshot.files.length, Math.max(0, ...snapshot.files.map((file) => file.mtimeMs)), fullScan && fullScanComplete)
+            state.clearS3Failure(sourceID, s3SourceFailurePath)
+          }
+          const incomplete = sourceComplete ? "" : ` (${deferredFailures} deferred failure${deferredFailures === 1 ? "" : "s"}; source incomplete)`
+          console.log(`uploaded ${uploaded} changed JSONL file${uploaded === 1 ? "" : "s"} from ${root}${incomplete}`)
         }
       } catch (error) {
         if (signal?.aborted) break

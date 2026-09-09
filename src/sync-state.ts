@@ -50,6 +50,7 @@ export class SyncState {
       create table if not exists s3_file (source_id text not null references source(id) on delete cascade, path text not null, file_id text not null, size integer not null, mtime_ms real not null, sha256 text not null, updated_at integer not null, primary key (source_id, path));
       create table if not exists s3_failure (source_id text not null references source(id) on delete cascade, path text not null, size integer not null, mtime_ms real not null, attempt_count integer not null default 0, next_attempt_at integer not null, exhausted integer not null default 0, last_error text, updated_at integer not null, primary key (source_id, path));
       create index if not exists s3_failure_due_idx on s3_failure(next_attempt_at);
+      create table if not exists s3_failure_audit (id integer primary key, source_id text not null references source(id) on delete cascade, path text not null, size integer not null, mtime_ms real not null, attempt_count integer not null, next_attempt_at integer not null, exhausted integer not null, last_error text, failure_updated_at integer not null, cleared_at integer not null, cleared_by text not null);
     `)
     this.db.query("insert or ignore into schema_migration(version, applied_at) values (1, ?)").run(Date.now())
     this.applyLocalMigrations()
@@ -86,6 +87,8 @@ export class SyncState {
     this.db.query("insert or ignore into schema_migration(version, applied_at) values (13, ?)").run(Date.now())
     this.db.exec("create table if not exists s3_failure (source_id text not null references source(id) on delete cascade, path text not null, size integer not null, mtime_ms real not null, attempt_count integer not null default 0, next_attempt_at integer not null, exhausted integer not null default 0, last_error text, updated_at integer not null, primary key (source_id, path)); create index if not exists s3_failure_due_idx on s3_failure(next_attempt_at)")
     this.db.query("insert or ignore into schema_migration(version, applied_at) values (14, ?)").run(Date.now())
+    this.db.exec("create table if not exists s3_failure_audit (id integer primary key, source_id text not null references source(id) on delete cascade, path text not null, size integer not null, mtime_ms real not null, attempt_count integer not null, next_attempt_at integer not null, exhausted integer not null, last_error text, failure_updated_at integer not null, cleared_at integer not null, cleared_by text not null)")
+    this.db.query("insert or ignore into schema_migration(version, applied_at) values (15, ?)").run(Date.now())
     this.db.exec("update source set local_revision=max(local_revision, coalesce((select max(record_revision) from normalized_record where normalized_record.source_id=source.id), 0))")
   }
 
@@ -267,6 +270,18 @@ export class SyncState {
 
   clearS3Failure(sourceID: string, filePath: string): void {
     this.db.query("delete from s3_failure where source_id=? and path=?").run(sourceID, filePath)
+  }
+
+  clearS3FailureWithAudit(sourceID: string, filePath: string, clearedBy: string, now = Date.now()): boolean {
+    const transaction = this.db.transaction(() => {
+      const row = this.db.query("select size, mtime_ms, attempt_count, next_attempt_at, exhausted, last_error, updated_at from s3_failure where source_id=? and path=?").get(sourceID, filePath) as { size: number; mtime_ms: number; attempt_count: number; next_attempt_at: number; exhausted: number; last_error?: string; updated_at: number } | null
+      if (!row) return false
+      this.db.query(`insert into s3_failure_audit(source_id, path, size, mtime_ms, attempt_count, next_attempt_at, exhausted, last_error, failure_updated_at, cleared_at, cleared_by)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(sourceID, filePath, row.size, row.mtime_ms, row.attempt_count, row.next_attempt_at, row.exhausted, row.last_error ?? null, row.updated_at, now, clearedBy)
+      this.db.query("delete from s3_failure where source_id=? and path=?").run(sourceID, filePath)
+      return true
+    })
+    return transaction()
   }
 
   hierarchyBackfillSHA(sourceID: string, path: string): string | undefined {

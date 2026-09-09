@@ -205,7 +205,9 @@ async function fakePi(root: string) {
 }
 
 async function runCLI(args: string[], overrides: Record<string, string>, input?: string) {
-  const child = Bun.spawn([process.execPath, path.join(process.cwd(), "scripts/cli.ts"), ...args], {
+  const preloadIndex = args.indexOf("--preload")
+  const command = preloadIndex === 0 ? [process.execPath, "--preload", args[1]!, path.join(process.cwd(), "scripts/cli.ts"), ...args.slice(2)] : [process.execPath, path.join(process.cwd(), "scripts/cli.ts"), ...args]
+  const child = Bun.spawn(command, {
     cwd: process.cwd(),
     env: { ...process.env, ...overrides },
     ...(input === undefined ? {} : { stdin: new Blob([input]) }),
@@ -369,6 +371,120 @@ describe("better-compact S3 sync scanning", () => {
       server.stop(true)
     }
   })
+
+  test("reports deferred S3 file failures while continuing other files in the source", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "better-compact-cli-"))
+    temporary.push(root)
+    const sessions = path.join(root, "sessions")
+    const pi = path.join(root, "pi")
+    await mkdir(sessions, { recursive: true })
+    await mkdir(pi, { recursive: true })
+    const failedPath = "a-exhausted.jsonl"
+    const goodPath = "b-new.jsonl"
+    await writeFile(path.join(sessions, failedPath), "failed\n")
+    await writeFile(path.join(sessions, goodPath), "good\n")
+    const failedMetadata = await stat(path.join(sessions, failedPath))
+    const uploadLog = path.join(root, "uploads.jsonl")
+    const preload = path.join(root, "mock-fetch.mjs")
+    await writeFile(preload, `
+globalThis.fetch = async (_url, init = {}) => {
+  const headers = init.headers;
+  const sourcePath = headers?.["x-vcc-path"] ?? headers?.get?.("x-vcc-path") ?? "";
+  await Bun.write(Bun.file(${JSON.stringify(uploadLog)}), sourcePath + "\\n", { append: true });
+  const body = init.body;
+  if (body && typeof body.getReader === "function") {
+    const reader = body.getReader();
+    for (;;) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+  }
+  return new Response(null, { status: 204, headers: { "x-sha256": "remote-digest" } });
+};
+`)
+    const config = path.join(root, "config.json")
+    const state = path.join(root, "state.sqlite")
+    await writeFile(config, JSON.stringify({
+      version: 1,
+      sync: { enabled: true, transport: "s3", failure_retry_attempts: 3, failure_retry_interval_ms: 60_000 },
+      sources: [
+        { kind: "codex-jsonl", database: sessions },
+        { kind: "pi-jsonl", database: pi },
+      ],
+    }))
+    const sourceID = createHash("sha256").update(`codex-jsonl\n${path.resolve(sessions)}`).digest("hex").slice(0, 32)
+    const store = await openSyncState(state)
+    store.ensureInstallation("installation-1", "incarnation-1")
+    store.upsertSource({ id: sourceID, installationID: "installation-1", kind: "codex-jsonl", schemaVersion: 1, locator: sessions, incarnation: "source-incarnation-1" })
+    store.recordS3Failure(sourceID, failedPath, { size: failedMetadata.size, mtimeMs: failedMetadata.mtimeMs }, "old failure", 3, 60_000)
+    const db = new Database(state)
+    db.query("update s3_failure set attempt_count=3, exhausted=1, next_attempt_at=? where source_id=? and path=?").run(Number.MAX_SAFE_INTEGER, sourceID, failedPath)
+    db.close()
+    store.close()
+
+    const result = await runCLI(["--preload", preload, "sync", "run", "--pass"], {
+      HOME: root,
+      BETTER_COMPACT_CONFIG: config,
+      BETTER_COMPACT_STATE: state,
+      SESSION_CENTER_URL: "http://127.0.0.1:9",
+      S3_SYNC_TOKEN: "token-token-token",
+    })
+
+    const uploaded = (await readFile(uploadLog, "utf8")).trim().split(/\r?\n/)
+    expect(result.exitCode).toBe(1)
+    expect(uploaded).toEqual([goodPath])
+    expect(result.stderr).toContain(`warning: S3 file codex-jsonl/${failedPath} has a deferred exhausted failure`)
+    expect(result.stderr).toContain("run better-compact sync retry-s3 for this file version")
+    expect(result.stdout).toContain(`uploaded 1 changed JSONL file from ${sessions} (1 deferred failure; source incomplete)`)
+    expect(result.stdout).toContain(`uploaded 0 changed JSONL files from ${pi}`)
+  })
+
+  test("clears one targeted S3 retry failure without resetting checkpoints", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "better-compact-cli-"))
+    temporary.push(root)
+    const sessions = path.join(root, "sessions")
+    await mkdir(sessions, { recursive: true })
+    const state = path.join(root, "state.sqlite")
+    const config = path.join(root, "config.json")
+    await writeFile(config, JSON.stringify({ version: 1, sync: { enabled: true, transport: "s3" }, sources: [{ kind: "codex-jsonl", database: sessions }] }))
+    const sourceID = createHash("sha256").update(`codex-jsonl\n${path.resolve(sessions)}`).digest("hex").slice(0, 32)
+    const store = await openSyncState(state)
+    store.ensureInstallation("installation-1", "incarnation-1")
+    store.upsertSource({ id: sourceID, installationID: "installation-1", kind: "codex-jsonl", schemaVersion: 1, locator: sessions, incarnation: "source-incarnation-1" })
+    store.enqueue([], sourceID, "messages", { preserved: true })
+    store.recordS3File(sourceID, "acked.jsonl", { fileID: "file-1", size: 10, mtimeMs: 20, sha256: "sha-1" })
+    store.recordS3Failure(sourceID, "target.jsonl", { size: 1, mtimeMs: 2 }, "old failure", 1, 60_000)
+    store.recordS3Failure(sourceID, "other.jsonl", { size: 1, mtimeMs: 2 }, "old failure", 1, 60_000)
+    store.close()
+
+    await mkdir(`${state}.lock`)
+    for (const pid of [undefined, String(process.pid)]) {
+      if (pid) await writeFile(path.join(`${state}.lock`, "pid"), pid)
+      const blocked = await runCLI(["sync", "retry-s3", "--kind", "codex-jsonl", "--path", "target.jsonl"], { HOME: root, BETTER_COMPACT_CONFIG: config, BETTER_COMPACT_STATE: state })
+      expect(blocked.exitCode).toBe(2)
+      expect(blocked.stderr).toContain("lock is active or indeterminate")
+      const lockedState = new Database(state, { readonly: true })
+      expect((lockedState.query("select count(*) as n from s3_failure").get() as { n: number }).n).toBe(2)
+      lockedState.close()
+    }
+    await rm(`${state}.lock`, { recursive: true })
+    const result = await runCLI(["sync", "retry-s3", "--kind", "codex-jsonl", "--path", "target.jsonl"], { HOME: root, BETTER_COMPACT_CONFIG: config, BETTER_COMPACT_STATE: state })
+
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout).toContain("cleared S3 retry failure for codex-jsonl/target.jsonl")
+    const db = new Database(state, { readonly: true })
+    const failures = db.query("select path from s3_failure order by path").all().map((row) => String((row as { path: string }).path))
+    const audit = db.query("select path, attempt_count, exhausted, last_error, failure_updated_at, cleared_by from s3_failure_audit").get() as { path: string; attempt_count: number; exhausted: number; last_error: string; failure_updated_at: number; cleared_by: string }
+    const ack = db.query("select file_id, size, mtime_ms, sha256 from s3_file where source_id=? and path=?").get(sourceID, "acked.jsonl") as { file_id: string; size: number; mtime_ms: number; sha256: string }
+    const checkpoint = JSON.parse((db.query("select checkpoint_json from source_cursor where source_id=?").get(sourceID) as { checkpoint_json: string }).checkpoint_json)
+    db.close()
+    expect(failures).toEqual(["other.jsonl"])
+    expect(audit).toMatchObject({ path: "target.jsonl", attempt_count: 1, exhausted: 1, last_error: "old failure", cleared_by: "retry-s3" })
+    expect(Number.isSafeInteger(audit.failure_updated_at)).toBe(true)
+    expect(ack).toEqual({ file_id: "file-1", size: 10, mtime_ms: 20, sha256: "sha-1" })
+    expect(checkpoint).toEqual({ preserved: true })
+  })
+
 })
 
 describe("better-compact sync backfill-hierarchy", () => {
