@@ -20,6 +20,7 @@ export type S3Upload = {
   size: number
   start: number
   full: boolean
+  source?: { id: string; kind: string; locator: string }
   signal?: AbortSignal
 }
 
@@ -42,13 +43,19 @@ export type S3UploadPlan =
 /** Decide whether a source version is an append, a complete replacement, or
  *  already represented by the acknowledged bytes. A timestamp-only touch is
  *  intentionally a skip: it must not become an empty continuation frame. */
-export function planS3Upload(sourcePath: string, metadata: { size: number; mtimeMs: number }, sha256: string, previous?: S3FileVersion): S3UploadPlan {
+export function planS3Upload(sourcePath: string, metadata: { size: number; mtimeMs: number }, sha256: string, previous?: S3FileVersion, prefixSha256?: string, sourceID?: string): S3UploadPlan {
   if (previous && previous.size === metadata.size && previous.sha256 === sha256) {
     return { action: "skip", version: { ...previous, mtimeMs: metadata.mtimeMs } }
   }
-  const full = !previous || metadata.size < previous.size || (metadata.size === previous.size && previous.sha256 !== sha256)
+  // Growth alone does not prove append-only content: compaction or a rewrite
+  // can replace earlier bytes while making the file larger. Missing evidence
+  // deliberately falls back to a complete replacement.
+  const append = previous && (!sourceID || previous.fileID.startsWith("s2_")) && metadata.size > previous.size && prefixSha256 === previous.sha256
+  const full = !append
   const start = full ? 0 : Math.min(previous!.size, metadata.size)
-  const version = { fileID: s3FileID(sourcePath, metadata, sha256, start, full), size: metadata.size, mtimeMs: metadata.mtimeMs, sha256 }
+  const legacyID = s3FileID(sourcePath, metadata, sha256, start, full)
+  const fileID = sourceID ? "s2_" + createHash("sha256").update(`${sourceID}\n${legacyID}`).digest("hex").slice(0, 32) : legacyID
+  const version = { fileID, size: metadata.size, mtimeMs: metadata.mtimeMs, sha256 }
   return { action: "upload", version, fileID: version.fileID, start, full }
 }
 
@@ -97,6 +104,27 @@ export async function hashS3File(filename: string): Promise<string> {
   return hash.digest("hex")
 }
 
+/** Hash precisely the discovered version and its acknowledged prefix in one
+ * read. Bytes appended during hashing belong to the next pass. A shortened
+ * source cannot produce a receipt for the originally discovered size. */
+export async function hashS3FileSnapshot(filename: string, size: number, prefixSize?: number): Promise<{ sha256: string; prefixSha256?: string }> {
+  if (!Number.isSafeInteger(size) || size < 0) throw new Error("invalid S3 snapshot size")
+  if (prefixSize !== undefined && (!Number.isSafeInteger(prefixSize) || prefixSize < 0 || prefixSize > size)) throw new Error("invalid S3 prefix size")
+  const hash = createHash("sha256")
+  const prefixHash = prefixSize === undefined ? undefined : createHash("sha256")
+  let seen = 0
+  if (size > 0) {
+    for await (const value of createReadStream(filename, { start: 0, end: size - 1 })) {
+      const chunk = value as Buffer
+      hash.update(chunk)
+      if (prefixHash && seen < prefixSize!) prefixHash.update(chunk.subarray(0, Math.min(chunk.length, prefixSize! - seen)))
+      seen += chunk.length
+    }
+  }
+  if (seen !== size) throw new Error(`S3 source changed during hashing: expected ${size} bytes, read ${seen}`)
+  return { sha256: hash.digest("hex"), ...(prefixHash ? { prefixSha256: prefixHash.digest("hex") } : {}) }
+}
+
 /** Match session-center's version identity: an uploaded mtime/size version gets
  *  a fresh id, while replaying the same bytes is skipped or answered with 204. */
 export function s3FileID(sourcePath: string, metadata: { size: number; mtimeMs: number }, sha256: string, start: number, full: boolean): string {
@@ -120,6 +148,7 @@ export async function uploadS3File(input: S3Upload): Promise<{ status: number; s
       "content-length": String(size),
       "x-vcc-path": input.sourcePath,
       "x-vcc-start": String(input.start),
+      ...(input.source ? { "x-vcc-source-id": input.source.id, "x-vcc-source-kind": input.source.kind, "x-vcc-source-locator": input.source.locator } : {}),
       ...(input.full ? { "x-vcc-full": "true" } : {}),
     },
     body,

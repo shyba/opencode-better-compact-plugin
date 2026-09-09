@@ -50,7 +50,9 @@
     "scripts/rag_worker.py",
     "db/migrations",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "scripts/cli-help.ts",
+    "scripts/sync-verify.ts"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit && tsc -p tsconfig.scripts.json",

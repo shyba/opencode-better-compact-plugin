@@ -2,7 +2,7 @@ import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { describe, expect, test } from "bun:test"
-import { discoverS3JsonlFiles, discoverS3JsonlSnapshot, hashS3File, planS3Upload, s3FileID, uploadS3File, validateS3Endpoint } from "../src/s3-sync.js"
+import { discoverS3JsonlFiles, discoverS3JsonlSnapshot, hashS3File, hashS3FileSnapshot, planS3Upload, s3FileID, uploadS3File, validateS3Endpoint } from "../src/s3-sync.js"
 
 describe("session-center S3 source transport", () => {
   test("discovers only regular JSONL files and preserves relative ordering", async () => {
@@ -43,9 +43,46 @@ describe("session-center S3 source transport", () => {
       action: "skip",
       version: { ...previous, mtimeMs: 20 },
     })
-    expect(planS3Upload("session.jsonl", { size: 14, mtimeMs: 20 }, "b", previous)).toMatchObject({ action: "upload", start: 10, full: false })
+    expect(planS3Upload("session.jsonl", { size: 14, mtimeMs: 20 }, "b", previous, "a")).toMatchObject({ action: "upload", start: 10, full: false })
+    expect(planS3Upload("session.jsonl", { size: 14, mtimeMs: 20 }, "b", previous)).toMatchObject({ action: "upload", start: 0, full: true })
+    expect(planS3Upload("session.jsonl", { size: 14, mtimeMs: 20 }, "b", previous, "rewritten")).toMatchObject({ action: "upload", start: 0, full: true })
     expect(planS3Upload("session.jsonl", { size: 8, mtimeMs: 20 }, "c", previous)).toMatchObject({ action: "upload", start: 0, full: true })
     expect(planS3Upload("session.jsonl", { size: 10, mtimeMs: 20 }, "b", previous)).toMatchObject({ action: "upload", start: 0, full: true })
+  })
+
+  test("proves append prefixes from bytes and replaces grown rewrites", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "better-compact-s3-"))
+    try {
+      const filename = path.join(root, "session.jsonl")
+      const original = "original\n"
+      await writeFile(filename, original)
+      const previous = { fileID: "old", size: Buffer.byteLength(original), mtimeMs: 1, sha256: await hashS3File(filename) }
+      for (const [content, append] of [[original + "new turn\n", true], ["replaced history and new turn\n", false], ["modified\n", false], ["short\n", false]] as const) {
+        await writeFile(filename, content)
+        const size = Buffer.byteLength(content)
+        const hashes = await hashS3FileSnapshot(filename, size, size > previous.size ? previous.size : undefined)
+        expect(hashes.sha256).toBe(await hashS3File(filename))
+        expect(planS3Upload("session.jsonl", { size, mtimeMs: 2 }, hashes.sha256, previous, hashes.prefixSha256)).toMatchObject({ action: "upload", start: append ? previous.size : 0, full: !append })
+      }
+      await writeFile(filename, original + "later append\n")
+      expect((await hashS3FileSnapshot(filename, previous.size, previous.size)).sha256).toBe(previous.sha256)
+      await expect(hashS3FileSnapshot(filename, 1000)).rejects.toThrow("source changed during hashing")
+      await expect(hashS3FileSnapshot(filename, 1, 2)).rejects.toThrow("invalid S3 prefix size")
+      expect((await hashS3FileSnapshot(filename, 0, 0)).sha256).toBe((await hashS3FileSnapshot(filename, 0, 0)).prefixSha256)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("scopes new identities and starts a full version when upgrading legacy receipts", () => {
+    const metadata = { size: 14, mtimeMs: 20 }
+    const previous = { fileID: "legacy", size: 10, mtimeMs: 10, sha256: "a" }
+    const first = planS3Upload("session.jsonl", metadata, "b", previous, "a", "source-one")
+    const second = planS3Upload("session.jsonl", metadata, "b", previous, "a", "source-two")
+    expect(first).toMatchObject({ action: "upload", full: true, start: 0 })
+    expect(first.version.fileID).not.toBe(second.version.fileID)
+    expect(first.version.fileID.startsWith("s2_")).toBe(true)
+    expect(planS3Upload("session.jsonl", { size: 18, mtimeMs: 30 }, "c", first.version, "b", "source-one")).toMatchObject({ action: "upload", full: false, start: 14 })
   })
 
   test("validates base URLs and refuses unsafe remote plaintext", () => {

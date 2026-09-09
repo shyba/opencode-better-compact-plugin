@@ -12,7 +12,9 @@ import { discoverJsonl, discoverJsonlSessions, inspectJsonl, readSessionHeader, 
 import type { JsonlCheckpoint, JsonlDiscoveryResult, JsonlReconcilePrefix, JsonlSessionCheckpoint } from "../src/jsonl.js"
 import { applyRemoteMigration, ensureRemoteSource, openPostgres, purgeRemoteTombstones, readRemoteFence, recordObservation, uploadFenced } from "../src/postgres.js"
 import { openSyncState, type NormalizedRecord } from "../src/sync-state.js"
-import { discoverS3JsonlSnapshot, hashS3File, planS3Upload, uploadS3File, validateS3Endpoint } from "../src/s3-sync.js"
+import { discoverS3JsonlSnapshot, hashS3FileSnapshot, planS3Upload, uploadS3File, validateS3Endpoint } from "../src/s3-sync.js"
+import { verifySync } from "./sync-verify.js"
+import { inspectCli, cliHelp } from "./cli-help.js"
 
 const installDir = path.resolve(process.env.OPENCODE_SAFE_COMPACTION_DIR ?? path.join(process.env.HOME ?? ".", ".local/share/opencode/plugins/safe-compaction"))
 const configDir = path.resolve(process.env.OPENCODE_SAFE_COMPACTION_CONFIG_DIR ?? process.env.OPENCODE_CONFIG_DIR ?? path.join(process.env.XDG_CONFIG_HOME ?? path.join(process.env.HOME ?? ".", ".config"), "opencode"))
@@ -31,6 +33,13 @@ const defaultSyncSources = [
   { kind: "codex-jsonl-sessions", database: "~/.codex/sessions" },
   { kind: "pi-jsonl", database: "~/.pi/agent/sessions" },
 ] as const
+const parsed = inspectCli(process.argv.slice(2))
+if (parsed.kind !== "run") {
+  (parsed.kind === "error" ? console.error : console.log)(parsed.text)
+  process.exit(parsed.code)
+}
+process.argv.splice(2, Infinity, ...parsed.args)
+
 const configFlag = flagValue("--config")
 const stateFlag = flagValue("--state")
 if (configFlag) process.env.BETTER_COMPACT_CONFIG = path.resolve(configFlag)
@@ -45,7 +54,7 @@ if (command === "help" || command === "--help" || command === "-h") {
 }
 if (command === "install") {
   if (process.argv[3] === "pi") process.exit(await installPi())
-  if (process.argv[3]) {
+  if (process.argv[3] && !process.argv[3].startsWith("-")) {
     console.error("Usage: better-compact install [pi]")
     process.exit(2)
   }
@@ -69,6 +78,7 @@ if (command === "sync") {
   if (action === "run") process.exit(await syncRun(process.argv.includes("--once"), process.argv.includes("--pass")))
   if (action === "setup") process.exit(await syncSetup())
   if (action === "status") process.exit(await syncStatus())
+  if (action === "verify") process.exit(await syncVerify())
   if (action === "migrate") process.exit(await syncMigrate())
   if (action === "install") process.exit(await syncInstall())
   if (action === "uninstall") process.exit(await syncUninstall())
@@ -97,48 +107,7 @@ console.error(`Unknown command: ${command}`)
 printHelp()
 process.exit(2)
 
-function printHelp() {
-  console.log(`better-compact - OpenCode safe-compaction maintenance
-
-Usage:
-  better-compact install  Activate the OpenCode plugin using the selected installation mode
-  better-compact install pi  Register both extensions with Pi
-  better-compact update   Update the managed checkout and verify configuration
-  better-compact doctor   Check installation, OpenCode, configuration, and SQLite access
-  better-compact sync setup [--url URL|--url-stdin] [--token TOKEN|--token-stdin] [--allow-insecure-remote] [--install] Configure session-center S3 ingest
-  better-compact sync run [--once|--pass] [--config FILE] [--state FILE] Archive JSONL sessions to session-center S3
-  better-compact sync status Show local outbox status
-  better-compact sync migrate No-op for S3 (session-center owns the VCC schema)
-  better-compact sync install|uninstall Manage a systemd user service
-  better-compact sync prune (--missing-directories|--blank-directories) --yes Delete local Codex files while retaining remote rows
-  better-compact sync compact --yes  Remove acknowledged local cache rows and compact SQLite
-  better-compact sync reconcile    Force the next OpenCode source pass to rebuild a complete snapshot
-  better-compact sync retry-s3 --kind KIND --path PATH [--root ROOT]
-                                   Clear one failed S3 archive retry row without resetting checkpoints
-  better-compact sync backfill-hierarchy [--dry-run]
-                                   Re-read local Codex session headers and stage hierarchy metadata
-                                   (parent session, depth, nickname) for already-mirrored sessions
-  better-compact rag setup         Enable the BGE-small worker and configure backend, dtype, batches, model/runtime
-  better-compact rag run [--once]  Run the streaming BGE-small worker in the foreground
-  better-compact rag status        Show model, row, dimension, and size metadata
-  better-compact rag migrate       Create the additive 384-dimensional RAG projection (admin credentials)
-  better-compact rag install       Install and start the per-user embedding service
-  better-compact rag uninstall     Stop and remove the per-user embedding service
-  better-compact rag tunnel install|uninstall  Manage the encrypted PostgreSQL SSH tunnel
-  better-compact installation reset|adopt --yes  Explicitly recover or replace sync identity
-  better-compact help     Show this help
-
-Environment overrides:
-  OPENCODE_SAFE_COMPACTION_DIR
-  OPENCODE_SAFE_COMPACTION_CONFIG_DIR
-  OPENCODE_SAFE_COMPACTION_OPENCODE
-  OPENCODE_SAFE_COMPACTION_BUN
-  OPENCODE_SAFE_COMPACTION_PI
-  OPENCODE_SAFE_COMPACTION_PI_SOURCE
-  OPENCODE_DB
-  BETTER_COMPACT_CONFIG
-  BETTER_COMPACT_STATE`)
-}
+function printHelp() { console.log(cliHelp()) }
 
 function flagValue(flag: string) {
   const index = process.argv.indexOf(flag)
@@ -375,8 +344,8 @@ async function syncReconcile() {
   }
   const config = await loadConfig(paths)
   if (config.sync.transport === "s3") {
-    console.log("S3 sync has no remote snapshot fence; session-center archives are append-only and require no reconcile command")
-    return 0
+    console.error("sync reconcile is a legacy Postgres snapshot operation. For S3 use sync run --once to scan/retry, or sync verify to check remote coverage.")
+    return 2
   }
   const sourceIDs = config.sources
     .filter((source) => source.kind === "opencode-v1-sqlite" || source.kind === "opencode-v1-sessions")
@@ -710,20 +679,31 @@ async function syncS3Pass(config: Awaited<ReturnType<typeof loadConfig>>, signal
           const metadataChanged = !previous || previous.size !== file.size || previous.mtimeMs !== file.mtimeMs
           if (!fullScan && !metadataChanged && !failure) continue
           try {
-            const sha256 = await hashS3File(file.filename)
-            const plan = planS3Upload(file.sourcePath, file, sha256, previous)
+            const hashed = await hashS3FileSnapshot(file.filename, file.size, previous && file.size > previous.size ? previous.size : undefined)
+            const afterHash = await stat(file.filename)
+            if (afterHash.size !== file.size || afterHash.mtimeMs !== file.mtimeMs) throw new Error("file changed during hashing; retry next pass")
+            // A previous failure may have occurred after remote acceptance.
+            // Start a complete version rather than appending from a stale ACK.
+            const plan = planS3Upload(file.sourcePath, file, hashed.sha256, failure ? undefined : previous, hashed.prefixSha256, sourceID)
             if (plan.action === "skip") {
               if (previous?.mtimeMs !== plan.version.mtimeMs) state.recordS3File(sourceID, file.sourcePath, plan.version)
               state.clearS3Failure(sourceID, file.sourcePath)
               continue
             }
-            await uploadS3File({ endpoint, token, fileID: plan.fileID, sourcePath: file.sourcePath, filename: file.filename, size: plan.version.size, start: plan.start, full: plan.full, ...(signal ? { signal } : {}) })
+            await uploadS3File({ endpoint, token, fileID: plan.fileID, sourcePath: file.sourcePath, filename: file.filename, size: plan.version.size, start: plan.start, full: plan.full, source: { id: sourceID, kind: source.kind, locator: root }, ...(signal ? { signal } : {}) })
+            const afterUpload = await stat(file.filename)
+            if (afterUpload.size !== file.size || afterUpload.mtimeMs !== file.mtimeMs) throw new Error("file changed during upload; receipt not advanced")
             state.recordS3File(sourceID, file.sourcePath, plan.version)
             state.clearS3Failure(sourceID, file.sourcePath)
             uploaded++
             progressed = true
           } catch (error) {
-            if (signal?.aborted) break
+            if (signal?.aborted) {
+              state.recordS3Failure(sourceID, file.sourcePath, { size: file.size, mtimeMs: file.mtimeMs }, "upload interrupted; remote acceptance unknown", config.sync.failure_retry_attempts, config.sync.failure_retry_interval_ms)
+              sourceComplete = false
+              fullScanComplete = false
+              break
+            }
             const message = error instanceof Error ? error.message : String(error)
             const retry = state.recordS3Failure(sourceID, file.sourcePath, { size: file.size, mtimeMs: file.mtimeMs }, message, config.sync.failure_retry_attempts, config.sync.failure_retry_interval_ms)
             failed = true
@@ -942,6 +922,15 @@ function assertPostgresURL(url: string, allowInsecureRemote: boolean) {
   try { parsed = new URL(url) } catch { throw new Error("invalid Postgres URL") }
   if (!parsed.hostname || !parsed.pathname || parsed.pathname === "/") throw new Error("Postgres URL must include a host and database")
   assertPostgresTLS(url, allowInsecureRemote)
+}
+
+async function syncVerify() {
+  const config = await loadConfig(paths)
+  if (config.sync.transport !== "s3") { console.error("sync verify currently supports S3 session-center sources only"); return 2 }
+  const endpoint = s3EndpointFor(config)
+  const token = s3TokenFor(config)
+  if (!endpoint || !token) { console.error("configure S3 sync URL and token before verification"); return 2 }
+  return verifySync({ sources: config.sources, state: paths.state, endpoint: validateS3Endpoint(endpoint, config.sync.allow_insecure_remote), token, json: process.argv.includes("--json") })
 }
 
 async function syncStatus() {

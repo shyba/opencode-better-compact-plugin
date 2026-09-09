@@ -253,6 +253,40 @@ describe("better-compact sync run --once", () => {
 })
 
 describe("better-compact S3 sync scanning", () => {
+  for (const mode of ["concurrent growth", "uncertain acknowledgement"]) test(`uses a full replacement after ${mode}`, async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "better-compact-retry-"))
+    temporary.push(root)
+    const sessions = path.join(root, "sessions")
+    await mkdir(sessions)
+    const filename = path.join(sessions, "session.jsonl")
+    await writeFile(filename, "one\n")
+    const requests: Array<{ full: string | null; body: string; source: string | null }> = []
+    const server = Bun.serve({ port: 0, async fetch(request) {
+      requests.push({ full: request.headers.get("x-vcc-full"), body: await request.text(), source: request.headers.get("x-vcc-source-id") })
+      if (requests.length === 2) {
+        if (mode === "concurrent growth") await appendFile(filename, "three\n")
+        else return new Response("accepted bytes but response failed", { status: 500 })
+      }
+      return new Response(null, { status: 204 })
+    } })
+    try {
+      const config = path.join(root, "config.json"), state = path.join(root, "state.sqlite")
+      await writeFile(config, JSON.stringify({ version: 1, sync: { enabled: true, transport: "s3" }, sources: [{ kind: "codex-jsonl", database: sessions }] }))
+      const env = { HOME: root, BETTER_COMPACT_CONFIG: config, BETTER_COMPACT_STATE: state, SESSION_CENTER_URL: `http://127.0.0.1:${server.port}`, S3_SYNC_TOKEN: "token-token-token" }
+      expect((await runCLI(["sync", "run", "--pass"], env)).exitCode).toBe(0)
+      await appendFile(filename, "two\n")
+      expect((await runCLI(["sync", "run", "--pass"], env)).exitCode).toBe(1)
+      const db = new Database(state)
+      db.query("update s3_failure set next_attempt_at=0").run()
+      db.close()
+      expect((await runCLI(["sync", "run", "--pass"], env)).exitCode).toBe(0)
+      expect(requests[1].full).toBeNull()
+      expect(requests[2].full).toBe("true")
+      expect(requests[2].body).toBe(mode === "concurrent growth" ? "one\ntwo\nthree\n" : "one\ntwo\n")
+      expect(requests.every(r => !!r.source)).toBe(true)
+    } finally { server.stop(true) }
+  })
+
   test("deduplicates roots, skips unchanged files, sends appends, and catches same-size rewrites on a full scan", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "better-compact-cli-"))
     temporary.push(root)

@@ -86,28 +86,42 @@ Other supported overrides are `OPENCODE_SAFE_COMPACTION_DIR`, `OPENCODE_SAFE_COM
 
 The checked-in `runtime/server.js` and `runtime/tui.js` entrypoints are Bun bundles with their runtime dependencies included, so the installer does not populate `node_modules` and an isolated OpenCode process does not depend on the installer host's global modules. OpenCode may manage its standard plugin SDK in the configuration directory when it first loads a TUI plugin. A bootstrapped Bun is temporary and is not installed into the user account or retained by the plugin; the in-app selector uses OpenCode's own Bun runtime. Restart a running OpenCode server after installation.
 
-The installer also creates `better-compact` in the user bin directory when a persistent Bun executable is available:
+The installer also creates `better-compact` in the user bin directory when a persistent Bun executable is available.
 
-```sh
-better-compact help
-better-compact doctor
-better-compact update
-better-compact install pi
-better-compact sync setup --url-stdin
-better-compact sync run --once
-better-compact sync status
-better-compact sync migrate
-better-compact sync install
-better-compact sync prune --missing-directories --yes
-better-compact sync prune --blank-directories --yes
-better-compact sync compact --yes
-better-compact sync reconcile
-better-compact sync backfill-hierarchy --dry-run
-better-compact rag migrate
-better-compact rag status
-better-compact installation reset --yes
-better-compact installation adopt --yes
-```
+### Command guide
+
+Use `better-compact --help`, `better-compact sync --help`, or append `--help` to a specific command. Help exits before configuration, local state or service actions. Unknown options, missing option values and conflicting flags are rejected. `--config FILE` and `--state FILE` select explicit local configuration and state paths.
+
+For the current session-center S3 transport:
+
+| Command | Purpose |
+| --- | --- |
+| `sync setup --url-stdin` | Configure the receiver and credentials |
+| `sync run` | Run continuous sync in the foreground |
+| `sync run --once` | Scan all configured files, bypass retry skips, and upload until idle |
+| `sync run --pass` | Perform one normal pass, preserving retry skips |
+| `sync status` | Inspect local receipts and failures; does not prove remote coverage |
+| `sync verify [--json]` | Read-only remote completeness report; distinguish archives, loading and indexing |
+| `sync install` / `sync uninstall` | Start/install or stop/remove the background service |
+| `sync retry-s3 --kind KIND --path PATH [--root ROOT]` | Clear one failed version for retry without resetting checkpoints; stop background sync first |
+| `sync compact --yes` | Compact the local acknowledged cache |
+
+Prefix commands above with `better-compact`. Zero local failures or a successful upload is not proof of searchable coverage. `sync verify` reports unsupported or unavailable stages as unknown, not complete; the receiver must support verification to establish remote coverage. Verification does not repair or resend data.
+
+Plugin maintenance uses `install`, `install pi`, `update`, and `doctor`. `installation reset --yes` explicitly replaces local sync identity and state; it is not a completeness check.
+
+Legacy Postgres commands remain implemented for older installations:
+
+| Command | Purpose and S3 boundary |
+| --- | --- |
+| `sync migrate` | Apply mirror migrations; no-op for S3 |
+| `sync reconcile` | Rebuild the OpenCode snapshot; no-op for S3, not archive verification |
+| `sync prune (--missing-directories\|--blank-directories) --yes` | Delete selected local Codex files; refuses S3 |
+| `sync backfill-hierarchy [--dry-run]` | Stage Codex hierarchy; refuses S3 |
+| `installation adopt --yes` | Adopt the remote Postgres mirror identity |
+| `rag setup`, `run`, `status`, `migrate`, `install`, `uninstall`, `tunnel install\|uninstall` | Separate legacy Postgres embedding worker, not the session-center VCC index |
+
+Use `better-compact rag setup --help` for runtime and model options. These commands are compatibility tools, not prerequisites for S3 sync. The RAG projection remains fixed at 384 dimensions; a model override must fit that existing projection.
 
 The generated wrapper points at the persistent checkout and also falls back to the standard checkout path if an older wrapper still references a deleted temporary installer directory. Re-running the installer repairs that wrapper in place.
 
@@ -117,7 +131,11 @@ The generated wrapper points at the persistent checkout and also falls back to t
 
 `doctor` checks the managed checkout, both OpenCode configuration surfaces, the OpenCode and Bun executables, and performs a read-only SQLite probe. `update` runs the same rollback-safe checkout/configuration transaction as the installer. If Bun was bootstrapped temporarily during installation, install Bun separately or invoke the CLI with `OPENCODE_SAFE_COMPACTION_BUN=/path/to/bun`.
 
-The default sync transport is session-center S3 ingest. The runner reads configured Codex JSONL and Pi JSONL sources read-only, uploads only changed bytes to `PUT /file/<file_id>`, and marks shrink/same-size rewrites with `x-vcc-full: true`. The local SQLite state stores the last acknowledged path version so an interrupted PUT can be replayed safely; S3 archives remain the durable source of truth and `vcc_load.py` projects them into `vcc.*`. OpenCode V1 SQLite remains an explicit warning until session-center's normalized-record feeder is enabled; it is never sent to the retired `opencode.*` writer. `better-compact sync status` reports acknowledged S3 file versions and retry failures, and `better-compact sync compact --yes` vacuums only the local cache.
+The default sync transport is session-center S3 ingest. The runner reads configured Codex JSONL and Pi JSONL sources read-only, uploads only changed bytes to `PUT /file/<file_id>`, and marks rewritten files with `x-vcc-full: true`; a growing file is appended only after verifying that its acknowledged prefix is unchanged. The local SQLite state stores the last acknowledged path version so an interrupted PUT can be replayed safely; S3 archives remain the durable source of truth and `vcc_load.py` projects them into `vcc.*`. OpenCode V1 SQLite remains an explicit warning until session-center's normalized-record feeder is enabled; it is never sent to the retired `opencode.*` writer. `better-compact sync status` reports acknowledged S3 file versions and retry failures, and `better-compact sync compact --yes` vacuums only the local cache.
+
+New uploads include source identity in both the file ID and frame headers. The first changed version of an older, unscoped receipt is sent in full so its new source does not start with an orphan suffix. Unchanged legacy files are not automatically resent; `sync verify` reports their missing provenance as unknown. After an uncertain upload acknowledgement or a file change during upload, the next retry sends a full replacement instead of assuming the old checkpoint is still the remote end.
+
+Remote verification requires a receiver with `POST /verify` and its read-only projection checker configured. It checks actual archived bytes, recompiles expected VCC blocks, and checks dense/BM25 point presence and dense source associations. It does not measure retrieval quality. Limits or unavailable backends return unknown and a nonzero exit, not partial success. The receiver currently limits a reconstructed file to 64 MiB, archive reads per request to 256 MiB, and projected blocks to 50,000 / 64 MiB. Files are checked serially and progress goes to stderr, including with `--json`.
 
 If an older hand-written config enables sync without an S3 URL/token, `sync run` warns and performs only local compatibility staging; it does not write Postgres or pretend that a remote upload succeeded. Run `sync setup` before relying on remote durability.
 
